@@ -1,0 +1,34 @@
+kind = response
+opcode = remove
+requestId = 12
+status = 0
+attributes.type = symlink
+attributes.mode = 319
+attributes.size = 7007
+attributes.nodeId = 71
+attributes.parentId = 23
+attributes.modified.seconds = 1700000700
+attributes.modified.nanos = 100000007
+attributes.accessed.seconds = 1700000701
+attributes.accessed.nanos = 200000007
+attributes.created.seconds = 1700000702
+attributes.created.nanos = 300000007
+directoryAttributes.type = directory
+directoryAttributes.mode = 328
+directoryAttributes.size = 8007
+directoryAttributes.nodeId = 72
+directoryAttributes.parentId = 26
+directoryAttributes.modified.seconds = 1700000800
+directoryAttributes.modified.nanos = 100000008
+directoryAttributes.accessed.seconds = 1700000801
+directoryAttributes.accessed.nanos = 200000008
+directoryAttributes.created.seconds = 1700000802
+directoryAttributes.created.nanos = 300000008
+usableBytes = 123456789016
+hex:
+00000099 01 0009 000000000000000c 0000008a
+0000000003013f0000000000001b5f0000000000000047000000000000001700
+0000006553f3bc05f5e107000000006553f3bd0bebc207000000006553f3be11
+e1a3070201480000000000001f470000000000000048000000000000001a0000
+00006553f42005f5e108000000006553f4210bebc208000000006553f42211e1
+a3080000001cbe991a18

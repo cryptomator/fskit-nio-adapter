@@ -1,0 +1,10 @@
+kind = request
+opcode = readdir
+requestId = 8
+nodeId = 67
+cookie = 5
+verifier = 9
+wantAttributes = true
+hex:
+00000028 00 0007 0000000000000008 00000019
+00000000000000430000000000000005000000000000000901

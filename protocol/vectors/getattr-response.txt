@@ -1,0 +1,22 @@
+kind = response
+opcode = getattr
+requestId = 2
+status = 0
+attributes.type = file
+attributes.mode = 420
+attributes.size = 4096
+attributes.nodeId = 64
+attributes.parentId = 2
+attributes.modified.seconds = 1700000001
+attributes.modified.nanos = 123456789
+attributes.accessed.seconds = 1700000002
+attributes.accessed.nanos = 223456789
+attributes.created.seconds = 1700000003
+attributes.created.nanos = 323456789
+hex:
+00000052 01 0005 0000000000000002 00000043
+00000000
+01 01a4 0000000000001000 0000000000000040 0000000000000002
+000000006553f101 075bcd15
+000000006553f102 0d51ae15
+000000006553f103 13478f15

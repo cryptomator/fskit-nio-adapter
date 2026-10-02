@@ -1,0 +1,10 @@
+kind = request
+opcode = create
+requestId = 11
+parentId = 70
+name = Neuer Ordner
+type = directory
+mode = 493
+hex:
+00000028 00 0008 000000000000000b 00000019
+0000000000000046000c4e65756572204f72646e65720201ed

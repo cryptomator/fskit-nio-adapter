@@ -1,0 +1,21 @@
+kind = response
+opcode = lookup
+requestId = 4
+status = 0
+attributes.type = file
+attributes.mode = 265
+attributes.size = 1007
+attributes.nodeId = 65
+attributes.parentId = 5
+attributes.modified.seconds = 1700000100
+attributes.modified.nanos = 100000001
+attributes.accessed.seconds = 1700000101
+attributes.accessed.nanos = 200000001
+attributes.created.seconds = 1700000102
+attributes.created.nanos = 300000001
+name = ä.txt
+hex:
+0000005a 01 0003 0000000000000004 0000004b
+0000000001010900000000000003ef0000000000000041000000000000000500
+0000006553f16405f5e101000000006553f1650bebc201000000006553f16611
+e1a3010006c3a42e747874

@@ -1,0 +1,8 @@
+kind = request
+opcode = lookup
+requestId = 4
+parentId = 2
+name = ä.txt
+hex:
+0000001f 00 0003 0000000000000004 00000010
+00000000000000020006c3a42e747874

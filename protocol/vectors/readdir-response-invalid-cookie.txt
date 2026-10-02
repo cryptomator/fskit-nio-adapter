@@ -1,0 +1,7 @@
+kind = response
+opcode = readdir
+requestId = 10
+status = -1
+hex:
+00000013 01 0007 000000000000000a 00000004
+ffffffff

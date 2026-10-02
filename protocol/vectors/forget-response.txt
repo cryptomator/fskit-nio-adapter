@@ -1,0 +1,8 @@
+kind = response
+opcode = forget
+requestId = 6
+status = 0
+usableBytes = 123456789013
+hex:
+0000001b 01 0004 0000000000000006 0000000c
+000000000000001cbe991a15

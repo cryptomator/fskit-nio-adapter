@@ -1,0 +1,22 @@
+kind = response
+opcode = read
+requestId = 17
+status = 0
+attributes.type = file
+attributes.mode = 400
+attributes.size = 16007
+attributes.nodeId = 80
+attributes.parentId = 50
+attributes.modified.seconds = 1700001600
+attributes.modified.nanos = 100000016
+attributes.accessed.seconds = 1700001601
+attributes.accessed.nanos = 200000016
+attributes.created.seconds = 1700001602
+attributes.created.nanos = 300000016
+data = 48656c6c6f2c20465353
+hex:
+0000005c 01 000d 0000000000000011 00000043
+000000000101900000000000003e870000000000000050000000000000003200
+0000006553f74005f5e110000000006553f7410bebc210000000006553f74211
+e1a310
+48656c6c6f2c20465353

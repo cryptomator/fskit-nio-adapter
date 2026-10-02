@@ -1,0 +1,5 @@
+kind = request
+opcode = statfs
+requestId = 3
+hex:
+0000000f 00 0002 0000000000000003 00000000

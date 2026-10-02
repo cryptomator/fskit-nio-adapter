@@ -1,0 +1,8 @@
+kind = request
+opcode = close
+requestId = 16
+nodeId = 77
+keptModes = 1
+hex:
+00000018 00 000c 0000000000000010 00000009
+000000000000004d01

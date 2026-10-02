@@ -1,0 +1,11 @@
+kind = request
+opcode = rename
+requestId = 13
+nodeId = 73
+sourceParentId = 74
+destinationParentId = 75
+destinationName = renamed.txt
+hex:
+00000034 00 000a 000000000000000d 00000025
+0000000000000049000000000000004a000000000000004b000b72656e616d65
+642e747874

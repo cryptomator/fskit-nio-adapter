@@ -1,0 +1,61 @@
+kind = response
+opcode = rename
+requestId = 13
+status = 0
+name = renamed.txt
+attributes.type = file
+attributes.mode = 337
+attributes.size = 9007
+attributes.nodeId = 73
+attributes.parentId = 29
+attributes.modified.seconds = 1700000900
+attributes.modified.nanos = 100000009
+attributes.accessed.seconds = 1700000901
+attributes.accessed.nanos = 200000009
+attributes.created.seconds = 1700000902
+attributes.created.nanos = 300000009
+sourceDirectoryAttributes.type = directory
+sourceDirectoryAttributes.mode = 346
+sourceDirectoryAttributes.size = 10007
+sourceDirectoryAttributes.nodeId = 74
+sourceDirectoryAttributes.parentId = 32
+sourceDirectoryAttributes.modified.seconds = 1700001000
+sourceDirectoryAttributes.modified.nanos = 100000010
+sourceDirectoryAttributes.accessed.seconds = 1700001001
+sourceDirectoryAttributes.accessed.nanos = 200000010
+sourceDirectoryAttributes.created.seconds = 1700001002
+sourceDirectoryAttributes.created.nanos = 300000010
+destinationDirectoryAttributes.type = directory
+destinationDirectoryAttributes.mode = 355
+destinationDirectoryAttributes.size = 11007
+destinationDirectoryAttributes.nodeId = 75
+destinationDirectoryAttributes.parentId = 35
+destinationDirectoryAttributes.modified.seconds = 1700001100
+destinationDirectoryAttributes.modified.nanos = 100000011
+destinationDirectoryAttributes.accessed.seconds = 1700001101
+destinationDirectoryAttributes.accessed.nanos = 200000011
+destinationDirectoryAttributes.created.seconds = 1700001102
+destinationDirectoryAttributes.created.nanos = 300000011
+replacedAttributes.type = file
+replacedAttributes.mode = 364
+replacedAttributes.size = 12007
+replacedAttributes.nodeId = 76
+replacedAttributes.parentId = 38
+replacedAttributes.modified.seconds = 1700001200
+replacedAttributes.modified.nanos = 100000012
+replacedAttributes.accessed.seconds = 1700001201
+replacedAttributes.accessed.nanos = 200000012
+replacedAttributes.created.seconds = 1700001202
+replacedAttributes.created.nanos = 300000012
+usableBytes = 123456789017
+hex:
+00000125 01 000a 000000000000000d 00000116
+00000000000b72656e616d65642e747874010151000000000000232f00000000
+00000049000000000000001d000000006553f48405f5e109000000006553f485
+0bebc209000000006553f48611e1a30902015a00000000000027170000000000
+00004a0000000000000020000000006553f4e805f5e10a000000006553f4e90b
+ebc20a000000006553f4ea11e1a30a0201630000000000002aff000000000000
+004b0000000000000023000000006553f54c05f5e10b000000006553f54d0beb
+c20b000000006553f54e11e1a30b0101016c0000000000002ee7000000000000
+004c0000000000000026000000006553f5b005f5e10c000000006553f5b10beb
+c20c000000006553f5b211e1a30c0000001cbe991a19

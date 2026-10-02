@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.cryptomator</groupId>
+    <artifactId>fskit-nio-adapter</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <name>FSKit-NIO-Adapter</name>
+    <description>Access resources at a given NIO path via FSKit.</description>
+    <url>https://github.com/cryptomator/fskit-nio-adapter</url>
+
+    <scm>
+        <connection>scm:git:git@github.com:cryptomator/fskit-nio-adapter.git</connection>
+        <developerConnection>scm:git:git@github.com:cryptomator/fskit-nio-adapter.git</developerConnection>
+        <url>https://github.com/cryptomator/fskit-nio-adapter</url>
+    </scm>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.build.jdk>25</project.build.jdk>
+
+        <!-- dependencies -->
+        <integrations-api.version>1.9.0</integrations-api.version>
+        <slf4j.version>2.0.20</slf4j.version>
+
+        <!-- test dependencies -->
+        <junit.jupiter.version>6.1.3</junit.jupiter.version>
+        <mockito.version>5.24.0</mockito.version>
+        <cryptofs.version>2.10.0</cryptofs.version>
+
+        <!-- build dependencies -->
+        <mvn-compiler.version>3.16.0</mvn-compiler.version>
+        <mvn-dependency.version>3.11.0</mvn-dependency.version>
+        <mvn-jar.version>3.5.1</mvn-jar.version>
+        <mvn-surefire.version>3.6.0</mvn-surefire.version>
+        <mvn-exec.version>3.6.4</mvn-exec.version>
+        <jacoco.version>0.8.15</jacoco.version>
+    </properties>
+
+    <licenses>
+        <license>
+            <name>GNU Affero General Public License (AGPL) version 3.0</name>
+            <url>https://www.gnu.org/licenses/agpl.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <name>Tobias Hagemann</name>
+            <email>tobias.hagemann@skymatic.de</email>
+            <timezone>+1</timezone>
+            <organization>cryptomator.org</organization>
+            <organizationUrl>http://cryptomator.org</organizationUrl>
+        </developer>
+    </developers>
+
+    <dependencies>
+        <!-- Mount API -->
+        <dependency>
+            <groupId>org.cryptomator</groupId>
+            <artifactId>integrations-api</artifactId>
+            <version>${integrations-api.version}</version>
+        </dependency>
+
+        <!-- Correctness -->
+        <dependency>
+            <groupId>org.jetbrains</groupId>
+            <artifactId>annotations</artifactId>
+            <version>26.1.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.cryptomator</groupId>
+            <artifactId>cryptofs</artifactId>
+            <version>${cryptofs.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <repositories>
+        <repository>
+            <id>maven-central</id>
+            <name>Maven Central Repo</name>
+            <url>https://repo.maven.apache.org/maven2</url>
+        </repository>
+    </repositories>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!-- shared setup of the mirror and crypto-mirror profiles, which run the interactive MirroringFSKitMountTest; fskit/scripts/interop-test.sh runs BridgeServerMain through the mirror profile -->
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>exec-maven-plugin</artifactId>
+                    <version>${mvn-exec.version}</version>
+                    <executions>
+                        <execution>
+                            <id>run-mirror</id>
+                            <phase>test</phase>
+                            <goals>
+                                <goal>exec</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                    <configuration>
+                        <executable>${java.home}/bin/java</executable>
+                        <classpathScope>test</classpathScope>
+                        <arguments>
+                            <argument>-classpath</argument>
+                            <classpath/>
+                            <argument>${mirror.mainClass}</argument>
+                        </arguments>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${mvn-compiler.version}</version>
+                <configuration>
+                    <showWarnings>true</showWarnings>
+                    <release>${project.build.jdk}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>${mvn-dependency.version}</version>
+                <executions>
+                    <execution>
+                        <id>jar-paths-to-properties</id>
+                        <goals>
+                            <goal>properties</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                        <configuration>
+                            <propertyName>surefire.jacoco.args</propertyName>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${mvn-surefire.version}</version>
+                <configuration>
+                    <argLine>@{surefire.jacoco.args} -javaagent:"${org.mockito:mockito-core:jar}"</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>${mvn-jar.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>coverage</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>report</id>
+                                <goals>
+                                    <goal>report</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Mirrors one or more directories, see `mvn test -Pmirror` -->
+        <profile>
+            <id>mirror</id>
+            <properties>
+                <mirror.mainClass>org.cryptomator.frontend.fskit.mount.MirroringFSKitMountTest$Mirror</mirror.mainClass>
+                <!-- test classes are still compiled, only surefire is skipped -->
+                <skipTests>true</skipTests>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Mirrors a vault, see `mvn test -Pcrypto-mirror` -->
+        <profile>
+            <id>crypto-mirror</id>
+            <properties>
+                <mirror.mainClass>org.cryptomator.frontend.fskit.mount.MirroringFSKitMountTest$CryptoFsMirror</mirror.mainClass>
+                <!-- test classes are still compiled, only surefire is skipped -->
+                <skipTests>true</skipTests>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

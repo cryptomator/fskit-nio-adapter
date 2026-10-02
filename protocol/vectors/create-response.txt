@@ -1,0 +1,35 @@
+kind = response
+opcode = create
+requestId = 11
+status = 0
+attributes.type = directory
+attributes.mode = 301
+attributes.size = 5007
+attributes.nodeId = 69
+attributes.parentId = 17
+attributes.modified.seconds = 1700000500
+attributes.modified.nanos = 100000005
+attributes.accessed.seconds = 1700000501
+attributes.accessed.nanos = 200000005
+attributes.created.seconds = 1700000502
+attributes.created.nanos = 300000005
+name = Neuer Ordner
+directoryAttributes.type = directory
+directoryAttributes.mode = 310
+directoryAttributes.size = 6007
+directoryAttributes.nodeId = 70
+directoryAttributes.parentId = 20
+directoryAttributes.modified.seconds = 1700000600
+directoryAttributes.modified.nanos = 100000006
+directoryAttributes.accessed.seconds = 1700000601
+directoryAttributes.accessed.nanos = 200000006
+directoryAttributes.created.seconds = 1700000602
+directoryAttributes.created.nanos = 300000006
+usableBytes = 123456789015
+hex:
+000000a7 01 0008 000000000000000b 00000098
+0000000002012d000000000000138f0000000000000045000000000000001100
+0000006553f2f405f5e105000000006553f2f50bebc205000000006553f2f611
+e1a305000c4e65756572204f72646e6572020136000000000000177700000000
+000000460000000000000014000000006553f35805f5e106000000006553f359
+0bebc206000000006553f35a11e1a3060000001cbe991a17

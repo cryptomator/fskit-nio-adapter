@@ -1,0 +1,8 @@
+kind = response
+opcode = close
+requestId = 16
+status = 0
+usableBytes = 123456789019
+hex:
+0000001b 01 000c 0000000000000010 0000000c
+000000000000001cbe991a1b

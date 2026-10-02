@@ -1,0 +1,2041 @@
+package org.cryptomator.frontend.fskit.fs;
+
+import org.cryptomator.cryptofs.CryptoFileSystemProperties;
+import org.cryptomator.cryptofs.CryptoFileSystemProvider;
+import org.cryptomator.cryptolib.api.Masterkey;
+import org.cryptomator.cryptolib.api.MasterkeyLoader;
+import org.cryptomator.frontend.fskit.protocol.Frame;
+import org.cryptomator.frontend.fskit.protocol.FrameCodec;
+import org.cryptomator.frontend.fskit.protocol.FrameCodecTest;
+import org.cryptomator.frontend.fskit.protocol.Messages;
+import org.cryptomator.frontend.fskit.protocol.Messages.Attributes;
+import org.cryptomator.frontend.fskit.protocol.Messages.CloseRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.CloseResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.CreateResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.DirectoryEntry;
+import org.cryptomator.frontend.fskit.protocol.Messages.Failure;
+import org.cryptomator.frontend.fskit.protocol.Messages.ForgetRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ForgetResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.GetattrRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.GetattrResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.HelloRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.LookupRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.LookupResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.NodeType;
+import org.cryptomator.frontend.fskit.protocol.Messages.OpenRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.OpenResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.RemoveRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.RemoveResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.RenameRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.RenameResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.Request;
+import org.cryptomator.frontend.fskit.protocol.Messages.Response;
+import org.cryptomator.frontend.fskit.protocol.Messages.SetattrRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SetattrResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.StatfsRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.StatfsResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.SyncRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SyncResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.Timestamp;
+import org.cryptomator.frontend.fskit.protocol.Messages.WriteRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.WriteResponse;
+import org.cryptomator.frontend.fskit.protocol.Opcode;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystem;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.NotDirectoryException;
+import java.nio.file.Path;
+import java.nio.file.ReadOnlyFileSystemException;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Stream;
+
+@SuppressWarnings("OctalInteger")
+public class FileSystemOperationsTest {
+
+	private static final long ROOT = Messages.ROOT_NODE_ID;
+	private static final int READ = Messages.MODE_READ;
+	private static final int WRITE = Messages.MODE_WRITE;
+	private static final Timestamp EPOCH = new Timestamp(0, 0);
+	private static final String COMPOSED = "\u00e4.txt";
+	private static final String DECOMPOSED = "a\u0308.txt";
+
+	private Path root;
+	private HookedOperations ops;
+
+	@BeforeEach
+	public void setup(@TempDir Path tmpDir) throws IOException {
+		root = tmpDir;
+		ops = new HookedOperations(root, false);
+	}
+
+	@AfterEach
+	public void tearDown() {
+		ops.close();
+	}
+
+	/* helpers */
+
+	private <T extends Response> T ok(Request request, Class<T> type) {
+		return Assertions.assertInstanceOf(type, ops.handle(request));
+	}
+
+	private void assertStatus(int status, Request request) {
+		Assertions.assertEquals(new Failure(status), ops.handle(request), request.toString());
+	}
+
+	private Attributes lookup(long parentId, String name) {
+		return ok(new LookupRequest(parentId, name), LookupResponse.class).attributes();
+	}
+
+	private Attributes create(long parentId, String name, NodeType type) {
+		return ok(new CreateRequest(parentId, name, type, type == NodeType.DIRECTORY ? 0755 : 0644), CreateResponse.class).attributes();
+	}
+
+	private Attributes getattr(long nodeId) {
+		return ok(new GetattrRequest(nodeId), GetattrResponse.class).attributes();
+	}
+
+	private WriteResponse write(long nodeId, long offset, String content) {
+		return ok(new WriteRequest(nodeId, offset, StandardCharsets.UTF_8.encode(content)), WriteResponse.class);
+	}
+
+	private String read(long nodeId, long offset, int length) {
+		return StandardCharsets.UTF_8.decode(ok(new ReadRequest(nodeId, offset, length), ReadResponse.class).data()).toString();
+	}
+
+	private ReaddirResponse readdir(long nodeId, long cookie, long verifier, boolean wantAttributes) {
+		return ok(new ReaddirRequest(nodeId, cookie, verifier, wantAttributes), ReaddirResponse.class);
+	}
+
+	private List<String> names(ReaddirResponse page) {
+		return page.entries().stream().map(DirectoryEntry::name).toList();
+	}
+
+	private Path backing(String name, String content) throws IOException {
+		return Files.writeString(root.resolve(name), content);
+	}
+
+	private List<String> backingNames() throws IOException {
+		try (Stream<Path> children = Files.list(root)) {
+			return children.map(child -> child.getFileName().toString()).sorted().toList();
+		}
+	}
+
+	/**
+	 * Stands in for a channel that transfers less than it is asked to, as channels may.
+	 */
+	private static FileChannel oneBytePerCall(FileChannel channel) {
+		try {
+			FileChannel trickling = Mockito.mock(FileChannel.class);
+			Mockito.when(trickling.read(Mockito.any(ByteBuffer.class), Mockito.anyLong())).thenAnswer(invocation -> {
+				ByteBuffer buffer = invocation.getArgument(0);
+				int read = channel.read(buffer.slice(buffer.position(), Math.min(1, buffer.remaining())), invocation.getArgument(1));
+				buffer.position(buffer.position() + Math.max(0, read));
+				return read;
+			});
+			Mockito.when(trickling.write(Mockito.any(ByteBuffer.class), Mockito.anyLong())).thenAnswer(invocation -> {
+				ByteBuffer buffer = invocation.getArgument(0);
+				int written = channel.write(buffer.slice(buffer.position(), Math.min(1, buffer.remaining())), invocation.getArgument(1));
+				buffer.position(buffer.position() + written);
+				return written;
+			});
+			Mockito.doAnswer(_ -> {
+				channel.close();
+				return null;
+			}).when(trickling).close();
+			return trickling;
+		} catch (IOException e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	private static Stream<Arguments> failures() {
+		return Stream.of( //
+				Arguments.of(new NoSuchFileException("x"), Errno.ENOENT), //
+				Arguments.of(new FileAlreadyExistsException("x"), Errno.EEXIST), //
+				Arguments.of(new DirectoryNotEmptyException("x"), Errno.ENOTEMPTY), //
+				Arguments.of(new NotDirectoryException("x"), Errno.ENOTDIR), //
+				Arguments.of(new AccessDeniedException("x"), Errno.EACCES), //
+				Arguments.of(new ReadOnlyFileSystemException(), Errno.EROFS), //
+				Arguments.of(new UnsupportedOperationException(), Errno.ENOTSUP), //
+				Arguments.of(new InvalidPathException("x", "invalid"), Errno.EINVAL), //
+				Arguments.of(new AtomicMoveNotSupportedException("x", "y", "across file stores"), Errno.EXDEV), //
+				Arguments.of(new StatusException(Errno.EBUSY), Errno.EBUSY), //
+				Arguments.of(new IOException("x"), Errno.EIO), //
+				Arguments.of(new UncheckedIOException(new IOException("x")), Errno.EIO), //
+				Arguments.of(new IllegalStateException("x"), Errno.EIO));
+	}
+
+	/* tests */
+
+	@Nested
+	@DisplayName("lookup and attributes")
+	public class LookupAndAttributes {
+
+		@Test
+		@DisplayName("the root is directory 2 with parent 1")
+		public void testRootAttributes() {
+			Attributes attributes = getattr(ROOT);
+
+			Assertions.assertEquals(NodeType.DIRECTORY, attributes.type());
+			Assertions.assertEquals(2, attributes.nodeId());
+			Assertions.assertEquals(1, attributes.parentId());
+		}
+
+		@Test
+		@DisplayName("lookup reports the entry's attributes and stored name")
+		public void testLookup() throws IOException {
+			Path file = backing("file.txt", "hello");
+			Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r-----"));
+			Files.setLastModifiedTime(file, FileTime.from(Instant.ofEpochSecond(1700000000, 123000000)));
+
+			LookupResponse response = ok(new LookupRequest(ROOT, "file.txt"), LookupResponse.class);
+
+			Assertions.assertEquals("file.txt", response.name());
+			Assertions.assertEquals(NodeType.FILE, response.attributes().type());
+			Assertions.assertEquals(0640, response.attributes().mode());
+			Assertions.assertEquals(5, response.attributes().size());
+			Assertions.assertEquals(64, response.attributes().nodeId());
+			Assertions.assertEquals(ROOT, response.attributes().parentId());
+			Assertions.assertEquals(new Timestamp(1700000000, 123000000), response.attributes().modified());
+		}
+
+		@Test
+		@DisplayName("lookups of one entry yield one node")
+		public void testLookupTwice() throws IOException {
+			backing("file.txt", "");
+
+			Assertions.assertEquals(lookup(ROOT, "file.txt").nodeId(), lookup(ROOT, "file.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("lookup of a missing entry yields ENOENT")
+		public void testLookupMissing() {
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "missing"));
+		}
+
+		@Test
+		@DisplayName("lookup in a file yields ENOTDIR")
+		public void testLookupInFile() throws IOException {
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			assertStatus(Errno.ENOTDIR, new LookupRequest(file, "child"));
+		}
+
+		@ParameterizedTest(name = "\"{0}\"")
+		@DisplayName("rejects invalid names")
+		@ValueSource(strings = {"", ".", "..", "a/b", "/"})
+		public void testInvalidNames(String name) throws IOException {
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			assertStatus(Errno.EINVAL, new LookupRequest(ROOT, name));
+			assertStatus(Errno.EINVAL, new CreateRequest(ROOT, name, NodeType.FILE, 0644));
+			assertStatus(Errno.EINVAL, new RenameRequest(file, ROOT, ROOT, name));
+			Assertions.assertEquals(List.of("file.txt"), backingNames());
+		}
+
+		@Test
+		@DisplayName("an unknown node yields ESTALE")
+		public void testUnknownNode() {
+			assertStatus(Errno.ESTALE, new GetattrRequest(4711));
+		}
+
+		@Test
+		@DisplayName("after a forget the node is gone and a new lookup gets a new id")
+		public void testForget() throws IOException {
+			backing("file.txt", "");
+			long forgotten = lookup(ROOT, "file.txt").nodeId();
+
+			ok(new ForgetRequest(forgotten), ForgetResponse.class);
+
+			assertStatus(Errno.ESTALE, new GetattrRequest(forgotten));
+			Assertions.assertNotEquals(forgotten, lookup(ROOT, "file.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("statfs reports the backing store")
+		public void testStatfs() throws IOException {
+			StatfsResponse response = ok(new StatfsRequest(), StatfsResponse.class);
+
+			Assertions.assertEquals(Files.getFileStore(root).getTotalSpace(), response.totalBytes());
+			Assertions.assertTrue(response.usableBytes() > 0);
+		}
+
+		@ParameterizedTest(name = "{0} -> {1}")
+		@DisplayName("a failure of the backing file system becomes the matching status")
+		@MethodSource("org.cryptomator.frontend.fskit.fs.FileSystemOperationsTest#failures")
+		public void testFailures(Exception failure, int status) {
+			ops.beforeReadingAttributes = _ -> {
+				if (failure instanceof IOException e) {
+					throw e;
+				}
+				throw (RuntimeException) failure;
+			};
+
+			assertStatus(status, new GetattrRequest(ROOT));
+		}
+
+		@Test
+		@DisplayName("a second hello is rejected")
+		public void testHello() {
+			assertStatus(Errno.EINVAL, new HelloRequest(Messages.MAGIC, Messages.PROTOCOL_VERSION, new byte[Messages.TOKEN_LENGTH]));
+		}
+	}
+
+	@Nested
+	@DisplayName("names")
+	public class Names {
+
+		@Test
+		@DisplayName("a decomposed name in the directory is listed and resolves under that spelling to one node")
+		public void testDecomposedNameInDirectory() throws IOException {
+			backing(DECOMPOSED, "");
+
+			ReaddirResponse listing = readdir(ROOT, 0, 0, false);
+			LookupResponse response = ok(new LookupRequest(ROOT, DECOMPOSED), LookupResponse.class);
+
+			Assertions.assertEquals(List.of(".", "..", DECOMPOSED), names(listing));
+			Assertions.assertEquals(DECOMPOSED, response.name());
+			Assertions.assertEquals(listing.entries().get(2).nodeId(), response.attributes().nodeId());
+		}
+
+		@Test
+		@DisplayName("an entry created through a decomposed name is stored composed and found under both spellings as one node")
+		public void testCreateDecomposedName() throws IOException {
+			CreateResponse created = ok(new CreateRequest(ROOT, DECOMPOSED, NodeType.FILE, 0644), CreateResponse.class);
+
+			Assertions.assertEquals(COMPOSED, created.name());
+			Assertions.assertEquals(List.of(COMPOSED), backingNames());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(ROOT, DECOMPOSED).nodeId());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(ROOT, COMPOSED).nodeId());
+			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(ROOT, DECOMPOSED), LookupResponse.class).name());
+		}
+
+		@Test
+		@DisplayName("renaming onto a decomposed spelling of an existing composed name replaces that entry")
+		public void testRenameOntoOtherSpelling() throws IOException {
+			backing(COMPOSED, "old");
+			backing("source", "new");
+			long source = lookup(ROOT, "source").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, DECOMPOSED), RenameResponse.class);
+
+			Assertions.assertEquals(COMPOSED, response.name());
+			Assertions.assertEquals(List.of(COMPOSED), backingNames());
+			Assertions.assertEquals("new", Files.readString(root.resolve(COMPOSED)));
+		}
+	}
+
+	@Nested
+	@DisplayName("below a directory that may be searched but not read")
+	public class BelowUnreadableDirectory {
+
+		private Path unreadable;
+		private long trash;
+		private long user;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			// like the .Trashes directory macOS creates in a volume's root
+			trash = create(ROOT, "trash", NodeType.DIRECTORY).nodeId();
+			unreadable = root.resolve("trash");
+			Files.setPosixFilePermissions(unreadable, PosixFilePermissions.fromString("-wx--x--x"));
+			user = create(trash, "501", NodeType.DIRECTORY).nodeId();
+		}
+
+		@AfterEach
+		public void makeDeletable() throws IOException {
+			Files.setPosixFilePermissions(unreadable, PosixFilePermissions.fromString("rwx------"));
+		}
+
+		@Test
+		@DisplayName("entries are created and found")
+		public void testCreateAndLookup() {
+			long file = create(user, "file.txt", NodeType.FILE).nodeId();
+
+			Assertions.assertEquals(user, lookup(trash, "501").nodeId());
+			Assertions.assertEquals(file, lookup(user, "file.txt").nodeId());
+			Assertions.assertEquals("file.txt", ok(new LookupRequest(user, "file.txt"), LookupResponse.class).name());
+			assertStatus(Errno.ENOENT, new LookupRequest(user, "missing.txt"));
+		}
+
+		@Test
+		@DisplayName("an entry moved there is found as the same node")
+		public void testRenameInto() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			ok(new RenameRequest(file, ROOT, user, "file.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(file, lookup(user, "file.txt").nodeId());
+			Assertions.assertEquals("content", read(file, 0, 100));
+			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(user, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("both spellings of a name resolve to one node")
+		public void testSpellings() {
+			CreateResponse created = ok(new CreateRequest(user, DECOMPOSED, NodeType.FILE, 0644), CreateResponse.class);
+
+			Assertions.assertEquals(COMPOSED, created.name());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(user, DECOMPOSED).nodeId());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(user, COMPOSED).nodeId());
+			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(user, DECOMPOSED), LookupResponse.class).name());
+		}
+	}
+
+	@Nested
+	@DisplayName("on a case-insensitive store")
+	public class CaseInsensitiveStore {
+
+		@BeforeEach
+		public void assumeCaseInsensitiveStore() throws IOException {
+			backing("File.txt", "original");
+			Assumptions.assumeTrue(Files.exists(root.resolve("file.txt")), "store is case-sensitive");
+		}
+
+		@Test
+		@DisplayName("lookup of a case variant yields ENOENT")
+		public void testLookupCaseVariant() {
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "file.txt"));
+		}
+
+		@Test
+		@DisplayName("renaming an entry to a case variant of itself changes its case")
+		public void testRenameToOwnCaseVariant() throws IOException {
+			long file = lookup(ROOT, "File.txt").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(file, ROOT, ROOT, "file.txt"), RenameResponse.class);
+
+			Assertions.assertEquals("file.txt", response.name());
+			Assertions.assertEquals(backingNames(), List.of(response.name()));
+			Assertions.assertEquals(file, lookup(ROOT, response.name()).nodeId());
+		}
+
+		@Test
+		@DisplayName("renaming another entry to a case variant yields EEXIST and leaves the existing entry unchanged")
+		public void testRenameToCaseVariantOfOtherEntry() throws IOException {
+			backing("other.txt", "other");
+			long other = lookup(ROOT, "other.txt").nodeId();
+
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, ROOT, "file.txt"));
+
+			Assertions.assertEquals(List.of("File.txt", "other.txt"), backingNames());
+			Assertions.assertEquals("original", Files.readString(root.resolve("File.txt")));
+		}
+	}
+
+	@Nested
+	@DisplayName("create, remove and rename")
+	public class CreateRemoveRename {
+
+		@Test
+		@DisplayName("creates a file")
+		public void testCreateFile() throws IOException {
+			CreateResponse response = ok(new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0600), CreateResponse.class);
+
+			Assertions.assertTrue(Files.isRegularFile(root.resolve("new.txt")));
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("new.txt"))));
+			Assertions.assertEquals("new.txt", response.name());
+			Assertions.assertEquals(NodeType.FILE, response.attributes().type());
+			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(0, response.attributes().size());
+			Assertions.assertEquals(ROOT, response.attributes().parentId());
+			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
+			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertEquals(response.attributes().nodeId(), lookup(ROOT, "new.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("creates a directory")
+		public void testCreateDirectory() {
+			Attributes directory = create(ROOT, "dir", NodeType.DIRECTORY);
+			Attributes child = create(directory.nodeId(), "child", NodeType.FILE);
+
+			Assertions.assertEquals(NodeType.DIRECTORY, directory.type());
+			Assertions.assertTrue(Files.isRegularFile(root.resolve("dir/child")));
+			Assertions.assertEquals(directory.nodeId(), child.parentId());
+		}
+
+		@Test
+		@DisplayName("a file created without write permission can be written by whoever created it, until it is closed")
+		public void testCreateWithoutWritePermission() throws IOException {
+			long file = ok(new CreateRequest(ROOT, "readonly.txt", NodeType.FILE, 0444), CreateResponse.class).attributes().nodeId();
+
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			Assertions.assertEquals(4, write(file, 0, "data").written());
+			Assertions.assertEquals("data", read(file, 0, 100));
+			Assertions.assertEquals(0444, getattr(file).mode());
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals("data", Files.readString(root.resolve("readonly.txt")));
+			Assertions.assertEquals("r--r--r--", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("readonly.txt"))));
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
+			Assertions.assertEquals("data", read(file, 0, 100));
+		}
+
+		@ParameterizedTest(name = "{0} with mode {1}")
+		@DisplayName("creates an entry with exactly the requested mode, whatever the umask of this process")
+		@CsvSource({"FILE, 0666, rw-rw-rw-", "DIRECTORY, 0777, rwxrwxrwx", "FILE, 0600, rw-------"})
+		public void testCreateMode(NodeType type, int mode, String permissions) throws IOException {
+			CreateResponse response = ok(new CreateRequest(ROOT, "created", type, mode), CreateResponse.class);
+
+			Assertions.assertEquals(mode, response.attributes().mode());
+			Assertions.assertEquals(permissions, PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("created"))));
+		}
+
+		@Test
+		@DisplayName("a created file is at no moment more permissive than requested")
+		public void testCreateModeFromTheStart() {
+			List<String> permissionsWhenCreated = new ArrayList<>();
+			ops.channelWrapper = channel -> {
+				try {
+					permissionsWhenCreated.add(PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("private.txt"))));
+					return channel;
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+			};
+
+			ok(new CreateRequest(ROOT, "private.txt", NodeType.FILE, 0600), CreateResponse.class);
+
+			Assertions.assertEquals(List.of("rw-------"), permissionsWhenCreated);
+		}
+
+		@Test
+		@DisplayName("creating an existing entry yields EEXIST")
+		public void testCreateExisting() throws IOException {
+			backing("file.txt", "content");
+
+			assertStatus(Errno.EEXIST, new CreateRequest(ROOT, "file.txt", NodeType.FILE, 0644));
+
+			Assertions.assertEquals("content", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("creating a symlink yields ENOTSUP")
+		public void testCreateUnsupportedType() throws IOException {
+			assertStatus(Errno.ENOTSUP, new CreateRequest(ROOT, "link", NodeType.SYMLINK, 0644));
+
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("removes a file and replies with its attributes from before the change")
+		public void testRemoveFile() throws IOException {
+			backing("file.txt", "12345");
+			Attributes before = lookup(ROOT, "file.txt");
+
+			RemoveResponse response = ok(new RemoveRequest(before.nodeId(), ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(), backingNames());
+			Assertions.assertEquals(before, response.attributes());
+			Assertions.assertEquals(5, response.attributes().size());
+			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
+		}
+
+		@Test
+		@DisplayName("a remove replies with the attributes read just before it, not the ones last reported")
+		public void testRemoveChangedFile() throws IOException {
+			backing("file.txt", "12345");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			backing("file.txt", "123456789");
+
+			Assertions.assertEquals(9, ok(new RemoveRequest(file, ROOT), RemoveResponse.class).attributes().size());
+		}
+
+		@Test
+		@DisplayName("removes an empty directory, but not one with entries")
+		public void testRemoveDirectory() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long child = create(directory, "child", NodeType.FILE).nodeId();
+
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+			ok(new RemoveRequest(child, directory), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("a file re-created under a removed item's name is a new node")
+		public void testRecreateRemovedName() throws IOException {
+			backing("file.txt", "old");
+			long removed = lookup(ROOT, "file.txt").nodeId();
+			ok(new RemoveRequest(removed, ROOT), RemoveResponse.class);
+
+			long recreated = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+
+			Assertions.assertNotEquals(removed, recreated);
+			Assertions.assertEquals(recreated, lookup(ROOT, "file.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("renames a file within its directory")
+		public void testRename() throws IOException {
+			backing("old.txt", "content");
+			Attributes file = lookup(ROOT, "old.txt");
+
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, ROOT, "new.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of("new.txt"), backingNames());
+			Assertions.assertEquals("new.txt", response.name());
+			Assertions.assertEquals(file.nodeId(), response.attributes().nodeId());
+			Assertions.assertNull(response.replacedAttributes());
+			Assertions.assertEquals(file.nodeId(), lookup(ROOT, "new.txt").nodeId());
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "old.txt"));
+		}
+
+		@Test
+		@DisplayName("moving a directory re-paths the open file inside it")
+		public void testMoveDirectoryWithOpenFile() throws IOException {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			long target = create(ROOT, "target", NodeType.DIRECTORY).nodeId();
+			long file = create(source, "file.txt", NodeType.FILE).nodeId();
+			write(file, 0, "before");
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, target, "moved"), RenameResponse.class);
+			write(file, 6, " and after");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals(target, response.attributes().parentId());
+			Assertions.assertEquals(target, response.destinationDirectoryAttributes().nodeId());
+			Assertions.assertEquals(ROOT, response.sourceDirectoryAttributes().nodeId());
+			Assertions.assertEquals("before and after", Files.readString(root.resolve("target/moved/file.txt")));
+			Assertions.assertEquals(file, lookup(source, "file.txt").nodeId());
+			Assertions.assertEquals(16, getattr(file).size());
+		}
+
+		@Test
+		@DisplayName("a replacing rename replies with the replaced item's attributes from before the change and unlinks it")
+		public void testRenameReplacing() throws IOException {
+			backing("source.txt", "new");
+			backing("target.txt", "replaced");
+			long source = lookup(ROOT, "source.txt").nodeId();
+			Attributes target = lookup(ROOT, "target.txt");
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of("target.txt"), backingNames());
+			Assertions.assertEquals("new", Files.readString(root.resolve("target.txt")));
+			Assertions.assertEquals("target.txt", response.name());
+			Assertions.assertEquals(target, response.replacedAttributes());
+			Assertions.assertEquals(8, response.replacedAttributes().size());
+			assertStatus(Errno.ESTALE, new RemoveRequest(target.nodeId(), ROOT));
+			Assertions.assertEquals(target, getattr(target.nodeId()));
+			Assertions.assertEquals(source, lookup(ROOT, "target.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("a replacing rename replies with the replaced item's attributes read just before it, not the ones last reported")
+		public void testRenameReplacingChangedFile() throws IOException {
+			backing("source.txt", "new");
+			backing("target.txt", "replaced");
+			long source = lookup(ROOT, "source.txt").nodeId();
+			lookup(ROOT, "target.txt");
+			backing("target.txt", "replaced and grown");
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(18, response.replacedAttributes().size());
+		}
+
+		@Test
+		@DisplayName("a replacing rename that fails leaves the file it would have replaced in place")
+		public void testFailingRenameKeepsTarget() throws IOException {
+			long locked = create(ROOT, "locked", NodeType.DIRECTORY).nodeId();
+			long source = create(locked, "source.txt", NodeType.FILE).nodeId();
+			backing("target.txt", "replaced");
+			long target = lookup(ROOT, "target.txt").nodeId();
+			// entries cannot be moved out of a directory that is not writable
+			Files.setPosixFilePermissions(root.resolve("locked"), PosixFilePermissions.fromString("r-xr-xr-x"));
+			try {
+				Assumptions.assumeFalse(Files.isWritable(root.resolve("locked")), "permissions do not apply to this user");
+
+				assertStatus(Errno.EACCES, new RenameRequest(source, locked, ROOT, "target.txt"));
+
+				Assertions.assertEquals("replaced", Files.readString(root.resolve("target.txt")));
+				Assertions.assertEquals(target, lookup(ROOT, "target.txt").nodeId());
+				Assertions.assertEquals(source, lookup(locked, "source.txt").nodeId());
+			} finally {
+				Files.setPosixFilePermissions(root.resolve("locked"), PosixFilePermissions.fromString("rwxr-xr-x"));
+			}
+		}
+
+		@Test
+		@DisplayName("a file that cannot replace a file atomically yields EXDEV and leaves both in place")
+		public void testRenameWithoutAtomicMove() throws IOException {
+			backing("source.txt", "new");
+			backing("target.txt", "replaced");
+			long source = lookup(ROOT, "source.txt").nodeId();
+			long target = lookup(ROOT, "target.txt").nodeId();
+			ops.beforeMoving = path -> {
+				throw new AtomicMoveNotSupportedException(path.toString(), "target.txt", "across file stores");
+			};
+
+			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, ROOT, "target.txt"));
+
+			Assertions.assertEquals(List.of(StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING), ops.moveOptions);
+			Assertions.assertEquals("replaced", Files.readString(root.resolve("target.txt")));
+			Assertions.assertEquals("new", Files.readString(root.resolve("source.txt")));
+			Assertions.assertEquals(target, lookup(ROOT, "target.txt").nodeId());
+			Assertions.assertEquals(source, lookup(ROOT, "source.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("an entry that cannot be moved atomically yields EXDEV and stays where it is")
+		public void testMoveWithoutAtomicMove() throws IOException {
+			backing("source.txt", "content");
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long source = lookup(ROOT, "source.txt").nodeId();
+			ok(new OpenRequest(source, READ | WRITE), OpenResponse.class);
+			ops.beforeMoving = path -> {
+				throw new AtomicMoveNotSupportedException(path.toString(), "dir/moved.txt", "across file stores");
+			};
+
+			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, directory, "moved.txt"));
+
+			Assertions.assertEquals(List.of(StandardCopyOption.ATOMIC_MOVE), ops.moveOptions);
+			Assertions.assertEquals(source, lookup(ROOT, "source.txt").nodeId());
+			write(source, 7, " kept");
+			Assertions.assertEquals("content kept", Files.readString(root.resolve("source.txt")));
+		}
+
+		@Test
+		@DisplayName("renames a directory that lacks write permission")
+		public void testRenameReadOnlyDirectory() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long child = create(directory, "child", NodeType.FILE).nodeId();
+			ok(new CloseRequest(child, 0), CloseResponse.class);
+			ok(new SetattrRequest(directory, Messages.ATTRIBUTE_MODE, 0, 0555, EPOCH, EPOCH), SetattrResponse.class);
+			try {
+				ok(new RenameRequest(directory, ROOT, ROOT, "renamed"), RenameResponse.class);
+
+				Assertions.assertEquals(List.of("renamed"), backingNames());
+				Assertions.assertEquals(child, lookup(directory, "child").nodeId());
+			} finally {
+				ok(new SetattrRequest(directory, Messages.ATTRIBUTE_MODE, 0, 0755, EPOCH, EPOCH), SetattrResponse.class);
+			}
+		}
+
+		@Test
+		@DisplayName("renaming an entry onto its own name changes nothing")
+		public void testRenameOntoOwnName() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(file, ROOT, ROOT, "file.txt"), RenameResponse.class);
+
+			Assertions.assertEquals("file.txt", response.name());
+			Assertions.assertNull(response.replacedAttributes());
+			Assertions.assertEquals("content", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(file, lookup(ROOT, "file.txt").nodeId());
+			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+		}
+
+		@Test
+		@DisplayName("a directory replaces an empty directory")
+		public void testRenameOverEmptyDirectory() {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			long child = create(source, "child", NodeType.FILE).nodeId();
+			Attributes target = create(ROOT, "target", NodeType.DIRECTORY);
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+
+			Assertions.assertEquals(target.nodeId(), response.replacedAttributes().nodeId());
+			Assertions.assertEquals(source, lookup(ROOT, "target").nodeId());
+			Assertions.assertEquals(child, lookup(source, "child").nodeId());
+			Assertions.assertFalse(Files.exists(root.resolve("source")));
+		}
+
+		@Test
+		@DisplayName("moving a directory into itself or below itself yields EINVAL and moves nothing")
+		public void testMoveDirectoryBelowItself() throws IOException {
+			long outer = create(ROOT, "outer", NodeType.DIRECTORY).nodeId();
+			long inner = create(outer, "inner", NodeType.DIRECTORY).nodeId();
+			long innermost = create(inner, "innermost", NodeType.DIRECTORY).nodeId();
+
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, outer, "moved"));
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, innermost, "moved"));
+
+			Assertions.assertEquals(List.of(), ops.moveOptions);
+			Assertions.assertEquals(List.of("outer"), backingNames());
+			Assertions.assertEquals(innermost, lookup(inner, "innermost").nodeId());
+			ok(new RenameRequest(innermost, inner, ROOT, "moved up"), RenameResponse.class);
+			Assertions.assertEquals(List.of("moved up", "outer"), backingNames());
+		}
+
+		@Test
+		@DisplayName("renaming a directory over a directory with entries yields ENOTEMPTY")
+		public void testRenameOverNonEmptyDirectory() {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			long target = create(ROOT, "target", NodeType.DIRECTORY).nodeId();
+			create(target, "child", NodeType.FILE);
+
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(source, ROOT, ROOT, "target"));
+
+			Assertions.assertTrue(Files.isDirectory(root.resolve("source")));
+			Assertions.assertEquals(target, lookup(ROOT, "target").nodeId());
+		}
+	}
+
+	@Nested
+	@DisplayName("a removed file that is still open")
+	public class RemovedButOpen {
+
+		private long file;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			backing("file.txt", "0123456789");
+			file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+		}
+
+		@Test
+		@DisplayName("stays readable and writable and reports its grown size")
+		public void testReadWrite() throws IOException {
+			Assertions.assertEquals("0123456789", read(file, 0, 100));
+
+			WriteResponse written = write(file, 10, "abcdef");
+
+			Assertions.assertEquals(16, written.attributes().size());
+			Assertions.assertEquals(file, written.attributes().nodeId());
+			Assertions.assertEquals("0123456789abcdef", read(file, 0, 100));
+			Assertions.assertEquals(16, getattr(file).size());
+			Assertions.assertEquals(16, ok(new ReadRequest(file, 0, 1), ReadResponse.class).attributes().size());
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("can be truncated and extended through its writable channel")
+		public void testTruncate() {
+			SetattrResponse truncated = ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 4, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, truncated.applied());
+			Assertions.assertEquals(4, truncated.attributes().size());
+			Assertions.assertEquals("0123", read(file, 0, 100));
+			Assertions.assertEquals(8, ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 8, 0, EPOCH, EPOCH), SetattrResponse.class).attributes().size());
+			Assertions.assertEquals("0123\0\0\0\0", read(file, 0, 100));
+			Assertions.assertEquals(1, ops.openedChannels.size());
+		}
+
+		@Test
+		@DisplayName("a time or permission change leaves a file re-created under its name untouched")
+		public void testTimesAndModeNotApplied() throws IOException {
+			Path recreated = backing("file.txt", "recreated");
+			Files.setPosixFilePermissions(recreated, PosixFilePermissions.fromString("rw-r--r--"));
+			FileTime modified = Files.getLastModifiedTime(recreated);
+			Attributes before = getattr(file);
+			int valid = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 2, 0600, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, response.applied());
+			Assertions.assertEquals(before.mode(), response.attributes().mode());
+			Assertions.assertEquals(before.modified(), response.attributes().modified());
+			Assertions.assertEquals("recreated", Files.readString(recreated));
+			Assertions.assertEquals("rw-r--r--", PosixFilePermissions.toString(Files.getPosixFilePermissions(recreated)));
+			Assertions.assertEquals(modified, Files.getLastModifiedTime(recreated));
+			Assertions.assertEquals("01", read(file, 0, 100));
+		}
+
+		@Test
+		@DisplayName("sync includes its channel")
+		public void testSync() throws IOException {
+			FileChannel channel = Mockito.mock(FileChannel.class);
+			ops.channelWrapper = _ -> channel;
+			backing("other.txt", "");
+			long other = lookup(ROOT, "other.txt").nodeId();
+			ok(new OpenRequest(other, WRITE), OpenResponse.class);
+			ok(new RemoveRequest(other, ROOT), RemoveResponse.class);
+
+			ok(new SyncRequest(), SyncResponse.class);
+
+			Mockito.verify(channel).force(false);
+		}
+
+		@Test
+		@DisplayName("is unreachable by path: it cannot be removed or renamed again")
+		public void testNoPathOperations() throws IOException {
+			backing("file.txt", "recreated");
+
+			assertStatus(Errno.ESTALE, new RemoveRequest(file, ROOT));
+			assertStatus(Errno.ESTALE, new RenameRequest(file, ROOT, ROOT, "other.txt"));
+
+			Assertions.assertEquals(List.of("file.txt"), backingNames());
+			Assertions.assertNotEquals(file, lookup(ROOT, "file.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("is gone for good once it is closed and forgotten")
+		public void testCloseAndForget() {
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
+
+			assertStatus(Errno.EIO, new ReadRequest(file, 0, 10));
+			assertStatus(Errno.EIO, new OpenRequest(file, READ));
+			Assertions.assertEquals(10, getattr(file).size());
+			ok(new ForgetRequest(file), ForgetResponse.class);
+			assertStatus(Errno.ESTALE, new GetattrRequest(file));
+		}
+	}
+
+	@Nested
+	@DisplayName("a removed item without a writable channel")
+	public class RemovedWithoutWritableChannel {
+
+		@Test
+		@DisplayName("a file open for reading cannot be widened, written or truncated")
+		public void testReadOnlyChannel() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals("0123456789", read(file, 0, 100));
+			assertStatus(Errno.EIO, new OpenRequest(file, READ | WRITE));
+			assertStatus(Errno.EIO, new WriteRequest(file, 0, ByteBuffer.allocate(1)));
+			assertStatus(Errno.EINVAL, new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 0, 0, EPOCH, EPOCH));
+			Assertions.assertEquals(1, ops.openedChannels.size());
+		}
+
+		@Test
+		@DisplayName("a file that was never opened cannot be opened anymore")
+		public void testNeverOpened() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			backing("file.txt", "recreated");
+
+			assertStatus(Errno.EIO, new OpenRequest(file, READ));
+			assertStatus(Errno.EIO, new ReadRequest(file, 0, 10));
+			assertStatus(Errno.EIO, new WriteRequest(file, 0, ByteBuffer.allocate(1)));
+			Assertions.assertEquals(10, getattr(file).size());
+			Assertions.assertEquals("recreated", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a removed directory answers nothing but getattr")
+		public void testRemovedDirectory() {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			create(ROOT, "dir", NodeType.DIRECTORY);
+
+			assertStatus(Errno.ESTALE, new LookupRequest(directory, "child"));
+			assertStatus(Errno.ESTALE, new ReaddirRequest(directory, 0, 0, false));
+			assertStatus(Errno.ESTALE, new CreateRequest(directory, "child", NodeType.FILE, 0644));
+			Assertions.assertEquals(NodeType.DIRECTORY, getattr(directory).type());
+			Assertions.assertFalse(Files.exists(root.resolve("dir/child")));
+		}
+
+		@Test
+		@DisplayName("a file replaced by a rename keeps serving its content through its open channel")
+		public void testReplacedByRename() throws IOException {
+			backing("target.txt", "old content");
+			backing("source.txt", "new");
+			long target = lookup(ROOT, "target.txt").nodeId();
+			long source = lookup(ROOT, "source.txt").nodeId();
+			ok(new OpenRequest(target, READ | WRITE), OpenResponse.class);
+
+			ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+			write(target, 0, "OLD");
+
+			Assertions.assertEquals("OLD content", read(target, 0, 100));
+			Assertions.assertEquals(11, getattr(target).size());
+			Assertions.assertEquals("new", read(source, 0, 100));
+			Assertions.assertEquals("new", Files.readString(root.resolve("target.txt")));
+		}
+	}
+
+	@Nested
+	@DisplayName("on a vault")
+	public class OnVault {
+
+		private FileSystem vault;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			MasterkeyLoader keyLoader = _ -> new Masterkey(new byte[64]);
+			CryptoFileSystemProperties properties = CryptoFileSystemProperties.cryptoFileSystemProperties().withKeyLoader(keyLoader).build();
+			CryptoFileSystemProvider.initialize(root, properties, URI.create("test:key"));
+			vault = CryptoFileSystemProvider.newFileSystem(root, properties);
+			ops.close();
+			ops = new HookedOperations(vault.getPath("/"), false);
+		}
+
+		@AfterEach
+		public void tearDown() throws IOException {
+			ops.close();
+			vault.close();
+		}
+
+		private long createFile(String name, String content) {
+			long file = create(ROOT, name, NodeType.FILE).nodeId();
+			write(file, 0, content);
+			return file;
+		}
+
+		@Test
+		@DisplayName("replacing a file that is open yields EBUSY")
+		public void testRenameOverOpenFile() {
+			long source = createFile("source.txt", "new");
+			long target = createFile("target.txt", "replaced");
+			ok(new CloseRequest(source, 0), CloseResponse.class);
+
+			assertStatus(Errno.EBUSY, new RenameRequest(source, ROOT, ROOT, "target.txt"));
+
+			ReadResponse response = ok(new ReadRequest(target, 0, 100), ReadResponse.class);
+			Assertions.assertEquals("replaced", StandardCharsets.UTF_8.decode(response.data()).toString());
+			Assertions.assertEquals(8, response.attributes().size());
+		}
+
+		@Test
+		@DisplayName("a file replaces a file that is closed")
+		public void testRenameOverClosedFile() {
+			long source = createFile("source.txt", "new");
+			long target = createFile("target.txt", "replaced");
+			ok(new CloseRequest(source, 0), CloseResponse.class);
+			ok(new CloseRequest(target, 0), CloseResponse.class);
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(target, response.replacedAttributes().nodeId());
+			Assertions.assertEquals("new", read(source, 0, 100));
+			Assertions.assertEquals(List.of(".", "..", "target.txt"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("a directory replaces an empty directory")
+		public void testRenameOverEmptyDirectory() {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			long child = createFile("child.txt", "content");
+			ok(new CloseRequest(child, 0), CloseResponse.class);
+			ok(new RenameRequest(child, ROOT, source, "child.txt"), RenameResponse.class);
+			create(ROOT, "target", NodeType.DIRECTORY);
+
+			ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals("content", read(lookup(source, "child.txt").nodeId(), 0, 100));
+		}
+
+		@Test
+		@DisplayName("moving a directory below itself yields EINVAL and keeps everything in it reachable")
+		public void testMoveDirectoryBelowItself() {
+			long outer = create(ROOT, "outer", NodeType.DIRECTORY).nodeId();
+			long inner = create(outer, "inner", NodeType.DIRECTORY).nodeId();
+			long innermost = create(inner, "innermost", NodeType.DIRECTORY).nodeId();
+			long file = create(outer, "file.txt", NodeType.FILE).nodeId();
+			write(file, 0, "content");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, innermost, "moved"));
+
+			Assertions.assertEquals(List.of(".", "..", "outer"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertTrue(Files.isDirectory(vault.getPath("/outer/inner/innermost")));
+			Assertions.assertEquals("content", read(lookup(outer, "file.txt").nodeId(), 0, 100));
+		}
+
+		@Test
+		@DisplayName("a file that is still open is renamed and moved, and keeps receiving writes")
+		public void testRenameOpenFile() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long file = createFile("file.txt", "one");
+
+			ok(new RenameRequest(file, ROOT, ROOT, "renamed.txt"), RenameResponse.class);
+			write(file, 3, " two");
+			ok(new RenameRequest(file, ROOT, directory, "moved.txt"), RenameResponse.class);
+			write(file, 7, " three");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals("one two three", Files.readString(vault.getPath("/dir/moved.txt")));
+			Assertions.assertEquals(List.of(".", "..", "dir"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("moves a directory and a link that replace nothing")
+		public void testMoveDirectoryAndLink() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long target = create(ROOT, "target", NodeType.DIRECTORY).nodeId();
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
+			long link = lookup(ROOT, "link").nodeId();
+
+			ok(new RenameRequest(directory, ROOT, target, "moved"), RenameResponse.class);
+			ok(new RenameRequest(link, ROOT, target, "moved link"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals(directory, lookup(target, "moved").nodeId());
+			Assertions.assertTrue(Files.isSymbolicLink(vault.getPath("/target/moved link")));
+		}
+
+		@Test
+		@DisplayName("a link replaces a file")
+		public void testRenameLinkOverFile() throws IOException {
+			long file = createFile("file.txt", "content");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
+			long link = lookup(ROOT, "link").nodeId();
+
+			ok(new RenameRequest(link, ROOT, ROOT, "file.txt"), RenameResponse.class);
+
+			Assertions.assertTrue(Files.isSymbolicLink(vault.getPath("/file.txt")));
+			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("a removed file that is still open stays readable and writable until it is closed")
+		public void testRemovedButOpen() {
+			long file = createFile("file.txt", "0123456789");
+
+			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(".", ".."), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals("0123456789", read(file, 0, 100));
+			Assertions.assertEquals(16, write(file, 10, "abcdef").attributes().size());
+			Assertions.assertEquals(4, ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 4, 0, EPOCH, EPOCH), SetattrResponse.class).attributes().size());
+			Assertions.assertEquals("0123", read(file, 0, 100));
+			Assertions.assertEquals(4, getattr(file).size());
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			ok(new ForgetRequest(file), ForgetResponse.class);
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "file.txt"));
+		}
+
+		@Test
+		@DisplayName("a file re-created under the name of a removed file that is still open is a file of its own")
+		public void testRecreateWhileRemovedFileIsOpen() {
+			long removed = createFile("file.txt", "removed");
+			ok(new RemoveRequest(removed, ROOT), RemoveResponse.class);
+
+			long recreated = createFile("file.txt", "recreated");
+			write(removed, 7, " and still open");
+
+			Assertions.assertNotEquals(removed, recreated);
+			Assertions.assertEquals("removed and still open", read(removed, 0, 100));
+			Assertions.assertEquals("recreated", read(recreated, 0, 100));
+			ok(new CloseRequest(removed, 0), CloseResponse.class);
+			Assertions.assertEquals("recreated", read(lookup(ROOT, "file.txt").nodeId(), 0, 100));
+		}
+
+		@Test
+		@DisplayName("an entry created through a decomposed name is found under both spellings as one node")
+		public void testDecomposedName() {
+			long file = createFile(DECOMPOSED, "content");
+
+			Assertions.assertEquals(file, lookup(ROOT, COMPOSED).nodeId());
+			Assertions.assertEquals(file, lookup(ROOT, DECOMPOSED).nodeId());
+			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(ROOT, DECOMPOSED), LookupResponse.class).name());
+		}
+	}
+
+	@Nested
+	@DisplayName("open, read and write")
+	public class OpenReadWrite {
+
+		private long file;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			backing("file.txt", "0123456789");
+			file = lookup(ROOT, "file.txt").nodeId();
+		}
+
+		@Test
+		@DisplayName("reads without a preceding open")
+		public void testReadLazily() {
+			Assertions.assertEquals("2345", read(file, 2, 4));
+		}
+
+		@Test
+		@DisplayName("a read past the end returns what is there")
+		public void testReadPastEnd() {
+			Assertions.assertEquals("89", read(file, 8, 100));
+			Assertions.assertEquals("", read(file, 10, 100));
+			Assertions.assertEquals("", read(file, 5000, 100));
+		}
+
+		@Test
+		@DisplayName("a read replies with the file's attributes")
+		public void testReadAttributes() {
+			ReadResponse response = ok(new ReadRequest(file, 0, 4), ReadResponse.class);
+
+			Assertions.assertEquals(file, response.attributes().nodeId());
+			Assertions.assertEquals(10, response.attributes().size());
+		}
+
+		@Test
+		@DisplayName("rejects a read longer than a payload can hold")
+		public void testReadTooLong() {
+			assertStatus(Errno.EINVAL, new ReadRequest(file, 0, FrameCodec.MAX_PAYLOAD_LENGTH + 1));
+		}
+
+		@Test
+		@DisplayName("a read as long as a payload can hold fits into a frame")
+		public void testLongestRead() throws IOException {
+			byte[] content = new byte[FrameCodec.MAX_PAYLOAD_LENGTH + 10];
+			Arrays.fill(content, (byte) 'x');
+			Files.write(root.resolve("file.txt"), content);
+
+			ReadResponse response = ok(new ReadRequest(file, 0, FrameCodec.MAX_PAYLOAD_LENGTH), ReadResponse.class);
+
+			Assertions.assertEquals(FrameCodec.MAX_PAYLOAD_LENGTH, response.data().remaining());
+			Frame decoded = FrameCodecTest.read(FrameCodecTest.write(response.toFrame(Opcode.READ, 1)));
+			Assertions.assertEquals(ByteBuffer.wrap(content, 0, FrameCodec.MAX_PAYLOAD_LENGTH), decoded.payload());
+		}
+
+		@Test
+		@DisplayName("reads and writes in full through a channel that transfers one byte per call")
+		public void testShortReadsAndWrites() throws IOException {
+			ops.channelWrapper = FileSystemOperationsTest::oneBytePerCall;
+			ByteBuffer data = StandardCharsets.UTF_8.encode("xxabcdefxx").position(2).limit(8);
+
+			WriteResponse written = ok(new WriteRequest(file, 8, data), WriteResponse.class);
+
+			Assertions.assertEquals(6, written.written());
+			Assertions.assertEquals("01234567abcdef", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals("234567abcdef", read(file, 2, 100));
+			Assertions.assertEquals("4567", read(file, 4, 4));
+		}
+
+		@Test
+		@DisplayName("writes without a preceding open and replies with the grown size")
+		public void testWriteLazily() throws IOException {
+			WriteResponse response = write(file, 8, "abcdef");
+
+			Assertions.assertEquals(6, response.written());
+			Assertions.assertEquals(14, response.attributes().size());
+			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertEquals("01234567abcdef", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("writes the part of a buffer between its position and limit")
+		public void testWriteBufferSlice() throws IOException {
+			ByteBuffer data = StandardCharsets.UTF_8.encode("xxABCxx").position(2).limit(5);
+
+			WriteResponse response = ok(new WriteRequest(file, 0, data), WriteResponse.class);
+
+			Assertions.assertEquals(3, response.written());
+			Assertions.assertEquals("ABC3456789", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("widening the open modes swaps in a new channel and closes the old one")
+		public void testWidenModes() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			write(file, 0, "ab");
+
+			Assertions.assertEquals(2, ops.openedChannels.size());
+			Assertions.assertFalse(ops.openedChannels.get(0).isOpen());
+			Assertions.assertTrue(ops.openedChannels.get(1).isOpen());
+			Assertions.assertEquals("ab23", read(file, 0, 4));
+			Assertions.assertEquals(2, ops.openedChannels.size());
+		}
+
+		@Test
+		@DisplayName("opening with modes already granted keeps the channel")
+		public void testReopenSameModes() {
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+
+			Assertions.assertEquals(1, ops.openedChannels.size());
+		}
+
+		@Test
+		@DisplayName("a close that keeps no mode closes the channel, one that keeps a mode does not")
+		public void testClose() {
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+
+			ok(new CloseRequest(file, READ), CloseResponse.class);
+			Assertions.assertTrue(ops.openedChannels.getFirst().isOpen());
+
+			CloseResponse response = ok(new CloseRequest(file, 0), CloseResponse.class);
+			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
+			Assertions.assertTrue(response.usableBytes() > 0);
+		}
+
+		@Test
+		@DisplayName("a forget closes the channel")
+		public void testForgetClosesChannel() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			ok(new ForgetRequest(file), ForgetResponse.class);
+
+			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
+		}
+
+		@Test
+		@DisplayName("directories get no channel")
+		public void testOpenDirectory() {
+			ok(new OpenRequest(ROOT, READ), OpenResponse.class);
+			ok(new CloseRequest(ROOT, 0), CloseResponse.class);
+
+			Assertions.assertEquals(List.of(), ops.openedChannels);
+			assertStatus(Errno.EISDIR, new ReadRequest(ROOT, 0, 10));
+			assertStatus(Errno.EISDIR, new WriteRequest(ROOT, 0, ByteBuffer.allocate(1)));
+		}
+
+		@Test
+		@DisplayName("sync forces every open channel and reports the first failure")
+		public void testSync() throws IOException {
+			backing("other.txt", "");
+			long other = lookup(ROOT, "other.txt").nodeId();
+			FileChannel failing = Mockito.mock(FileChannel.class);
+			FileChannel working = Mockito.mock(FileChannel.class);
+			Mockito.doThrow(new IOException("disk on fire")).when(failing).force(false);
+			ops.channelWrapper = _ -> failing;
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			ops.channelWrapper = _ -> working;
+			ok(new OpenRequest(other, WRITE), OpenResponse.class);
+
+			assertStatus(Errno.EIO, new SyncRequest());
+			Mockito.verify(failing).force(false);
+			Mockito.verify(working).force(false);
+
+			Mockito.doNothing().when(failing).force(false);
+			Assertions.assertTrue(ok(new SyncRequest(), SyncResponse.class).usableBytes() > 0);
+		}
+	}
+
+	@Nested
+	@DisplayName("setattr")
+	public class Setattr {
+
+		private long file;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			backing("file.txt", "0123456789");
+			file = lookup(ROOT, "file.txt").nodeId();
+		}
+
+		private SetattrResponse setSize(long size) {
+			return ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, size, 0, EPOCH, EPOCH), SetattrResponse.class);
+		}
+
+		@Test
+		@DisplayName("truncates a file")
+		public void testTruncate() throws IOException {
+			SetattrResponse response = setSize(4);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, response.applied());
+			Assertions.assertEquals(4, response.attributes().size());
+			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertEquals("0123", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(List.of(), ops.openedChannels.stream().filter(FileChannel::isOpen).toList());
+		}
+
+		@Test
+		@DisplayName("extends a file with zeros")
+		public void testExtend() throws IOException {
+			SetattrResponse response = setSize(10000);
+
+			Assertions.assertEquals(10000, response.attributes().size());
+			byte[] content = Files.readAllBytes(root.resolve("file.txt"));
+			Assertions.assertEquals(10000, content.length);
+			Assertions.assertEquals("0123456789", new String(content, 0, 10, StandardCharsets.UTF_8));
+			for (int i = 10; i < content.length; i++) {
+				Assertions.assertEquals(0, content[i], "byte " + i);
+			}
+		}
+
+		@Test
+		@DisplayName("truncates through the open channel when that is writable")
+		public void testTruncateThroughWritableChannel() {
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+
+			setSize(4);
+
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertEquals("0123", read(file, 0, 100));
+		}
+
+		@Test
+		@DisplayName("truncates a file whose open channel is read-only")
+		public void testTruncateWithReadOnlyChannel() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			setSize(4);
+
+			Assertions.assertEquals("0123", read(file, 0, 100));
+			Assertions.assertTrue(ops.openedChannels.get(0).isOpen());
+			Assertions.assertFalse(ops.openedChannels.get(1).isOpen());
+		}
+
+		@Test
+		@DisplayName("sets times and permissions and reports what it applied")
+		public void testTimesAndMode() throws IOException {
+			int valid = Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
+			Timestamp accessed = new Timestamp(1600000000, 0);
+			Timestamp modified = new Timestamp(1500000000, 0);
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0600, accessed, modified), SetattrResponse.class);
+
+			Assertions.assertEquals(valid, response.applied());
+			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(modified, response.attributes().modified());
+			Assertions.assertEquals(10, response.attributes().size());
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+			Assertions.assertEquals(Instant.ofEpochSecond(1500000000), Files.getLastModifiedTime(root.resolve("file.txt")).toInstant());
+		}
+
+		@Test
+		@DisplayName("changes the permissions of an entry that lacks read permission")
+		public void testModeOfUnreadableEntries() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			for (long node : List.of(file, directory)) {
+				ok(new SetattrRequest(node, Messages.ATTRIBUTE_MODE, 0, 0311, EPOCH, EPOCH), SetattrResponse.class);
+
+				SetattrResponse response = ok(new SetattrRequest(node, Messages.ATTRIBUTE_MODE, 0, 0700, EPOCH, EPOCH), SetattrResponse.class);
+
+				Assertions.assertEquals(Messages.ATTRIBUTE_MODE, response.applied());
+				Assertions.assertEquals(0700, response.attributes().mode());
+			}
+			Assertions.assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("dir"))));
+			Assertions.assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+		}
+
+		@Test
+		@DisplayName("sets only the modification time when only that is valid")
+		public void testModifiedOnly() throws IOException {
+			Path path = root.resolve("file.txt");
+			Files.setAttribute(path, "lastAccessTime", FileTime.from(Instant.ofEpochSecond(1400000000)));
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_MODIFIED, 0, 0, EPOCH, new Timestamp(1500000000, 0)), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_MODIFIED, response.applied());
+			Assertions.assertEquals(new Timestamp(1400000000, 0), response.attributes().accessed());
+			Assertions.assertEquals(new Timestamp(1500000000, 0), response.attributes().modified());
+		}
+
+		@Test
+		@DisplayName("does not apply a size to a directory")
+		public void testSizeOfDirectory() {
+			SetattrResponse response = ok(new SetattrRequest(ROOT, Messages.ATTRIBUTE_SIZE, 0, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+		}
+	}
+
+	@Nested
+	@DisplayName("readdir")
+	public class Readdir {
+
+		private static final int ENTRIES = 250;
+		private static final String LONG_NAME_PREFIX = "x".repeat(200);
+
+		/**
+		 * Creates enough entries with long names to need more than one page.
+		 */
+		private Set<String> createManyEntries() throws IOException {
+			Set<String> names = new HashSet<>();
+			for (int i = 0; i < ENTRIES; i++) {
+				String name = LONG_NAME_PREFIX + i;
+				backing(name, "");
+				names.add(name);
+			}
+			return names;
+		}
+
+		@Test
+		@DisplayName("a listing of names starts with . and ..")
+		public void testNamesStartWithDotEntries() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long file = create(directory, "file.txt", NodeType.FILE).nodeId();
+
+			ReaddirResponse page = readdir(directory, 0, 0, false);
+
+			Assertions.assertFalse(page.more());
+			Assertions.assertEquals(List.of( //
+					new DirectoryEntry(".", NodeType.DIRECTORY, directory, 1, null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
+					new DirectoryEntry("file.txt", NodeType.FILE, file, 3, null)), page.entries());
+		}
+
+		@Test
+		@DisplayName("the root's .. entry is the root itself")
+		public void testRootDotEntries() {
+			Assertions.assertEquals(List.of( //
+					new DirectoryEntry(".", NodeType.DIRECTORY, ROOT, 1, null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null)), readdir(ROOT, 0, 0, false).entries());
+		}
+
+		@Test
+		@DisplayName("a listing with attributes omits . and ..")
+		public void testAttributesOmitDotEntries() throws IOException {
+			backing("file.txt", "12345");
+			Files.createDirectory(root.resolve("dir"));
+
+			ReaddirResponse page = readdir(ROOT, 0, 0, true);
+
+			Assertions.assertEquals(Set.of("file.txt", "dir"), Set.copyOf(names(page)));
+			for (DirectoryEntry entry : page.entries()) {
+				Assertions.assertEquals(entry.nodeId(), entry.attributes().nodeId());
+				Assertions.assertEquals(entry.type(), entry.attributes().type());
+				Assertions.assertEquals(ROOT, entry.attributes().parentId());
+				Assertions.assertEquals(entry.nodeId(), lookup(ROOT, entry.name()).nodeId());
+			}
+			DirectoryEntry file = page.entries().stream().filter(entry -> entry.name().equals("file.txt")).findFirst().orElseThrow();
+			Assertions.assertEquals(5, file.attributes().size());
+			Assertions.assertEquals(NodeType.FILE, file.type());
+		}
+
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("paging by cookie returns every entry once, and the cookie at the end returns an empty page")
+		@ValueSource(booleans = {false, true})
+		public void testPaging(boolean wantAttributes) throws IOException {
+			Set<String> expected = createManyEntries();
+			if (!wantAttributes) {
+				expected.addAll(List.of(".", ".."));
+			}
+
+			List<String> listed = new ArrayList<>();
+			int pages = 0;
+			ReaddirResponse page = readdir(ROOT, 0, 0, wantAttributes);
+			long verifier = page.verifier();
+			while (true) {
+				pages++;
+				listed.addAll(names(page));
+				Assertions.assertEquals(verifier, page.verifier());
+				if (!page.more()) {
+					break;
+				}
+				page = readdir(ROOT, page.entries().getLast().nextCookie(), verifier, wantAttributes);
+			}
+
+			Assertions.assertTrue(pages > 1, "pages");
+			Assertions.assertEquals(expected.size(), listed.size());
+			Assertions.assertEquals(expected, Set.copyOf(listed));
+			Assertions.assertEquals(ENTRIES + 2, page.entries().getLast().nextCookie());
+			ReaddirResponse end = readdir(ROOT, ENTRIES + 2, verifier, wantAttributes);
+			Assertions.assertEquals(List.of(), end.entries());
+			Assertions.assertFalse(end.more());
+		}
+
+		@Test
+		@DisplayName("a size change between two pages shows up in the later page")
+		public void testAttributesAreReadPerPage() throws IOException {
+			createManyEntries();
+			ReaddirResponse first = readdir(ROOT, 0, 0, true);
+			long cookie = first.entries().getLast().nextCookie();
+			String later = readdir(ROOT, cookie, first.verifier(), false).entries().getFirst().name();
+
+			backing(later, "grown");
+			DirectoryEntry entry = readdir(ROOT, cookie, first.verifier(), true).entries().getFirst();
+
+			Assertions.assertEquals(later, entry.name());
+			Assertions.assertEquals(5, entry.attributes().size());
+		}
+
+		@Test
+		@DisplayName("after a lookup and forget of a listed entry, continuing the listing reports the id a new lookup returns")
+		public void testListedIdAfterForget() throws IOException {
+			backing("file.txt", "");
+			ReaddirResponse page = readdir(ROOT, 0, 0, false);
+			long listed = page.entries().get(2).nodeId();
+			Assertions.assertEquals(listed, lookup(ROOT, "file.txt").nodeId());
+			ok(new ForgetRequest(listed), ForgetResponse.class);
+
+			long relisted = readdir(ROOT, 2, page.verifier(), false).entries().getFirst().nodeId();
+
+			Assertions.assertNotEquals(listed, relisted);
+			Assertions.assertEquals(relisted, lookup(ROOT, "file.txt").nodeId());
+		}
+
+		@Test
+		@DisplayName("cookie 0 starts a new listing whatever verifier is sent, and no verifier is 0")
+		public void testCookieZero() throws IOException {
+			long first = readdir(ROOT, 0, 0, false).verifier();
+			backing("file.txt", "");
+			ReaddirResponse second = readdir(ROOT, 0, first, false);
+			ReaddirResponse third = readdir(ROOT, 0, 4711, false);
+
+			Assertions.assertNotEquals(0, first);
+			Assertions.assertNotEquals(0, second.verifier());
+			Assertions.assertNotEquals(first, second.verifier());
+			Assertions.assertNotEquals(second.verifier(), third.verifier());
+			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(second));
+		}
+
+		@Test
+		@DisplayName("a stale verifier or a cookie beyond the listing yields the invalid-cookie status")
+		public void testInvalidCookie() throws IOException {
+			backing("file.txt", "");
+			long other = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long verifier = readdir(ROOT, 0, 0, false).verifier();
+
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, verifier + 1, false));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, 0, false));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 5, verifier, false));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, -1, verifier, false));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(other, 1, verifier, false));
+			Assertions.assertEquals(List.of(), readdir(ROOT, 4, verifier, false).entries());
+		}
+
+		@Test
+		@DisplayName("create and remove invalidate the listings of their directory, rename those of all directories")
+		public void testInvalidation() {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			long file = create(directory, "file.txt", NodeType.FILE).nodeId();
+
+			long rootVerifier = readdir(ROOT, 0, 0, false).verifier();
+			long verifier = readdir(directory, 0, 0, false).verifier();
+			create(directory, "created.txt", NodeType.FILE);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
+			readdir(ROOT, 1, rootVerifier, false);
+
+			verifier = readdir(directory, 0, 0, false).verifier();
+			ok(new RemoveRequest(file, directory), RemoveResponse.class);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
+			readdir(ROOT, 1, rootVerifier, false);
+
+			ok(new RenameRequest(lookup(directory, "created.txt").nodeId(), directory, directory, "renamed.txt"), RenameResponse.class);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, rootVerifier, false));
+		}
+
+		@Test
+		@DisplayName("holds at most 16 listings and drops the one that was paged through least recently")
+		public void testListingCap() {
+			long first = readdir(ROOT, 0, 0, false).verifier();
+			long second = readdir(ROOT, 0, 0, false).verifier();
+			for (int i = 0; i < 14; i++) {
+				readdir(ROOT, 0, 0, false);
+			}
+			readdir(ROOT, 1, first, false);
+
+			readdir(ROOT, 0, 0, false);
+
+			readdir(ROOT, 1, first, false);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, second, false));
+		}
+
+		@Test
+		@DisplayName("invalidating a directory's listings releases the nodes that were only listed")
+		public void testInvalidationReleasesListedNodes() throws IOException {
+			backing("listed.txt", "");
+			backing("held.txt", "");
+			long held = lookup(ROOT, "held.txt").nodeId();
+			long listed = readdir(ROOT, 0, 0, false).entries().stream().filter(entry -> entry.name().equals("listed.txt")).findFirst().orElseThrow().nodeId();
+			Assertions.assertEquals(listed, getattr(listed).nodeId());
+
+			create(ROOT, "created.txt", NodeType.FILE);
+
+			assertStatus(Errno.ESTALE, new GetattrRequest(listed));
+			Assertions.assertEquals(held, getattr(held).nodeId());
+		}
+
+		@Test
+		@DisplayName("an entry that vanished since the listing was taken is left out of a page with attributes")
+		public void testVanishedEntry() throws IOException {
+			backing("stays.txt", "");
+			Path vanishing = backing("vanishes.txt", "");
+			long verifier = readdir(ROOT, 0, 0, false).verifier();
+
+			Files.delete(vanishing);
+			ReaddirResponse page = readdir(ROOT, 2, verifier, true);
+
+			Assertions.assertEquals(List.of("stays.txt"), names(page));
+			Assertions.assertFalse(page.more());
+		}
+
+		@Test
+		@DisplayName("an entry that vanishes while the listing is taken is left out")
+		public void testVanishingWhileListing() throws IOException {
+			backing("stays.txt", "");
+			backing("vanishes.txt", "");
+			ops.beforeReadingAttributes = path -> {
+				if (path.endsWith("vanishes.txt")) {
+					throw new NoSuchFileException(path.toString());
+				}
+			};
+
+			Assertions.assertEquals(List.of(".", "..", "stays.txt"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("every page of names that take three bytes per character fits into a frame")
+		@ValueSource(booleans = {false, true})
+		public void testFullPagesOfMultibyteNames(boolean wantAttributes) throws IOException {
+			Set<String> expected = new HashSet<>();
+			for (int i = 0; i < 600; i++) {
+				String name = "\u20ac".repeat(80) + i;
+				backing(name, "");
+				expected.add(name);
+			}
+
+			Set<String> listed = new HashSet<>();
+			ReaddirResponse page = readdir(ROOT, 0, 0, wantAttributes);
+			int pages = 1;
+			while (true) {
+				Frame decoded = FrameCodecTest.read(FrameCodecTest.write(page.toFrame(Opcode.READDIR, pages)));
+				Assertions.assertEquals(page, Messages.decodeResponse(decoded));
+				listed.addAll(names(page));
+				if (!page.more()) {
+					break;
+				}
+				page = readdir(ROOT, page.entries().getLast().nextCookie(), page.verifier(), wantAttributes);
+				pages++;
+			}
+
+			Assertions.assertTrue(pages > 2, "pages");
+			listed.removeAll(List.of(".", ".."));
+			Assertions.assertEquals(expected, listed);
+		}
+
+		@Test
+		@DisplayName("listing a file yields ENOTDIR")
+		public void testReaddirOfFile() throws IOException {
+			backing("file.txt", "");
+
+			assertStatus(Errno.ENOTDIR, new ReaddirRequest(lookup(ROOT, "file.txt").nodeId(), 0, 0, false));
+		}
+	}
+
+	@Nested
+	@DisplayName("symbolic links")
+	public class SymbolicLinks {
+
+		private Path outside;
+		private long link;
+
+		@BeforeEach
+		public void setup(@TempDir Path outsideDir) throws IOException {
+			outside = outsideDir;
+			Files.writeString(outside.resolve("secret.txt"), "secret");
+			Files.createSymbolicLink(root.resolve("link"), outside);
+			link = lookup(ROOT, "link").nodeId();
+		}
+
+		@Test
+		@DisplayName("a link is reported as a link")
+		public void testReportedAsLink() {
+			Assertions.assertEquals(NodeType.SYMLINK, getattr(link).type());
+			Assertions.assertEquals(NodeType.SYMLINK, readdir(ROOT, 0, 0, false).entries().get(2).type());
+			Assertions.assertEquals(NodeType.SYMLINK, readdir(ROOT, 0, 0, true).entries().getFirst().attributes().type());
+		}
+
+		@Test
+		@DisplayName("a link cannot be traversed or opened")
+		public void testNotFollowed() {
+			assertStatus(Errno.ENOTDIR, new LookupRequest(link, "secret.txt"));
+			assertStatus(Errno.ENOTDIR, new ReaddirRequest(link, 0, 0, false));
+			assertStatus(Errno.ENOTDIR, new CreateRequest(link, "new.txt", NodeType.FILE, 0644));
+			assertStatus(Errno.ENOTSUP, new OpenRequest(link, READ));
+			assertStatus(Errno.ENOTSUP, new ReadRequest(link, 0, 10));
+		}
+
+		@Test
+		@DisplayName("a link replaces a file")
+		public void testRenameOverFile() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(link, ROOT, ROOT, "file.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(file, response.replacedAttributes().nodeId());
+			Assertions.assertTrue(Files.isSymbolicLink(root.resolve("file.txt")));
+			Assertions.assertFalse(Files.exists(root.resolve("link"), LinkOption.NOFOLLOW_LINKS));
+		}
+
+		@Test
+		@DisplayName("a file that was swapped for a link is not opened through the link")
+		public void testFileSwappedForLink() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			Files.delete(root.resolve("file.txt"));
+			Files.createSymbolicLink(root.resolve("file.txt"), outside.resolve("secret.txt"));
+
+			Assertions.assertInstanceOf(Failure.class, ops.handle(new ReadRequest(file, 0, 100)));
+			Assertions.assertInstanceOf(Failure.class, ops.handle(new WriteRequest(file, 0, StandardCharsets.UTF_8.encode("public"))));
+			Assertions.assertInstanceOf(Failure.class, ops.handle(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 0, 0, EPOCH, EPOCH)));
+
+			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
+		}
+
+		@Test
+		@DisplayName("setattr leaves the link's target untouched")
+		public void testSetattr() throws IOException {
+			FileTime before = Files.getLastModifiedTime(outside);
+			int valid = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(link, valid, 0, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals(before, Files.getLastModifiedTime(outside));
+			Assertions.assertTrue(Files.isReadable(outside));
+		}
+
+		@Test
+		@DisplayName("removing a link deletes only the link")
+		public void testRemove() throws IOException {
+			ok(new RemoveRequest(link, ROOT), RemoveResponse.class);
+
+			Assertions.assertFalse(Files.exists(root.resolve("link"), LinkOption.NOFOLLOW_LINKS));
+			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
+		}
+
+		@Test
+		@DisplayName("renaming a link moves the link itself")
+		public void testRename() throws IOException {
+			ok(new RenameRequest(link, ROOT, ROOT, "moved"), RenameResponse.class);
+
+			Assertions.assertTrue(Files.isSymbolicLink(root.resolve("moved")));
+			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
+		}
+	}
+
+	@Nested
+	@DisplayName("when reads fail after a change")
+	public class FailingReadsAfterChange {
+
+		private final IOException failure = new IOException("backend gone");
+		private final HookedOperations.Hook failing = _ -> {
+			throw failure;
+		};
+
+		@Test
+		@DisplayName("a write still succeeds, with the size it established and unknown usable space")
+		public void testWrite() throws IOException {
+			backing("file.txt", "0123456789");
+			Attributes last = lookup(ROOT, "file.txt");
+			ops.beforeReadingAttributes = failing;
+			ops.beforeReadingUsableSpace = failing;
+
+			WriteResponse response = write(last.nodeId(), 8, "abcdef");
+
+			Assertions.assertEquals(6, response.written());
+			Assertions.assertEquals(14, response.attributes().size());
+			Assertions.assertEquals(last.nodeId(), response.attributes().nodeId());
+			Assertions.assertEquals(last.mode(), response.attributes().mode());
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+			Assertions.assertEquals("01234567abcdef", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a write within the file keeps the last known size")
+		public void testWriteWithinFile() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ops.beforeReadingAttributes = failing;
+
+			Assertions.assertEquals(10, write(file, 2, "ab").attributes().size());
+		}
+
+		@Test
+		@DisplayName("a truncation still succeeds, with the size it established")
+		public void testTruncate() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ops.beforeReadingAttributes = failing;
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 4, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(4, response.attributes().size());
+			Assertions.assertEquals("0123", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a create still succeeds, with the type and mode it established")
+		public void testCreate() throws IOException {
+			Attributes directory = getattr(ROOT);
+			ops.beforeReadingAttributes = failing;
+			ops.beforeReadingUsableSpace = failing;
+
+			CreateResponse response = ok(new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0640), CreateResponse.class);
+
+			Assertions.assertEquals(List.of("new.txt"), backingNames());
+			Assertions.assertEquals("new.txt", response.name());
+			Assertions.assertEquals(NodeType.FILE, response.attributes().type());
+			Assertions.assertEquals(0640, response.attributes().mode());
+			Assertions.assertEquals(0, response.attributes().size());
+			Assertions.assertEquals(ROOT, response.attributes().parentId());
+			Assertions.assertEquals(directory, response.directoryAttributes());
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+		}
+
+		@Test
+		@DisplayName("a rename still succeeds, with the last known attributes")
+		public void testRename() throws IOException {
+			backing("old.txt", "content");
+			Attributes directory = getattr(ROOT);
+			Attributes file = lookup(ROOT, "old.txt");
+			ops.beforeReadingAttributes = path -> {
+				if (Files.exists(root.resolve("new.txt"))) {
+					throw failure;
+				}
+			};
+
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, ROOT, "new.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of("new.txt"), backingNames());
+			Assertions.assertEquals("new.txt", response.name());
+			Assertions.assertEquals(file, response.attributes());
+			Assertions.assertEquals(directory, response.sourceDirectoryAttributes());
+			Assertions.assertEquals(directory, response.destinationDirectoryAttributes());
+		}
+
+		@Test
+		@DisplayName("a create and a rename still succeed when the stored name cannot be read, with the requested name")
+		public void testStoredNameUnreadable() throws IOException {
+			backing("old.txt", "content");
+			long file = lookup(ROOT, "old.txt").nodeId();
+			ops.beforeResolvingRealPath = failing;
+
+			Assertions.assertEquals("created.txt", ok(new CreateRequest(ROOT, "created.txt", NodeType.FILE, 0644), CreateResponse.class).name());
+			Assertions.assertEquals("new.txt", ok(new RenameRequest(file, ROOT, ROOT, "new.txt"), RenameResponse.class).name());
+
+			Assertions.assertEquals(List.of("created.txt", "new.txt"), backingNames());
+		}
+
+		@Test
+		@DisplayName("a move to another directory still succeeds, with the new parent")
+		public void testMoveToOtherDirectory() throws IOException {
+			backing("file.txt", "content");
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			Attributes file = lookup(ROOT, "file.txt");
+			ops.beforeReadingAttributes = path -> {
+				if (Files.exists(root.resolve("dir/file.txt"))) {
+					throw failure;
+				}
+			};
+
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, directory, "file.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(directory, response.attributes().parentId());
+			Assertions.assertEquals(file.nodeId(), response.attributes().nodeId());
+			Assertions.assertEquals(file.size(), response.attributes().size());
+		}
+
+		@Test
+		@DisplayName("a change of permissions and times still succeeds, with the values it established")
+		public void testModeAndTimes() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ops.beforeReadingAttributes = failing;
+			int valid = Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
+			Timestamp accessed = new Timestamp(1600000000, 0);
+			Timestamp modified = new Timestamp(1500000000, 0);
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0600, accessed, modified), SetattrResponse.class);
+
+			Assertions.assertEquals(valid, response.applied());
+			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(accessed, response.attributes().accessed());
+			Assertions.assertEquals(modified, response.attributes().modified());
+			Assertions.assertEquals(10, response.attributes().size());
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+		}
+
+		@Test
+		@DisplayName("a remove still succeeds, with the directory's last known attributes")
+		public void testRemove() throws IOException {
+			backing("file.txt", "content");
+			Attributes directory = getattr(ROOT);
+			Attributes file = lookup(ROOT, "file.txt");
+			ops.beforeReadingAttributes = path -> {
+				if (!Files.exists(root.resolve("file.txt"))) {
+					throw failure;
+				}
+			};
+
+			RemoveResponse response = ok(new RemoveRequest(file.nodeId(), ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(file, response.attributes());
+			Assertions.assertEquals(directory, response.directoryAttributes());
+		}
+	}
+
+	@Nested
+	@DisplayName("read-only")
+	public class ReadOnly {
+
+		private long file;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			backing("file.txt", "content");
+			ops.close();
+			ops = new HookedOperations(root, true);
+			file = lookup(ROOT, "file.txt").nodeId();
+		}
+
+		@Test
+		@DisplayName("rejects every mutating operation with EROFS and leaves the backing directory unchanged")
+		public void testMutationsRejected() throws IOException {
+			FileTime modified = Files.getLastModifiedTime(root.resolve("file.txt"));
+			List<Request> mutations = List.of( //
+					new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 0, 0, EPOCH, EPOCH), //
+					new SetattrRequest(file, Messages.ATTRIBUTE_MODIFIED, 0, 0, EPOCH, EPOCH), //
+					new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0644), //
+					new CreateRequest(ROOT, "dir", NodeType.DIRECTORY, 0755), //
+					new RemoveRequest(file, ROOT), //
+					new RenameRequest(file, ROOT, ROOT, "renamed.txt"), //
+					new WriteRequest(file, 0, ByteBuffer.allocate(1)), //
+					new OpenRequest(file, WRITE), //
+					new OpenRequest(file, READ | WRITE));
+
+			for (Request mutation : mutations) {
+				assertStatus(Errno.EROFS, mutation);
+			}
+
+			Assertions.assertEquals(List.of("file.txt"), backingNames());
+			Assertions.assertEquals("content", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(modified, Files.getLastModifiedTime(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("still reads")
+		public void testReading() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			Assertions.assertEquals("content", read(file, 0, 100));
+			ok(new ReaddirRequest(ROOT, 0, 0, true), ReaddirResponse.class);
+			ok(new SyncRequest(), SyncResponse.class);
+		}
+	}
+}

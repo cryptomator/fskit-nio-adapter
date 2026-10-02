@@ -1,0 +1,5 @@
+kind = request
+opcode = sync
+requestId = 19
+hex:
+0000000f 00 000f 0000000000000013 00000000

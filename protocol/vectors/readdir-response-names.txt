@@ -1,0 +1,28 @@
+kind = response
+opcode = readdir
+requestId = 8
+status = 0
+verifier = 9
+more = true
+entries[0].name = .
+entries[0].type = directory
+entries[0].nodeId = 67
+entries[0].nextCookie = 1
+entries[1].name = ..
+entries[1].type = directory
+entries[1].nodeId = 2
+entries[1].nextCookie = 2
+entries[2].name = notes.txt
+entries[2].type = file
+entries[2].nodeId = 68
+entries[2].nextCookie = 3
+entries[3].name = link
+entries[3].type = symlink
+entries[3].nodeId = 69
+entries[3].nextCookie = 4
+hex:
+0000007e 01 0007 0000000000000008 0000006f
+00000000000000000000000901000400012e0200000000000000430000000000
+0000010000022e2e02000000000000000200000000000000020000096e6f7465
+732e74787401000000000000004400000000000000030000046c696e6b030000
+000000000045000000000000000400

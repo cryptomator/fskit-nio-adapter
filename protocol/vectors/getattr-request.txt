@@ -1,0 +1,7 @@
+kind = request
+opcode = getattr
+requestId = 2
+nodeId = 64
+hex:
+00000017 00 0005 0000000000000002 00000008
+0000000000000040

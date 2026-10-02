@@ -1,0 +1,22 @@
+kind = response
+opcode = setattr
+requestId = 7
+status = 0
+applied = 13
+attributes.type = file
+attributes.mode = 274
+attributes.size = 2007
+attributes.nodeId = 66
+attributes.parentId = 8
+attributes.modified.seconds = 1700000200
+attributes.modified.nanos = 100000002
+attributes.accessed.seconds = 1700000201
+attributes.accessed.nanos = 200000002
+attributes.created.seconds = 1700000202
+attributes.created.nanos = 300000002
+usableBytes = 123456789014
+hex:
+0000005b 01 0006 0000000000000007 0000004c
+000000000d01011200000000000007d700000000000000420000000000000008
+000000006553f1c805f5e102000000006553f1c90bebc202000000006553f1ca
+11e1a3020000001cbe991a16

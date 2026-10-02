@@ -1,0 +1,7 @@
+kind = request
+opcode = forget
+requestId = 6
+nodeId = 65
+hex:
+00000017 00 0004 0000000000000006 00000008
+0000000000000041

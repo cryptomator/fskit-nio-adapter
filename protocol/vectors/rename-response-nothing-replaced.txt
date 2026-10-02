@@ -1,0 +1,48 @@
+kind = response
+opcode = rename
+requestId = 14
+status = 0
+name = moved
+attributes.type = directory
+attributes.mode = 373
+attributes.size = 13007
+attributes.nodeId = 77
+attributes.parentId = 41
+attributes.modified.seconds = 1700001300
+attributes.modified.nanos = 100000013
+attributes.accessed.seconds = 1700001301
+attributes.accessed.nanos = 200000013
+attributes.created.seconds = 1700001302
+attributes.created.nanos = 300000013
+sourceDirectoryAttributes.type = directory
+sourceDirectoryAttributes.mode = 382
+sourceDirectoryAttributes.size = 14007
+sourceDirectoryAttributes.nodeId = 78
+sourceDirectoryAttributes.parentId = 44
+sourceDirectoryAttributes.modified.seconds = 1700001400
+sourceDirectoryAttributes.modified.nanos = 100000014
+sourceDirectoryAttributes.accessed.seconds = 1700001401
+sourceDirectoryAttributes.accessed.nanos = 200000014
+sourceDirectoryAttributes.created.seconds = 1700001402
+sourceDirectoryAttributes.created.nanos = 300000014
+destinationDirectoryAttributes.type = directory
+destinationDirectoryAttributes.mode = 391
+destinationDirectoryAttributes.size = 15007
+destinationDirectoryAttributes.nodeId = 79
+destinationDirectoryAttributes.parentId = 47
+destinationDirectoryAttributes.modified.seconds = 1700001500
+destinationDirectoryAttributes.modified.nanos = 100000015
+destinationDirectoryAttributes.accessed.seconds = 1700001501
+destinationDirectoryAttributes.accessed.nanos = 200000015
+destinationDirectoryAttributes.created.seconds = 1700001502
+destinationDirectoryAttributes.created.nanos = 300000015
+usableBytes = 123456789018
+hex:
+000000e0 01 000a 000000000000000e 000000d1
+0000000000056d6f76656402017500000000000032cf000000000000004d0000
+000000000029000000006553f61405f5e10d000000006553f6150bebc20d0000
+00006553f61611e1a30d02017e00000000000036b7000000000000004e000000
+000000002c000000006553f67805f5e10e000000006553f6790bebc20e000000
+006553f67a11e1a30e0201870000000000003a9f000000000000004f00000000
+0000002f000000006553f6dc05f5e10f000000006553f6dd0bebc20f00000000
+6553f6de11e1a30f000000001cbe991a1a

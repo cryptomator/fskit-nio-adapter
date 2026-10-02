@@ -1,0 +1,22 @@
+kind = response
+opcode = write
+requestId = 18
+status = 0
+written = 10
+attributes.type = file
+attributes.mode = 409
+attributes.size = 17007
+attributes.nodeId = 81
+attributes.parentId = 53
+attributes.modified.seconds = 1700001700
+attributes.modified.nanos = 100000017
+attributes.accessed.seconds = 1700001701
+attributes.accessed.nanos = 200000017
+attributes.created.seconds = 1700001702
+attributes.created.nanos = 300000017
+usableBytes = 123456789020
+hex:
+0000005e 01 000e 0000000000000012 0000004f
+000000000000000a010199000000000000426f00000000000000510000000000
+000035000000006553f7a405f5e111000000006553f7a50bebc2110000000065
+53f7a611e1a3110000001cbe991a1c

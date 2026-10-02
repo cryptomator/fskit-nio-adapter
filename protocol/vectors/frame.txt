@@ -1,0 +1,9 @@
+kind = request
+opcode = getattr
+requestId = 72623859790382856
+control = aabbcc
+payload = ddeeff00
+hex:
+00000016 00 0005 0102030405060708 00000003
+aabbcc
+ddeeff00

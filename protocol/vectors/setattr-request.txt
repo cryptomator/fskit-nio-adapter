@@ -1,0 +1,15 @@
+kind = request
+opcode = setattr
+requestId = 7
+nodeId = 66
+valid = 13
+size = 8192
+mode = 416
+accessed.seconds = 1700000700
+accessed.nanos = 111111111
+modified.seconds = 1700000701
+modified.nanos = 222222222
+hex:
+0000003a 00 0006 0000000000000007 0000002b
+00000000000000420d000000000000200001a0000000006553f3bc069f6bc700
+0000006553f3bd0d3ed78e
