@@ -68,6 +68,7 @@ import java.nio.file.attribute.PosixFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.text.Normalizer;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -167,6 +168,13 @@ public class FileSystemOperations implements Closeable {
 	private SetattrResponse setattr(SetattrRequest request) throws IOException {
 		assertWritable();
 		Node node = nodes.get(request.nodeId());
+		if ((request.valid() & Messages.ATTRIBUTE_SIZE) != 0 && request.size() < 0) {
+			throw new StatusException(Errno.EINVAL);
+		}
+		int times = request.valid() & (Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED);
+		// converted before anything is applied, so that a time the conversion rejects fails the request with nothing changed
+		FileTime modified = (times & Messages.ATTRIBUTE_MODIFIED) != 0 ? fileTime(request.modified()) : null;
+		FileTime accessed = (times & Messages.ATTRIBUTE_ACCESSED) != 0 ? fileTime(request.accessed()) : null;
 		int applied = 0;
 		if ((request.valid() & Messages.ATTRIBUTE_SIZE) != 0 && node.type == NodeType.FILE) {
 			truncateOrExpand(node, request.size());
@@ -179,10 +187,7 @@ public class FileSystemOperations implements Closeable {
 			Files.setPosixFilePermissions(node.path, FileAttributesUtil.octalModeToPosixPermissions(request.mode()));
 			applied |= Messages.ATTRIBUTE_MODE;
 		}
-		int times = request.valid() & (Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED);
 		if (times != 0 && settableByPath) {
-			FileTime modified = (times & Messages.ATTRIBUTE_MODIFIED) != 0 ? fileTime(request.modified()) : null;
-			FileTime accessed = (times & Messages.ATTRIBUTE_ACCESSED) != 0 ? fileTime(request.accessed()) : null;
 			Files.getFileAttributeView(node.path, BasicFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).setTimes(modified, accessed, null);
 			applied |= times;
 		}
@@ -645,8 +650,17 @@ public class FileSystemOperations implements Closeable {
 		return new Timestamp(instant.getEpochSecond(), instant.getNano());
 	}
 
-	private static FileTime fileTime(Timestamp timestamp) {
-		return FileTime.from(Instant.ofEpochSecond(timestamp.seconds(), timestamp.nanos()));
+	private static FileTime fileTime(Timestamp timestamp) throws StatusException {
+		// nanoseconds beyond what an int holds arrive negative
+		if (timestamp.nanos() < 0 || timestamp.nanos() >= 1_000_000_000) {
+			throw new StatusException(Errno.EINVAL);
+		}
+		try {
+			return FileTime.from(Instant.ofEpochSecond(timestamp.seconds(), timestamp.nanos()));
+		} catch (DateTimeException e) {
+			// beyond what an Instant holds
+			throw new StatusException(Errno.EINVAL);
+		}
 	}
 
 	private static Timestamp now() {

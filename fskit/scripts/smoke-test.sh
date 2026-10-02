@@ -854,8 +854,9 @@ cleanup() {
 	exit $exit_status
 }
 
+# A start-up command that fails ends the script with status 2. Left to errexit, it would end it with 1, the status of failed checks.
 # below a symbolic link, so the mount points differ from the paths the mount table names
-WORK_DIR="$(mktemp -d /tmp/fskit-smoke.XXXXXX)"
+WORK_DIR="$(mktemp -d /tmp/fskit-smoke.XXXXXX)" || exit 2
 PROGRAM_LOG="$WORK_DIR/jvm.log"
 PROGRAM_OUT="$WORK_DIR/maven.out"
 PROGRAM_STDIN="$WORK_DIR/program.stdin"
@@ -870,14 +871,14 @@ trap 'cleanup 143' TERM
 # so would a write to a program that is gone
 trap '' PIPE
 
-mkdir "$JVM_TMP"
-mkfifo "$PROGRAM_STDIN"
-: > "$PROGRAM_LOG"
+mkdir "$JVM_TMP" || exit 2
+mkfifo "$PROGRAM_STDIN" || exit 2
+: > "$PROGRAM_LOG" || exit 2
 echo "==> Starting SmokeMountMain"
 # the program writes its log and its replies to standard error
 (cd "$REPO_ROOT" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djava.io.tmpdir=$JVM_TMP" ./mvnw -B -q test -Pmirror -Dmirror.mainClass=org.cryptomator.frontend.fskit.mount.SmokeMountMain < "$PROGRAM_STDIN" > "$PROGRAM_OUT" 2> "$PROGRAM_LOG") &
 PROGRAM_PID=$!
-exec 3> "$PROGRAM_STDIN"
+exec 3> "$PROGRAM_STDIN" || exit 2
 if ! await_reply 120; then
 	echo "error: SmokeMountMain did not start:" >&2
 	cat "$PROGRAM_OUT" "$PROGRAM_LOG" >&2

@@ -1454,6 +1454,29 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("rejects a size or time it cannot represent with EINVAL and applies nothing")
+		public void testUnrepresentableSizeAndTimes() throws IOException {
+			Path path = root.resolve("file.txt");
+			String permissions = PosixFilePermissions.toString(Files.getPosixFilePermissions(path));
+			int sizeAndMode = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE;
+			List<Timestamp> unrepresentable = List.of( //
+					new Timestamp(Long.MAX_VALUE, 0), //
+					new Timestamp(Long.MIN_VALUE, 0), //
+					new Timestamp(0, 1_000_000_000), //
+					// nanoseconds beyond what an int holds, as they are decoded
+					new Timestamp(0, -1));
+
+			assertStatus(Errno.EINVAL, new SetattrRequest(file, sizeAndMode, -1, 0700, EPOCH, EPOCH));
+			for (Timestamp time : unrepresentable) {
+				assertStatus(Errno.EINVAL, new SetattrRequest(file, sizeAndMode | Messages.ATTRIBUTE_ACCESSED, 4, 0700, time, EPOCH));
+				assertStatus(Errno.EINVAL, new SetattrRequest(file, sizeAndMode | Messages.ATTRIBUTE_MODIFIED, 4, 0700, EPOCH, time));
+			}
+
+			Assertions.assertEquals("0123456789", Files.readString(path));
+			Assertions.assertEquals(permissions, PosixFilePermissions.toString(Files.getPosixFilePermissions(path)));
+		}
+
+		@Test
 		@DisplayName("does not apply a size to a directory")
 		public void testSizeOfDirectory() {
 			SetattrResponse response = ok(new SetattrRequest(ROOT, Messages.ATTRIBUTE_SIZE, 0, 0, EPOCH, EPOCH), SetattrResponse.class);
