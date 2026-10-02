@@ -91,6 +91,16 @@ Mirror a vault (prompts for the vault, its passphrase, the mount point, and for 
 ./mvnw test -Pcrypto-mirror
 ```
 
+## Smoke test
+
+With the extension installed and enabled, and built with the default `FS_TYPE_NAME`, the smoke test mounts directories and a throwaway vault, works on them through the shell, and scans the JVM's log for failures:
+
+```
+fskit/scripts/smoke-test.sh
+```
+
+It does not cover Finder, a disabled extension, a killed extension process or a killed JVM. The script's header lists its arguments and exit statuses.
+
 ## Known limitations
 
 Observed on macOS 27.0.1 with JDK 26.
@@ -109,9 +119,11 @@ Observed on macOS 27.0.1 with JDK 26.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.
 - Replacing a file that is open (`mv` onto it) fails with "Resource busy" on a vault, because cryptofs refuses to replace an open file. It works on a plain directory.
 - A time or permission change on a removed file that is still open is ignored.
+- A modification or access time later than 11 April 2262, 23:47:16 UTC, is set to that time, the latest the JDK sets.
 - A rename that replaces an existing entry is atomic only when a file replaces a file. With a directory or a symbolic link on either side, the target is removed first and is gone if the move then fails.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.
-- A restarted extension cannot reconnect to a live mount, and a mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
+- A mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
+- A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". The mount point is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`.
 - The provider is offered on every Mac running macOS 27 or later, whether or not the extension is installed and enabled. If it is not, `mount()` fails with `MountFailedException`.
 
 ## License

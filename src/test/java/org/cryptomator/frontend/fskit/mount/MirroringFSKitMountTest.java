@@ -122,7 +122,7 @@ public class MirroringFSKitMountTest {
 		}
 	}
 
-	private static void unmount(Mount mount) {
+	static void unmount(Mount mount) {
 		try (mount) {
 			try {
 				mount.unmount();

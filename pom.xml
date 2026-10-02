@@ -128,7 +128,7 @@
     <build>
         <pluginManagement>
             <plugins>
-                <!-- shared setup of the mirror and crypto-mirror profiles, which run the interactive MirroringFSKitMountTest; fskit/scripts/interop-test.sh runs BridgeServerMain through the mirror profile -->
+                <!-- shared setup of the mirror and crypto-mirror profiles, which run the interactive MirroringFSKitMountTest; fskit/scripts/interop-test.sh runs BridgeServerMain and fskit/scripts/smoke-test.sh runs SmokeMountMain through the mirror profile -->
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
