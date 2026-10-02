@@ -119,6 +119,9 @@ Observed on macOS 27.0.1 with JDK 26.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.
 - Replacing a file that is open (`mv` onto it) fails with "Resource busy" on a vault, because cryptofs refuses to replace an open file. It works on a plain directory.
 - A time or permission change on a removed file that is still open is ignored.
+- A modification or access time cannot be set on a file or directory whose owner may not read it: `touch` fails with "Permission denied", because the JDK opens the entry for reading to set its times.
+- One request can change several attributes, as `setattrlist` does. When the backing store refuses one of them after another has been applied, the request still succeeds, and only the JVM's log reports the refusal.
+- A file or directory is created even when the backing store refuses to set its mode. It then keeps the mode it was created with, which the umask of the JVM may have cut down. Only the JVM's log reports the refusal.
 - A modification or access time later than 11 April 2262, 23:47:16 UTC, is set to that time, the latest the JDK sets.
 - A rename that replaces an existing entry is atomic only when a file replaces a file. With a directory or a symbolic link on either side, the target is removed first and is gone if the move then fails.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.

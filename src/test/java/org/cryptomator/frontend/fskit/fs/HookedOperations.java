@@ -7,6 +7,8 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -53,6 +55,8 @@ public class HookedOperations extends FileSystemOperations {
 	 * The options of every move, in order.
 	 */
 	public final List<CopyOption> moveOptions = new CopyOnWriteArrayList<>();
+	public volatile Hook beforeSettingPermissions = _ -> {};
+	public volatile Hook beforeSettingTimes = _ -> {};
 	public volatile Hook beforeResolvingRealPath = _ -> {};
 	public volatile UnaryOperator<FileChannel> channelWrapper = UnaryOperator.identity();
 	public final List<FileChannel> openedChannels = new CopyOnWriteArrayList<>();
@@ -96,6 +100,18 @@ public class HookedOperations extends FileSystemOperations {
 		moveOptions.addAll(List.of(options));
 		beforeMoving.run(source);
 		super.move(source, target, options);
+	}
+
+	@Override
+	void setPermissions(Path path, Set<PosixFilePermission> permissions) throws IOException {
+		beforeSettingPermissions.run(path);
+		super.setPermissions(path, permissions);
+	}
+
+	@Override
+	void setTimes(Path path, FileTime modified, FileTime accessed) throws IOException {
+		beforeSettingTimes.run(path);
+		super.setTimes(path, modified, accessed);
 	}
 
 	@Override

@@ -175,21 +175,40 @@ public class FileSystemOperations implements Closeable {
 		// converted before anything is applied, so that a time the conversion rejects fails the request with nothing changed
 		FileTime modified = (times & Messages.ATTRIBUTE_MODIFIED) != 0 ? fileTime(request.modified()) : null;
 		FileTime accessed = (times & Messages.ATTRIBUTE_ACCESSED) != 0 ? fileTime(request.accessed()) : null;
-		int applied = 0;
-		if ((request.valid() & Messages.ATTRIBUTE_SIZE) != 0 && node.type == NodeType.FILE) {
-			truncateOrExpand(node, request.size());
-			applied |= Messages.ATTRIBUTE_SIZE;
+		boolean modeRequested = (request.valid() & Messages.ATTRIBUTE_MODE) != 0 && posix;
+		if (modeRequested) {
+			// setting permissions follows a link, and the entry may have become one since its type was last read
+			refresh(node);
 		}
 		// permissions and times are set by path, which a removed item no longer has: a file created under its old name since must stay untouched
 		boolean settableByPath = !node.unlinked && node.type != NodeType.SYMLINK;
-		if ((request.valid() & Messages.ATTRIBUTE_MODE) != 0 && posix && settableByPath) {
-			// not NOFOLLOW_LINKS: that variant has to open the entry, which fails for a file that may be neither read nor written and for a directory that may not be read. The node is no link.
-			Files.setPosixFilePermissions(node.path, FileAttributesUtil.octalModeToPosixPermissions(request.mode()));
-			applied |= Messages.ATTRIBUTE_MODE;
-		}
-		if (times != 0 && settableByPath) {
-			Files.getFileAttributeView(node.path, BasicFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).setTimes(modified, accessed, null);
-			applied |= times;
+		boolean setsMode = modeRequested && settableByPath;
+		boolean setsTimes = times != 0 && settableByPath;
+		// the backing file system may need the owner's read permission to set times, so they go ahead of a mode without it and after a mode with it
+		boolean timesFirst = setsMode && (request.mode() & 0400) == 0;
+		int applied = 0;
+		try {
+			if ((request.valid() & Messages.ATTRIBUTE_SIZE) != 0 && node.type == NodeType.FILE) {
+				truncateOrExpand(node, request.size());
+				applied |= Messages.ATTRIBUTE_SIZE;
+			}
+			if (setsTimes && timesFirst) {
+				setTimes(node.path, modified, accessed);
+				applied |= times;
+			}
+			if (setsMode) {
+				setPermissions(node.path, FileAttributesUtil.octalModeToPosixPermissions(request.mode()));
+				applied |= Messages.ATTRIBUTE_MODE;
+			}
+			if (setsTimes && !timesFirst) {
+				setTimes(node.path, modified, accessed);
+				applied |= times;
+			}
+		} catch (IOException | RuntimeException e) {
+			if (applied == 0) {
+				throw e;
+			}
+			FailureLog.warn(LOG, "Unable to apply every attribute requested for node " + node.id + ". Replying with the ones that took effect.", e);
 		}
 		int established = applied;
 		Attributes attributes = refreshAfterChange(node, last -> new Attributes(last.type(), //
@@ -237,8 +256,9 @@ public class FileSystemOperations implements Closeable {
 		FileAttribute<?>[] initialPermissions = posix ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(permissions)} : new FileAttribute<?>[0];
 		FileChannel channel = null;
 		switch (request.type()) {
-			// whoever creates a file may write to it whatever its mode, which takes a channel opened while creating it
-			case FILE -> channel = openChannel(target, Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE), initialPermissions);
+			// whoever creates a file may write to it whatever its mode, which takes a channel opened while creating it.
+			// NOFOLLOW_LINKS: cryptofs would otherwise create the target of a link that has the name, although the file has to be new
+			case FILE -> channel = openChannel(target, Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS), initialPermissions);
 			case DIRECTORY -> Files.createDirectory(target, initialPermissions);
 			case SYMLINK -> throw new StatusException(Errno.ENOTSUP);
 		}
@@ -257,9 +277,9 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	// the mode an entry is created with is cut down by this process's umask, although the kernel has applied the caller's already
-	private static void applyExactly(Path created, Set<PosixFilePermission> permissions) {
+	private void applyExactly(Path created, Set<PosixFilePermission> permissions) {
 		try {
-			Files.setPosixFilePermissions(created, permissions);
+			setPermissions(created, permissions);
 		} catch (IOException | RuntimeException e) {
 			FailureLog.warn(LOG, "Unable to set the permissions of a created entry.", e);
 		}
@@ -690,6 +710,20 @@ public class FileSystemOperations implements Closeable {
 
 	void move(Path source, Path target, CopyOption... options) throws IOException {
 		Files.move(source, target, options);
+	}
+
+	/**
+	 * Sets an entry's permissions, following a symbolic link, so the entry must not be one. The variant with {@code NOFOLLOW_LINKS} is not used because it has to open the entry, which fails for a file that may be neither read nor written and for a directory that may not be read.
+	 */
+	void setPermissions(Path path, Set<PosixFilePermission> permissions) throws IOException {
+		Files.setPosixFilePermissions(path, permissions);
+	}
+
+	/**
+	 * Sets an entry's times without following a symbolic link. A time that is {@code null} stays as it is.
+	 */
+	void setTimes(Path path, @Nullable FileTime modified, @Nullable FileTime accessed) throws IOException {
+		Files.getFileAttributeView(path, BasicFileAttributeView.class, LinkOption.NOFOLLOW_LINKS).setTimes(modified, accessed, null);
 	}
 
 	/**

@@ -437,6 +437,11 @@ create_read_only() {
 	/usr/bin/perl -e 'use Fcntl; sysopen(my $file, $ARGV[0], O_WRONLY | O_CREAT | O_EXCL, 0444) or die "open: $!"; syswrite($file, "data") or die "write: $!"; close($file) or die "close: $!"' "$1"
 }
 
+# set_mode_and_time <file> <mode> <seconds>: sets a mode and a modification time in one setattrlist call, so that both reach the volume in one request. The buffer holds the values for ATTR_CMN_MODTIME and ATTR_CMN_ACCESSMASK.
+set_mode_and_time() {
+	/usr/bin/perl -e 'my $list = pack("S S L5", 5, 0, 0x400 | 0x20000, 0, 0, 0, 0); my $buffer = pack("q q L", $ARGV[2], 0, oct($ARGV[1])); syscall(221, $ARGV[0], $list, $buffer, length($buffer), 0) == 0 or die "setattrlist: $!"' "$1" "$2" "$3"
+}
+
 create_with_umask() {
 	(umask "$1" && : > "$2")
 }
@@ -608,6 +613,8 @@ listing() {
 
 modes() {
 	touch -t 201501010000 "$BACKING/times.txt"
+	: > "$BACKING/combined.txt"
+	chmod 644 "$BACKING/combined.txt"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check "a file created with mode 0444 is written through its descriptor" create_read_only "$MNT/read-only.txt"
 	check "it holds what was written" test "$(cat "$BACKING/read-only.txt")" = data
@@ -631,6 +638,9 @@ modes() {
 	# the JDK sets no time later than the largest number of nanoseconds a long holds, in the year 2262
 	check "a date far in the future is applied, cut down or refused" touch_extreme 999912312359 "$MNT/times.txt" 9223372036
 	check "the volume answers afterwards" volume_answers "$MNT"
+	check "one request sets mode 0200 and a modification time" set_mode_and_time "$MNT/combined.txt" 0200 1500000000
+	check "stat shows both" test "$(stat -f '%Lp %m' "$MNT/combined.txt")" = "200 1500000000"
+	check "the backing directory has both" test "$(stat -f '%Lp %m' "$BACKING/combined.txt")" = "200 1500000000"
 	unmount_volume "$SCENARIO" "$MNT"
 }
 

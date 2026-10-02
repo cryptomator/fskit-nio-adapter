@@ -546,6 +546,22 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("a create still succeeds when the permissions of the created entry cannot be set")
+		public void testCreateWithRefusedPermissions() throws IOException {
+			List<Path> refused = new ArrayList<>();
+			ops.beforeSettingPermissions = path -> {
+				refused.add(path);
+				throw new UncheckedIOException(new AccessDeniedException(path.toString()));
+			};
+
+			CreateResponse response = ok(new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0644), CreateResponse.class);
+
+			Assertions.assertEquals(List.of(root.resolve("new.txt")), refused);
+			Assertions.assertEquals("new.txt", response.name());
+			Assertions.assertEquals(List.of("new.txt"), backingNames());
+		}
+
+		@Test
 		@DisplayName("creating an existing entry yields EEXIST")
 		public void testCreateExisting() throws IOException {
 			backing("file.txt", "content");
@@ -1162,6 +1178,63 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("sets times together with a mode that takes the owner's read permission away")
+		public void testTimesWithModeRevokingRead() throws IOException {
+			long file = createFile("file.txt", "content");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			int valid = Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0200, EPOCH, new Timestamp(1500000000, 0)), SetattrResponse.class);
+
+			Assertions.assertEquals(valid, response.applied());
+			Assertions.assertEquals(0200, response.attributes().mode());
+			Assertions.assertEquals("-w-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(vault.getPath("/file.txt"))));
+			Assertions.assertEquals(Instant.ofEpochSecond(1500000000), Files.getLastModifiedTime(vault.getPath("/file.txt")).toInstant());
+		}
+
+		@Test
+		@DisplayName("a time set together with a mode that takes the owner's read permission away outlasts the close of a written file, given the sync macOS sends first")
+		public void testTimesWithModeRevokingReadOnOpenFile() throws IOException {
+			long file = createFile("file.txt", "content");
+			// without it, cryptofs writes the file out when it is closed and cannot set the time again on a file its owner may not read
+			ok(new SyncRequest(), SyncResponse.class);
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED, 0, 0200, EPOCH, new Timestamp(1500000000, 0)), SetattrResponse.class);
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED, response.applied());
+			Assertions.assertEquals("-w-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(vault.getPath("/file.txt"))));
+			Assertions.assertEquals(Instant.ofEpochSecond(1500000000), Files.getLastModifiedTime(vault.getPath("/file.txt")).toInstant());
+		}
+
+		@Test
+		@DisplayName("a mode set on a file that was swapped for a link leaves the link's target untouched")
+		public void testModeOfFileSwappedForLink() throws IOException {
+			long target = createFile("target.txt", "secret");
+			ok(new CloseRequest(target, 0), CloseResponse.class);
+			long file = createFile("file.txt", "content");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Files.setPosixFilePermissions(vault.getPath("/target.txt"), PosixFilePermissions.fromString("rw-------"));
+			Files.delete(vault.getPath("/file.txt"));
+			Files.createSymbolicLink(vault.getPath("/file.txt"), vault.getPath("/target.txt"));
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_MODE, 0, 0666, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(vault.getPath("/target.txt"))));
+		}
+
+		@Test
+		@DisplayName("creating a file under the name of a link yields ENOTSUP and leaves the link's target absent")
+		public void testCreateAtLink() throws IOException {
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
+
+			assertStatus(Errno.ENOTSUP, new CreateRequest(ROOT, "link", NodeType.FILE, 0644));
+
+			Assertions.assertFalse(Files.exists(vault.getPath("/elsewhere")));
+		}
+
+		@Test
 		@DisplayName("an entry created through a decomposed name is found under both spellings as one node")
 		public void testDecomposedName() {
 			long file = createFile(DECOMPOSED, "content");
@@ -1346,6 +1419,16 @@ public class FileSystemOperationsTest {
 	@DisplayName("setattr")
 	public class Setattr {
 
+		private static final Timestamp ACCESSED = new Timestamp(1600000000, 0);
+		private static final Timestamp MODIFIED = new Timestamp(1500000000, 0);
+		private static final int TIMES = Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
+
+		private final HookedOperations.Hook refusing = path -> {
+			throw new AccessDeniedException(path.toString());
+		};
+		private final HookedOperations.Hook refusingUnchecked = path -> {
+			throw new UncheckedIOException(new AccessDeniedException(path.toString()));
+		};
 		private long file;
 
 		@BeforeEach
@@ -1356,6 +1439,14 @@ public class FileSystemOperationsTest {
 
 		private SetattrResponse setSize(long size) {
 			return ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, size, 0, EPOCH, EPOCH), SetattrResponse.class);
+		}
+
+		private SetattrRequest modeAndTimes(long node, int mode) {
+			return new SetattrRequest(node, Messages.ATTRIBUTE_MODE | TIMES, 0, mode, ACCESSED, MODIFIED);
+		}
+
+		private Instant backingAccessTime(Path path) throws IOException {
+			return ((FileTime) Files.getAttribute(path, "lastAccessTime")).toInstant();
 		}
 
 		@Test
@@ -1408,23 +1499,6 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("sets times and permissions and reports what it applied")
-		public void testTimesAndMode() throws IOException {
-			int valid = Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
-			Timestamp accessed = new Timestamp(1600000000, 0);
-			Timestamp modified = new Timestamp(1500000000, 0);
-
-			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0600, accessed, modified), SetattrResponse.class);
-
-			Assertions.assertEquals(valid, response.applied());
-			Assertions.assertEquals(0600, response.attributes().mode());
-			Assertions.assertEquals(modified, response.attributes().modified());
-			Assertions.assertEquals(10, response.attributes().size());
-			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
-			Assertions.assertEquals(Instant.ofEpochSecond(1500000000), Files.getLastModifiedTime(root.resolve("file.txt")).toInstant());
-		}
-
-		@Test
 		@DisplayName("changes the permissions of an entry that lacks read permission")
 		public void testModeOfUnreadableEntries() throws IOException {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
@@ -1438,6 +1512,157 @@ public class FileSystemOperationsTest {
 			}
 			Assertions.assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("dir"))));
 			Assertions.assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+		}
+
+		@Test
+		@DisplayName("sets times together with a mode that takes the owner's read permission away")
+		public void testTimesWithModeRevokingRead() throws IOException {
+			create(ROOT, "dir", NodeType.DIRECTORY);
+			for (String name : List.of("file.txt", "dir")) {
+				long node = lookup(ROOT, name).nodeId();
+				try {
+					SetattrResponse response = ok(modeAndTimes(node, 0244), SetattrResponse.class);
+
+					Assertions.assertEquals(Messages.ATTRIBUTE_MODE | TIMES, response.applied());
+					Assertions.assertEquals(0244, response.attributes().mode());
+					Assertions.assertEquals(MODIFIED, response.attributes().modified());
+					Assertions.assertEquals(ACCESSED, response.attributes().accessed());
+					Assertions.assertEquals("-w-r--r--", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve(name))));
+					Assertions.assertEquals(Instant.ofEpochSecond(MODIFIED.seconds()), Files.getLastModifiedTime(root.resolve(name)).toInstant());
+					Assertions.assertEquals(Instant.ofEpochSecond(ACCESSED.seconds()), backingAccessTime(root.resolve(name)));
+				} finally {
+					ok(new SetattrRequest(node, Messages.ATTRIBUTE_MODE, 0, 0700, EPOCH, EPOCH), SetattrResponse.class);
+				}
+			}
+		}
+
+		@Test
+		@DisplayName("sets times together with a mode that grants the owner read permission")
+		public void testTimesWithModeGrantingRead() throws IOException {
+			Path path = root.resolve("file.txt");
+			Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("---------"));
+
+			SetattrResponse response = ok(modeAndTimes(file, 0600), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_MODE | TIMES, response.applied());
+			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(MODIFIED, response.attributes().modified());
+			Assertions.assertEquals(ACCESSED, response.attributes().accessed());
+			Assertions.assertEquals(10, response.attributes().size());
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(path)));
+			Assertions.assertEquals(Instant.ofEpochSecond(MODIFIED.seconds()), Files.getLastModifiedTime(path).toInstant());
+			Assertions.assertEquals(Instant.ofEpochSecond(ACCESSED.seconds()), backingAccessTime(path));
+		}
+
+		@Test
+		@DisplayName("times together with a mode that leaves an unreadable file unreadable yield EACCES and leave the mode unchanged")
+		public void testTimesWithModeOfUnreadableFile() throws IOException {
+			Path path = root.resolve("file.txt");
+			Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("---------"));
+			Assumptions.assumeFalse(Files.isReadable(path), "permissions do not apply to this user");
+
+			assertStatus(Errno.EACCES, modeAndTimes(file, 0200));
+
+			Assertions.assertEquals("---------", PosixFilePermissions.toString(Files.getPosixFilePermissions(path)));
+		}
+
+		@Test
+		@DisplayName("a mode whose entry cannot be read anew yields the status of that failure, and neither the mode nor a size is applied")
+		public void testModeOfUnreadableEntry() throws IOException {
+			Path path = root.resolve("file.txt");
+			String permissions = PosixFilePermissions.toString(Files.getPosixFilePermissions(path));
+			ops.beforeReadingAttributes = _ -> {
+				throw new IOException("backend gone");
+			};
+
+			assertStatus(Errno.EIO, new SetattrRequest(file, Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE, 4, 0750, EPOCH, EPOCH));
+
+			Assertions.assertEquals("0123456789", Files.readString(path));
+			Assertions.assertEquals(permissions, PosixFilePermissions.toString(Files.getPosixFilePermissions(path)));
+		}
+
+		@Test
+		@DisplayName("truncates before it sets times that go ahead of the mode")
+		public void testSizeBeforeTimes() throws IOException {
+			int valid = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 4, 0200, EPOCH, MODIFIED), SetattrResponse.class);
+
+			Assertions.assertEquals(valid, response.applied());
+			Assertions.assertEquals(4, response.attributes().size());
+			Assertions.assertEquals(Instant.ofEpochSecond(MODIFIED.seconds()), Files.getLastModifiedTime(root.resolve("file.txt")).toInstant());
+		}
+
+		@Test
+		@DisplayName("times refused after the mode was applied are left out of a reply that still succeeds")
+		public void testTimesRefusedAfterMode() throws IOException {
+			Attributes before = getattr(file);
+			ops.beforeSettingTimes = refusing;
+
+			SetattrResponse response = ok(modeAndTimes(file, 0600), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_MODE, response.applied());
+			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(before.modified(), response.attributes().modified());
+			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+		}
+
+		@Test
+		@DisplayName("a mode refused after the times were applied is left out of a reply that still succeeds")
+		public void testModeRefusedAfterTimes() throws IOException {
+			Path path = root.resolve("file.txt");
+			ops.beforeSettingPermissions = refusing;
+
+			SetattrResponse response = ok(modeAndTimes(file, 0200), SetattrResponse.class);
+
+			Assertions.assertEquals(TIMES, response.applied());
+			Assertions.assertEquals(MODIFIED, response.attributes().modified());
+			Assertions.assertEquals(Instant.ofEpochSecond(MODIFIED.seconds()), Files.getLastModifiedTime(path).toInstant());
+		}
+
+		@Test
+		@DisplayName("after a refused mode that follows a truncation, the times are not attempted")
+		public void testModeRefusedAfterSize() throws IOException {
+			List<Path> timesSet = new ArrayList<>();
+			ops.beforeSettingPermissions = refusingUnchecked;
+			ops.beforeSettingTimes = timesSet::add;
+			int valid = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 4, 0600, EPOCH, MODIFIED), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, response.applied());
+			Assertions.assertEquals(4, response.attributes().size());
+			Assertions.assertEquals("0123", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(List.of(), timesSet);
+		}
+
+		@Test
+		@DisplayName("after refused times that follow a truncation, the mode is not attempted")
+		public void testTimesRefusedAfterSize() throws IOException {
+			List<Path> permissionsSet = new ArrayList<>();
+			ops.beforeSettingTimes = refusing;
+			ops.beforeSettingPermissions = permissionsSet::add;
+			int valid = Messages.ATTRIBUTE_SIZE | Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED;
+
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 4, 0200, EPOCH, MODIFIED), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, response.applied());
+			Assertions.assertEquals("0123", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(List.of(), permissionsSet);
+		}
+
+		@Test
+		@DisplayName("a mode refused before anything was applied yields its status and leaves the times unchanged")
+		public void testModeRefusedFirst() throws IOException {
+			Path path = root.resolve("file.txt");
+			String permissions = PosixFilePermissions.toString(Files.getPosixFilePermissions(path));
+			FileTime modified = Files.getLastModifiedTime(path);
+			ops.beforeSettingPermissions = refusing;
+
+			assertStatus(Errno.EACCES, modeAndTimes(file, 0600));
+
+			Assertions.assertEquals(permissions, PosixFilePermissions.toString(Files.getPosixFilePermissions(path)));
+			Assertions.assertEquals(modified, Files.getLastModifiedTime(path));
 		}
 
 		@Test
@@ -1820,6 +2045,33 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
 		}
 
+		@ParameterizedTest(name = "{0}")
+		@DisplayName("a mode set on an entry that was swapped for a link leaves the link's target untouched")
+		@CsvSource({"FILE, secret.txt", "DIRECTORY, ."})
+		public void testModeOfEntrySwappedForLink(NodeType type, String targetName) throws IOException {
+			Path target = outside.resolve(targetName).normalize();
+			long node = create(ROOT, "entry", type).nodeId();
+			ok(new CloseRequest(node, 0), CloseResponse.class);
+			Files.delete(root.resolve("entry"));
+			Files.createSymbolicLink(root.resolve("entry"), target);
+			Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rwx------"));
+
+			SetattrResponse response = ok(new SetattrRequest(node, Messages.ATTRIBUTE_MODE, 0, 0777, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(target)));
+		}
+
+		@Test
+		@DisplayName("creating a file under the name of a link yields EEXIST and leaves the link's target absent")
+		public void testCreateAtLink() throws IOException {
+			Files.createSymbolicLink(root.resolve("dangling"), outside.resolve("absent.txt"));
+
+			assertStatus(Errno.EEXIST, new CreateRequest(ROOT, "dangling", NodeType.FILE, 0644));
+
+			Assertions.assertFalse(Files.exists(outside.resolve("absent.txt")));
+		}
+
 		@Test
 		@DisplayName("setattr leaves the link's target untouched")
 		public void testSetattr() throws IOException {
@@ -1979,19 +2231,38 @@ public class FileSystemOperationsTest {
 		public void testModeAndTimes() throws IOException {
 			backing("file.txt", "0123456789");
 			long file = lookup(ROOT, "file.txt").nodeId();
-			ops.beforeReadingAttributes = failing;
+			// the entry's type is read before a mode is applied
+			ops.beforeSettingPermissions = _ -> ops.beforeReadingAttributes = failing;
 			int valid = Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_ACCESSED | Messages.ATTRIBUTE_MODIFIED;
 			Timestamp accessed = new Timestamp(1600000000, 0);
 			Timestamp modified = new Timestamp(1500000000, 0);
 
-			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0600, accessed, modified), SetattrResponse.class);
+			SetattrResponse response = ok(new SetattrRequest(file, valid, 0, 0750, accessed, modified), SetattrResponse.class);
 
 			Assertions.assertEquals(valid, response.applied());
-			Assertions.assertEquals(0600, response.attributes().mode());
+			Assertions.assertEquals(0750, response.attributes().mode());
 			Assertions.assertEquals(accessed, response.attributes().accessed());
 			Assertions.assertEquals(modified, response.attributes().modified());
 			Assertions.assertEquals(10, response.attributes().size());
-			Assertions.assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+			Assertions.assertEquals("rwxr-x---", PosixFilePermissions.toString(Files.getPosixFilePermissions(root.resolve("file.txt"))));
+		}
+
+		@Test
+		@DisplayName("a change of times whose mode is refused still succeeds, with the times it established and the last known mode")
+		public void testTimesWithRefusedMode() throws IOException {
+			backing("file.txt", "0123456789");
+			Attributes last = lookup(ROOT, "file.txt");
+			ops.beforeSettingTimes = _ -> ops.beforeReadingAttributes = failing;
+			ops.beforeSettingPermissions = path -> {
+				throw new AccessDeniedException(path.toString());
+			};
+			Timestamp modified = new Timestamp(1500000000, 0);
+
+			SetattrResponse response = ok(new SetattrRequest(last.nodeId(), Messages.ATTRIBUTE_MODE | Messages.ATTRIBUTE_MODIFIED, 0, 0200, EPOCH, modified), SetattrResponse.class);
+
+			Assertions.assertEquals(Messages.ATTRIBUTE_MODIFIED, response.applied());
+			Assertions.assertEquals(modified, response.attributes().modified());
+			Assertions.assertEquals(last.mode(), response.attributes().mode());
 		}
 
 		@Test
