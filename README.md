@@ -53,7 +53,9 @@ codesign --verify --deep --strict /Applications/FSKitNioHost.app  # must pass
 open /Applications/FSKitNioHost.app
 ```
 
-Then enable "Cryptomator FSKit File System Extension" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m | grep -i fskit` lists the extension once it is registered.
+Then enable "Cryptomator FSKit File System Extension" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m | grep -i fskit` lists the extension once it is registered. macOS switches the extension off again when a reinstalled build has a changed `Info.plist`.
+
+For a file system type that no extension provides, `mount` exits with status 69 and `mount: Unable to invoke task`. With the extension disabled, it additionally prints `Module <bundle identifier> is disabled!`.
 
 `package.sh` reads these environment variables:
 
@@ -89,46 +91,18 @@ Mirror a vault (prompts for the vault, its passphrase, the mount point, and for 
 ./mvnw test -Pcrypto-mirror
 ```
 
-## Platform notes
+## Known limitations
 
 Observed on macOS 27.0.1 with JDK 26.
 
-Mounting:
-
-- The sandboxed extension, with the `com.apple.security.network.client` entitlement, can read the manifest in the owner-only directory it is asked to mount and connect to a loopback listener of another process.
-- `loadResource` runs once per mount, and every mount gets its own extension process.
-- `mount` accepts only options the extension declares in `FSActivateOptionSyntax`; any other fails with `mount: Argument count 4 not equal to expected count 2`. The extension declares `-o`, and the provider passes `-o rdonly` for a read-only mount. The mount table then lists the volume as `read-only` and the system rejects changes itself with "Read-only file system", before they reach the extension. The option arrives in `activateVolume`, not in `loadResource` or `mount`.
-- `/sbin/mount` lists a volume as `file://<manifest directory>/ on <mount point> (cryptomatorfs, local, nodev, nosuid, noowners, noatime, fskit, mounted by <user>)`, with symbolic links resolved in the mount point only. The provider names the manifest directory with a random UUID and recognizes its own mount by it.
-- For a file system type that no extension provides, `mount` exits with status 69 and `mount: Unable to invoke task`. With the extension disabled, it additionally prints `Module <bundle identifier> is disabled!`.
-- Right after mounting, system services probe the root for `.metadata_never_index`, `.Spotlight-V100`, `.Trashes` and others, and `fseventsd` creates a `.fseventsd` directory there. That directory appears in the mounted `Path`.
-
-Removed files that are still open:
-
-- FSKit can emulate them itself (`enableOpenUnlinkEmulation`). It then renames such a file to `.nfs.<number>.<hex>` in its directory instead of removing it, moves it to the volume root when its directory is removed, and removes it when the last descriptor is closed. Until then the file is visible in listings and in the mounted `Path`, and it stays there for good if the host JVM dies first.
-- The adapter does not use the emulation for that reason. It removes the entry at once and serves the item through its open channel until it is closed.
-
-Names:
-
-- FSKit delivers a name in the Unicode form the caller used, without normalizing it: a shell passes the name as typed, Finder passes it decomposed. The adapter creates new entries under the composed form and finds an entry under either.
-- Finder's Trash needs a `.Trashes` directory in the volume root, which macOS creates with mode `d-wx--x--x`. It appears in the mounted `Path`.
-
-Extended attributes:
-
-- The volume advertises no extended attribute support. macOS then stores attributes in AppleDouble companion files named `._<name>` next to the file, which appear in the mounted `Path`. `xattr -w` succeeds.
-- A process whose files are tagged with `com.apple.provenance` creates a companion for every file it creates.
-- The kernel removes a companion together with its file. `rm -r` may therefore report `No such file or directory` for a companion it had listed, and exit with status 1 although everything is removed.
-- An attribute set on a removed file that is still open leaves an orphaned companion behind.
-- Tools that scan their own directories see the companions. In a git repository on the volume, `git fsck` reports the ones inside `.git` as invalid refs and objects, and `git status` lists the others as untracked.
-
-Host failure:
-
-- When the host JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
-
-## Known limitations
-
 - A mounted volume may not be confined to the user who mounted it. macOS mounts it with `noowners`, and the extension checks no caller identity, so another local account that can reach the mount point may be able to read and write it. That is untested, so mount only data that other accounts on the Mac may see.
+- macOS creates directories of its own in the volume root, which appear in the mounted `Path`: `fseventsd` creates `.fseventsd` right after mounting, and Finder's Trash needs `.Trashes`.
 - Symbolic links are shown but cannot be read, followed or created. Hard links cannot be created.
-- No extended attributes, see the platform notes for what macOS does instead.
+- No extended attributes. macOS stores attributes in AppleDouble companion files named `._<name>` next to the file instead, which appear in the mounted `Path` as well. `xattr -w` therefore succeeds, and:
+  - A process whose files are tagged with `com.apple.provenance` creates a companion for every file it creates.
+  - The kernel removes a companion together with its file. `rm -r` may therefore report `No such file or directory` for a companion it had listed, and exit with status 1 although everything is removed.
+  - An attribute set on a removed file that is still open leaves an orphaned companion behind.
+  - Tools that scan their own directories see the companions. In a git repository on the volume, `git fsck` reports the ones inside `.git` as invalid refs and objects, and `git status` lists the others as untracked.
 - One slow operation stalls its volume, since requests are served one at a time.
 - Nothing else may modify the mounted `Path` while it is mounted.
 - The mounted `Path` must not hold two names that differ only in Unicode normalization.
@@ -137,7 +111,7 @@ Host failure:
 - A time or permission change on a removed file that is still open is ignored.
 - A rename that replaces an existing entry is atomic only when a file replaces a file. With a directory or a symbolic link on either side, the target is removed first and is gone if the move then fails.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.
-- A restarted extension cannot reconnect to a live mount, and a mount does not survive its JVM.
+- A restarted extension cannot reconnect to a live mount, and a mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
 - The provider is offered on every Mac running macOS 27 or later, whether or not the extension is installed and enabled. If it is not, `mount()` fails with `MountFailedException`.
 
 ## License
