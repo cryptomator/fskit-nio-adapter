@@ -160,7 +160,12 @@
                 <version>${mvn-compiler.version}</version>
                 <configuration>
                     <showWarnings>true</showWarnings>
+                    <failOnWarning>true</failOnWarning>
                     <release>${project.build.jdk}</release>
+                    <compilerArgs>
+                        <!-- the exceptions of this project are never serialized -->
+                        <arg>-Xlint:all,-serial</arg>
+                    </compilerArgs>
                 </configuration>
             </plugin>
             <plugin>

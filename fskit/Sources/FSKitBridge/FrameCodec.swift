@@ -1,7 +1,6 @@
 import Foundation
 
 public enum FrameCodec {
-
 	public static let maxControlLength = 64 * 1024
 	public static let maxPayloadLength = 1024 * 1024
 	private static let headerLength = 1 + 2 + 8 + 4 // kind, opcode, request id, control length
@@ -26,24 +25,24 @@ public enum FrameCodec {
 	/// - Parameter read: Returns exactly the requested number of bytes or throws.
 	/// - Throws: `ProtocolError` if the frame violates the limits or names an unknown kind or opcode, or whatever `read` throws.
 	public static func decode(readingFrom read: (Int) throws -> Data) throws -> Frame {
-		var lengthReader = ByteReader(try read(4))
-		let length = Int(try lengthReader.read(UInt32.self))
+		var lengthReader = try ByteReader(read(4))
+		let length = try Int(lengthReader.read(UInt32.self))
 		guard length >= headerLength, length <= headerLength + maxControlLength + maxPayloadLength else {
 			throw ProtocolError("Invalid frame length \(length)")
 		}
-		var header = ByteReader(try read(headerLength))
-		guard let kind = Frame.Kind(rawValue: try header.read()) else {
+		var header = try ByteReader(read(headerLength))
+		guard let kind = try Frame.Kind(rawValue: header.read()) else {
 			throw ProtocolError("Unknown frame kind")
 		}
-		guard let opcode = Opcode(rawValue: try header.read()) else {
+		guard let opcode = try Opcode(rawValue: header.read()) else {
 			throw ProtocolError("Unknown opcode")
 		}
 		let requestId = try header.read(UInt64.self)
-		let controlLength = Int(try header.read(UInt32.self))
+		let controlLength = try Int(header.read(UInt32.self))
 		let payloadLength = length - headerLength - controlLength
 		guard controlLength <= maxControlLength, payloadLength >= 0, payloadLength <= maxPayloadLength else {
 			throw ProtocolError("Invalid control length \(controlLength) in frame of length \(length)")
 		}
-		return Frame(kind: kind, opcode: opcode, requestId: requestId, control: try read(controlLength), payload: try read(payloadLength))
+		return try Frame(kind: kind, opcode: opcode, requestId: requestId, control: read(controlLength), payload: read(payloadLength))
 	}
 }

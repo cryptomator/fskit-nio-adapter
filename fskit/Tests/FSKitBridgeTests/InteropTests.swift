@@ -1,16 +1,15 @@
 import Foundation
 import Testing
-
 @testable import FSKitBridge
 
 /// Drives the Java server with the Swift client. `scripts/interop-test.sh` starts the server and passes the directory that holds its manifest.
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["FSKIT_INTEROP_RENDEZVOUS_DIR"] != nil))
 struct InteropTests {
-
 	private static let root = Messages.rootNodeId
 
+	// swiftlint:disable:next function_body_length
 	@Test func clientAndServerAgreeOnAnOperationSequence() throws {
-		let rendezvousDir = URL(fileURLWithPath: ProcessInfo.processInfo.environment["FSKIT_INTEROP_RENDEZVOUS_DIR"]!)
+		let rendezvousDir = try URL(fileURLWithPath: #require(ProcessInfo.processInfo.environment["FSKIT_INTEROP_RENDEZVOUS_DIR"]))
 		let manifest = try Manifest.read(from: rendezvousDir)
 		#expect(manifest.volumeName == "Interop ä")
 		let client = try BridgeClient(manifest: manifest)
@@ -38,7 +37,7 @@ struct InteropTests {
 		#expect(Int(written.attributes.size) == content.count)
 		let read = try client.read(nodeId: file, offset: 0, length: content.count + 100)
 		#expect(read.data == content)
-		#expect(try client.read(nodeId: file, offset: 5, length: 10).data == content.subdata(in: 5..<15))
+		#expect(try client.read(nodeId: file, offset: 5, length: 10).data == content.subdata(in: 5 ..< 15))
 
 		let truncated = try client.request(SetattrRequest(nodeId: file, valid: Messages.attributeSize | Messages.attributeModified, size: 3, mode: 0, accessed: Timestamp(seconds: 0, nanos: 0), modified: Timestamp(seconds: 1_700_000_000, nanos: 5)))
 		#expect(truncated.applied == Messages.attributeSize | Messages.attributeModified)

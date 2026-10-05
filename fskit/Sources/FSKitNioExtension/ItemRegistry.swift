@@ -4,7 +4,6 @@ import FSKit
 ///
 /// Confined to the volume's queue.
 final class ItemRegistry {
-
 	private var items: [UInt64: BridgeItem] = [:]
 
 	func item(for nodeId: UInt64) -> BridgeItem {

@@ -2,7 +2,6 @@ import Foundation
 
 /// The messages of the bridge protocol, as specified in `protocol/PROTOCOL.md`.
 public enum Messages {
-
 	public static let magic: UInt32 = 0x4653_4B4E
 	public static let protocolVersion: UInt16 = 1
 	public static let tokenLength = 32
@@ -26,7 +25,7 @@ public enum Messages {
 		return Frame(kind: .request, opcode: R.opcode, requestId: requestId, control: control.data, payload: request.payload)
 	}
 
-	public static func frame<M: Message>(for response: M, opcode: Opcode, requestId: UInt64) -> Frame {
+	public static func frame(for response: some Message, opcode: Opcode, requestId: UInt64) -> Frame {
 		var control = ByteWriter()
 		control.write(Int32(0))
 		response.encode(control: &control)
@@ -77,7 +76,6 @@ public enum Messages {
 
 /// A response's non-zero status: a macOS errno value or `Messages.statusInvalidCookie`.
 public struct StatusError: Error, Equatable {
-
 	public let status: Int32
 
 	public init(status: Int32) {
@@ -86,7 +84,6 @@ public struct StatusError: Error, Equatable {
 }
 
 public protocol Message: Sendable {
-
 	static var carriesPayload: Bool { get }
 
 	init(control: inout ByteReader, payload: Data) throws
@@ -96,22 +93,19 @@ public protocol Message: Sendable {
 	var payload: Data { get }
 }
 
-extension Message {
-
-	public static var carriesPayload: Bool {
+public extension Message {
+	static var carriesPayload: Bool {
 		false
 	}
 
-	public func encode(control: inout ByteWriter) {
-	}
+	func encode(control: inout ByteWriter) {}
 
-	public var payload: Data {
+	var payload: Data {
 		Data()
 	}
 }
 
 public protocol Request: Message {
-
 	associatedtype Response: Message
 
 	static var opcode: Opcode { get }
@@ -125,7 +119,7 @@ public enum NodeType: UInt8, Sendable {
 	case symlink = 3
 
 	init(control: inout ByteReader) throws {
-		guard let type = NodeType(rawValue: try control.read()) else {
+		guard let type = try NodeType(rawValue: control.read()) else {
 			throw ProtocolError("Unknown node type")
 		}
 		self = type
@@ -133,7 +127,6 @@ public enum NodeType: UInt8, Sendable {
 }
 
 public struct Timestamp: Equatable, Sendable {
-
 	public var seconds: Int64
 	public var nanos: UInt32
 
@@ -143,8 +136,8 @@ public struct Timestamp: Equatable, Sendable {
 	}
 
 	init(control: inout ByteReader) throws {
-		seconds = try control.read()
-		nanos = try control.read()
+		self.seconds = try control.read()
+		self.nanos = try control.read()
 	}
 
 	func encode(control: inout ByteWriter) {
@@ -154,7 +147,6 @@ public struct Timestamp: Equatable, Sendable {
 }
 
 public struct Attributes: Equatable, Sendable {
-
 	public var type: NodeType
 	public var mode: UInt16
 	public var size: UInt64
@@ -176,14 +168,14 @@ public struct Attributes: Equatable, Sendable {
 	}
 
 	init(control: inout ByteReader) throws {
-		type = try NodeType(control: &control)
-		mode = try control.read()
-		size = try control.read()
-		nodeId = try control.read()
-		parentId = try control.read()
-		modified = try Timestamp(control: &control)
-		accessed = try Timestamp(control: &control)
-		created = try Timestamp(control: &control)
+		self.type = try NodeType(control: &control)
+		self.mode = try control.read()
+		self.size = try control.read()
+		self.nodeId = try control.read()
+		self.parentId = try control.read()
+		self.modified = try Timestamp(control: &control)
+		self.accessed = try Timestamp(control: &control)
+		self.created = try Timestamp(control: &control)
 	}
 
 	func encode(control: inout ByteWriter) {
@@ -199,7 +191,6 @@ public struct Attributes: Equatable, Sendable {
 }
 
 public struct DirectoryEntry: Equatable, Sendable {
-
 	public var name: String
 	public var type: NodeType
 	public var nodeId: UInt64
@@ -215,11 +206,11 @@ public struct DirectoryEntry: Equatable, Sendable {
 	}
 
 	init(control: inout ByteReader) throws {
-		name = try control.readString()
-		type = try NodeType(control: &control)
-		nodeId = try control.read()
-		nextCookie = try control.read()
-		attributes = try control.readBool() ? Attributes(control: &control) : nil
+		self.name = try control.readString()
+		self.type = try NodeType(control: &control)
+		self.nodeId = try control.read()
+		self.nextCookie = try control.read()
+		self.attributes = try control.readBool() ? Attributes(control: &control) : nil
 	}
 
 	func encode(control: inout ByteWriter) {
@@ -235,7 +226,6 @@ public struct DirectoryEntry: Equatable, Sendable {
 // MARK: - HELLO
 
 public struct HelloRequest: Request, Equatable {
-
 	public typealias Response = HelloResponse
 	public static let opcode = Opcode.hello
 
@@ -249,11 +239,11 @@ public struct HelloRequest: Request, Equatable {
 		self.token = token
 	}
 
-	// what follows magic and version is not interpreted here, since a client speaking another version may lay it out differently
 	public init(control: inout ByteReader, payload: Data) throws {
-		magic = try control.read()
-		protocolVersion = try control.read()
-		token = try control.readBytes(control.remaining)
+		self.magic = try control.read()
+		self.protocolVersion = try control.read()
+		// what follows magic and version is not interpreted here, since a client speaking another version may lay it out differently
+		self.token = try control.readBytes(control.remaining)
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -264,30 +254,23 @@ public struct HelloRequest: Request, Equatable {
 }
 
 public struct HelloResponse: Message, Equatable {
+	public init() {}
 
-	public init() {
-	}
-
-	public init(control: inout ByteReader, payload: Data) throws {
-	}
+	public init(control: inout ByteReader, payload: Data) throws {}
 }
 
 // MARK: - STATFS
 
 public struct StatfsRequest: Request, Equatable {
-
 	public typealias Response = StatfsResponse
 	public static let opcode = Opcode.statfs
 
-	public init() {
-	}
+	public init() {}
 
-	public init(control: inout ByteReader, payload: Data) throws {
-	}
+	public init(control: inout ByteReader, payload: Data) throws {}
 }
 
 public struct StatfsResponse: Message, Equatable {
-
 	public var totalBytes: UInt64
 	public var usableBytes: UInt64
 
@@ -297,8 +280,8 @@ public struct StatfsResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		totalBytes = try control.read()
-		usableBytes = try control.read()
+		self.totalBytes = try control.read()
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -310,7 +293,6 @@ public struct StatfsResponse: Message, Equatable {
 // MARK: - LOOKUP
 
 public struct LookupRequest: Request, Equatable {
-
 	public typealias Response = LookupResponse
 	public static let opcode = Opcode.lookup
 
@@ -323,8 +305,8 @@ public struct LookupRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		parentId = try control.read()
-		name = try control.readString()
+		self.parentId = try control.read()
+		self.name = try control.readString()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -334,7 +316,6 @@ public struct LookupRequest: Request, Equatable {
 }
 
 public struct LookupResponse: Message, Equatable {
-
 	public var attributes: Attributes
 	public var name: String
 
@@ -344,8 +325,8 @@ public struct LookupResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		attributes = try Attributes(control: &control)
-		name = try control.readString()
+		self.attributes = try Attributes(control: &control)
+		self.name = try control.readString()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -357,7 +338,6 @@ public struct LookupResponse: Message, Equatable {
 // MARK: - FORGET
 
 public struct ForgetRequest: Request, Equatable {
-
 	public typealias Response = ForgetResponse
 	public static let opcode = Opcode.forget
 
@@ -368,7 +348,7 @@ public struct ForgetRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
+		self.nodeId = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -377,7 +357,6 @@ public struct ForgetRequest: Request, Equatable {
 }
 
 public struct ForgetResponse: Message, Equatable {
-
 	public var usableBytes: UInt64
 
 	public init(usableBytes: UInt64) {
@@ -385,7 +364,7 @@ public struct ForgetResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		usableBytes = try control.read()
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -396,7 +375,6 @@ public struct ForgetResponse: Message, Equatable {
 // MARK: - GETATTR
 
 public struct GetattrRequest: Request, Equatable {
-
 	public typealias Response = GetattrResponse
 	public static let opcode = Opcode.getattr
 
@@ -407,7 +385,7 @@ public struct GetattrRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
+		self.nodeId = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -416,7 +394,6 @@ public struct GetattrRequest: Request, Equatable {
 }
 
 public struct GetattrResponse: Message, Equatable {
-
 	public var attributes: Attributes
 
 	public init(attributes: Attributes) {
@@ -424,7 +401,7 @@ public struct GetattrResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		attributes = try Attributes(control: &control)
+		self.attributes = try Attributes(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -435,7 +412,6 @@ public struct GetattrResponse: Message, Equatable {
 // MARK: - SETATTR
 
 public struct SetattrRequest: Request, Equatable {
-
 	public typealias Response = SetattrResponse
 	public static let opcode = Opcode.setattr
 
@@ -456,12 +432,12 @@ public struct SetattrRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		valid = try control.read()
-		size = try control.read()
-		mode = try control.read()
-		accessed = try Timestamp(control: &control)
-		modified = try Timestamp(control: &control)
+		self.nodeId = try control.read()
+		self.valid = try control.read()
+		self.size = try control.read()
+		self.mode = try control.read()
+		self.accessed = try Timestamp(control: &control)
+		self.modified = try Timestamp(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -475,7 +451,6 @@ public struct SetattrRequest: Request, Equatable {
 }
 
 public struct SetattrResponse: Message, Equatable {
-
 	public var applied: UInt8
 	public var attributes: Attributes
 	public var usableBytes: UInt64
@@ -487,9 +462,9 @@ public struct SetattrResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		applied = try control.read()
-		attributes = try Attributes(control: &control)
-		usableBytes = try control.read()
+		self.applied = try control.read()
+		self.attributes = try Attributes(control: &control)
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -502,7 +477,6 @@ public struct SetattrResponse: Message, Equatable {
 // MARK: - READDIR
 
 public struct ReaddirRequest: Request, Equatable {
-
 	public typealias Response = ReaddirResponse
 	public static let opcode = Opcode.readdir
 
@@ -519,10 +493,10 @@ public struct ReaddirRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		cookie = try control.read()
-		verifier = try control.read()
-		wantAttributes = try control.readBool()
+		self.nodeId = try control.read()
+		self.cookie = try control.read()
+		self.verifier = try control.read()
+		self.wantAttributes = try control.readBool()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -534,7 +508,6 @@ public struct ReaddirRequest: Request, Equatable {
 }
 
 public struct ReaddirResponse: Message, Equatable {
-
 	public var verifier: UInt64
 	public var more: Bool
 	public var entries: [DirectoryEntry]
@@ -546,12 +519,12 @@ public struct ReaddirResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		verifier = try control.read()
-		more = try control.readBool()
-		let count = Int(try control.read(UInt16.self))
-		entries = []
-		for _ in 0..<count {
-			entries.append(try DirectoryEntry(control: &control))
+		self.verifier = try control.read()
+		self.more = try control.readBool()
+		let count = try Int(control.read(UInt16.self))
+		self.entries = []
+		for _ in 0 ..< count {
+			try entries.append(DirectoryEntry(control: &control))
 		}
 	}
 
@@ -566,7 +539,6 @@ public struct ReaddirResponse: Message, Equatable {
 // MARK: - CREATE
 
 public struct CreateRequest: Request, Equatable {
-
 	public typealias Response = CreateResponse
 	public static let opcode = Opcode.create
 
@@ -583,10 +555,10 @@ public struct CreateRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		parentId = try control.read()
-		name = try control.readString()
-		type = try NodeType(control: &control)
-		mode = try control.read()
+		self.parentId = try control.read()
+		self.name = try control.readString()
+		self.type = try NodeType(control: &control)
+		self.mode = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -598,7 +570,6 @@ public struct CreateRequest: Request, Equatable {
 }
 
 public struct CreateResponse: Message, Equatable {
-
 	public var attributes: Attributes
 	public var name: String
 	public var directoryAttributes: Attributes
@@ -612,10 +583,10 @@ public struct CreateResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		attributes = try Attributes(control: &control)
-		name = try control.readString()
-		directoryAttributes = try Attributes(control: &control)
-		usableBytes = try control.read()
+		self.attributes = try Attributes(control: &control)
+		self.name = try control.readString()
+		self.directoryAttributes = try Attributes(control: &control)
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -629,7 +600,6 @@ public struct CreateResponse: Message, Equatable {
 // MARK: - REMOVE
 
 public struct RemoveRequest: Request, Equatable {
-
 	public typealias Response = RemoveResponse
 	public static let opcode = Opcode.remove
 
@@ -642,8 +612,8 @@ public struct RemoveRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		parentId = try control.read()
+		self.nodeId = try control.read()
+		self.parentId = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -653,7 +623,6 @@ public struct RemoveRequest: Request, Equatable {
 }
 
 public struct RemoveResponse: Message, Equatable {
-
 	public var attributes: Attributes
 	public var directoryAttributes: Attributes
 	public var usableBytes: UInt64
@@ -665,9 +634,9 @@ public struct RemoveResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		attributes = try Attributes(control: &control)
-		directoryAttributes = try Attributes(control: &control)
-		usableBytes = try control.read()
+		self.attributes = try Attributes(control: &control)
+		self.directoryAttributes = try Attributes(control: &control)
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -680,7 +649,6 @@ public struct RemoveResponse: Message, Equatable {
 // MARK: - RENAME
 
 public struct RenameRequest: Request, Equatable {
-
 	public typealias Response = RenameResponse
 	public static let opcode = Opcode.rename
 
@@ -697,10 +665,10 @@ public struct RenameRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		sourceParentId = try control.read()
-		destinationParentId = try control.read()
-		destinationName = try control.readString()
+		self.nodeId = try control.read()
+		self.sourceParentId = try control.read()
+		self.destinationParentId = try control.read()
+		self.destinationName = try control.readString()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -712,7 +680,6 @@ public struct RenameRequest: Request, Equatable {
 }
 
 public struct RenameResponse: Message, Equatable {
-
 	public var name: String
 	public var attributes: Attributes
 	public var sourceDirectoryAttributes: Attributes
@@ -730,12 +697,12 @@ public struct RenameResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		name = try control.readString()
-		attributes = try Attributes(control: &control)
-		sourceDirectoryAttributes = try Attributes(control: &control)
-		destinationDirectoryAttributes = try Attributes(control: &control)
-		replacedAttributes = try control.readBool() ? Attributes(control: &control) : nil
-		usableBytes = try control.read()
+		self.name = try control.readString()
+		self.attributes = try Attributes(control: &control)
+		self.sourceDirectoryAttributes = try Attributes(control: &control)
+		self.destinationDirectoryAttributes = try Attributes(control: &control)
+		self.replacedAttributes = try control.readBool() ? Attributes(control: &control) : nil
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -752,7 +719,6 @@ public struct RenameResponse: Message, Equatable {
 // MARK: - OPEN
 
 public struct OpenRequest: Request, Equatable {
-
 	public typealias Response = OpenResponse
 	public static let opcode = Opcode.open
 
@@ -765,8 +731,8 @@ public struct OpenRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		modes = try control.read()
+		self.nodeId = try control.read()
+		self.modes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -776,18 +742,14 @@ public struct OpenRequest: Request, Equatable {
 }
 
 public struct OpenResponse: Message, Equatable {
+	public init() {}
 
-	public init() {
-	}
-
-	public init(control: inout ByteReader, payload: Data) throws {
-	}
+	public init(control: inout ByteReader, payload: Data) throws {}
 }
 
 // MARK: - CLOSE
 
 public struct CloseRequest: Request, Equatable {
-
 	public typealias Response = CloseResponse
 	public static let opcode = Opcode.close
 
@@ -800,8 +762,8 @@ public struct CloseRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		keptModes = try control.read()
+		self.nodeId = try control.read()
+		self.keptModes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -811,7 +773,6 @@ public struct CloseRequest: Request, Equatable {
 }
 
 public struct CloseResponse: Message, Equatable {
-
 	public var usableBytes: UInt64
 
 	public init(usableBytes: UInt64) {
@@ -819,7 +780,7 @@ public struct CloseResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		usableBytes = try control.read()
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -830,7 +791,6 @@ public struct CloseResponse: Message, Equatable {
 // MARK: - READ
 
 public struct ReadRequest: Request, Equatable {
-
 	public typealias Response = ReadResponse
 	public static let opcode = Opcode.read
 
@@ -845,9 +805,9 @@ public struct ReadRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		offset = try control.read()
-		length = try control.read()
+		self.nodeId = try control.read()
+		self.offset = try control.read()
+		self.length = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -858,7 +818,6 @@ public struct ReadRequest: Request, Equatable {
 }
 
 public struct ReadResponse: Message, Equatable {
-
 	public static let carriesPayload = true
 
 	public var attributes: Attributes
@@ -870,8 +829,8 @@ public struct ReadResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		attributes = try Attributes(control: &control)
-		data = payload
+		self.attributes = try Attributes(control: &control)
+		self.data = payload
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -886,7 +845,6 @@ public struct ReadResponse: Message, Equatable {
 // MARK: - WRITE
 
 public struct WriteRequest: Request, Equatable {
-
 	public typealias Response = WriteResponse
 	public static let opcode = Opcode.write
 	public static let carriesPayload = true
@@ -902,9 +860,9 @@ public struct WriteRequest: Request, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		nodeId = try control.read()
-		offset = try control.read()
-		data = payload
+		self.nodeId = try control.read()
+		self.offset = try control.read()
+		self.data = payload
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -918,7 +876,6 @@ public struct WriteRequest: Request, Equatable {
 }
 
 public struct WriteResponse: Message, Equatable {
-
 	public var written: UInt32
 	public var attributes: Attributes
 	public var usableBytes: UInt64
@@ -930,9 +887,9 @@ public struct WriteResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		written = try control.read()
-		attributes = try Attributes(control: &control)
-		usableBytes = try control.read()
+		self.written = try control.read()
+		self.attributes = try Attributes(control: &control)
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -945,19 +902,15 @@ public struct WriteResponse: Message, Equatable {
 // MARK: - SYNC
 
 public struct SyncRequest: Request, Equatable {
-
 	public typealias Response = SyncResponse
 	public static let opcode = Opcode.sync
 
-	public init() {
-	}
+	public init() {}
 
-	public init(control: inout ByteReader, payload: Data) throws {
-	}
+	public init(control: inout ByteReader, payload: Data) throws {}
 }
 
 public struct SyncResponse: Message, Equatable {
-
 	public var usableBytes: UInt64
 
 	public init(usableBytes: UInt64) {
@@ -965,7 +918,7 @@ public struct SyncResponse: Message, Equatable {
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		usableBytes = try control.read()
+		self.usableBytes = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {

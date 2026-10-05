@@ -2,7 +2,6 @@ import Foundation
 
 /// Tells the extension where to find the server of a mount.
 public struct Manifest: Equatable, Sendable {
-
 	public static let fileName = "manifest"
 
 	public var protocolVersion: UInt16
@@ -19,13 +18,13 @@ public struct Manifest: Equatable, Sendable {
 
 	public init(decoding data: Data) throws {
 		var reader = ByteReader(data)
-		protocolVersion = try reader.read()
+		self.protocolVersion = try reader.read()
 		guard protocolVersion == Messages.protocolVersion else {
 			throw ProtocolError("Unsupported protocol version \(protocolVersion)")
 		}
-		port = try reader.read()
-		token = try reader.readBytes(Messages.tokenLength)
-		volumeName = try reader.readString()
+		self.port = try reader.read()
+		self.token = try reader.readBytes(Messages.tokenLength)
+		self.volumeName = try reader.readString()
 		guard reader.remaining == 0 else {
 			throw ProtocolError("\(reader.remaining) bytes left over in manifest")
 		}

@@ -2,7 +2,6 @@ import Foundation
 
 /// Thrown when a frame, message or manifest violates the bridge protocol. A connection that carried it must be closed.
 public struct ProtocolError: Error, Equatable {
-
 	public let message: String
 
 	public init(_ message: String) {
@@ -12,13 +11,11 @@ public struct ProtocolError: Error, Equatable {
 
 /// Appends the protocol's primitives to a byte buffer. All integers are big-endian.
 public struct ByteWriter {
-
 	public private(set) var data = Data()
 
-	public init() {
-	}
+	public init() {}
 
-	public mutating func write<T: FixedWidthInteger>(_ value: T) {
+	public mutating func write(_ value: some FixedWidthInteger) {
 		withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
 	}
 
@@ -40,7 +37,6 @@ public struct ByteWriter {
 
 /// Reads the protocol's primitives from a byte buffer, failing on a buffer that is too short.
 public struct ByteReader {
-
 	private let data: Data
 	private var offset: Int
 
@@ -69,7 +65,7 @@ public struct ByteReader {
 	}
 
 	public mutating func readString() throws -> String {
-		let bytes = try readBytes(Int(try read(UInt16.self)))
+		let bytes = try readBytes(Int(read(UInt16.self)))
 		guard let string = String(validating: bytes, as: UTF8.self) else {
 			throw ProtocolError("String is not valid UTF-8")
 		}
@@ -81,6 +77,6 @@ public struct ByteReader {
 			throw ProtocolError("Field of \(count) bytes exceeds the remaining \(remaining)")
 		}
 		defer { offset += count }
-		return data.subdata(in: offset..<(offset + count))
+		return data.subdata(in: offset ..< (offset + count))
 	}
 }

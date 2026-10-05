@@ -3,7 +3,6 @@ import Testing
 
 /// An example from `protocol/vectors`: the decoded field values and the encoded bytes.
 struct Vector: Sendable, CustomTestStringConvertible {
-
 	private static let directory = URL(fileURLWithPath: #filePath)
 		.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
 		.appendingPathComponent("protocol/vectors")
@@ -21,14 +20,14 @@ struct Vector: Sendable, CustomTestStringConvertible {
 		let lines = try String(contentsOf: directory.appendingPathComponent(name), encoding: .utf8)
 			.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
 		let separator = try #require(lines.firstIndex(of: hexSeparator))
-		return Vector(name: name, fields: Array(lines[..<separator]), bytes: try #require(Data(hex: lines[(separator + 1)...].joined())))
+		return try Vector(name: name, fields: Array(lines[..<separator]), bytes: #require(Data(hex: lines[(separator + 1)...].joined())))
 	}
 
 	/// All examples that hold a message, i.e. all but the bare frame and the manifest.
-	static let messages: [Vector] = {
-		let names = try! FileManager.default.contentsOfDirectory(atPath: directory.path)
-		return names.filter { $0 != "frame.txt" && $0 != "manifest.txt" }.sorted().map { try! load($0) }
-	}()
+	static func messages() throws -> [Vector] {
+		try FileManager.default.contentsOfDirectory(atPath: directory.path)
+			.filter { $0 != "frame.txt" && $0 != "manifest.txt" }.sorted().map { try load($0) }
+	}
 
 	/// Lists the fields of a value the way the examples do.
 	static func describe(_ value: Any) -> [String] {
@@ -67,7 +66,6 @@ struct Vector: Sendable, CustomTestStringConvertible {
 }
 
 extension Data {
-
 	init?(hex: String) {
 		let digits = Array(hex.filter { !$0.isWhitespace })
 		guard digits.count % 2 == 0 else {
@@ -75,7 +73,7 @@ extension Data {
 		}
 		var bytes: [UInt8] = []
 		for index in stride(from: 0, to: digits.count, by: 2) {
-			guard let byte = UInt8(String(digits[index...(index + 1)]), radix: 16) else {
+			guard let byte = UInt8(String(digits[index ... (index + 1)]), radix: 16) else {
 				return nil
 			}
 			bytes.append(byte)
@@ -85,7 +83,7 @@ extension Data {
 
 	/// Bytes that differ from one payload-sized stretch to the next, so that a misplaced payload shows.
 	init(testContentOfLength count: Int) {
-		self.init((0..<count).map { UInt8(truncatingIfNeeded: $0 ^ ($0 >> 8) ^ ($0 >> 16)) })
+		self.init((0 ..< count).map { UInt8(truncatingIfNeeded: $0 ^ ($0 >> 8) ^ ($0 >> 16)) })
 	}
 
 	/// Hands out this data in the pieces a frame decoder asks for.
@@ -96,7 +94,7 @@ extension Data {
 				throw POSIXError(.EIO)
 			}
 			defer { offset += count }
-			return subdata(in: offset..<(offset + count))
+			return subdata(in: offset ..< (offset + count))
 		}
 	}
 }

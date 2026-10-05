@@ -1,10 +1,8 @@
 import Foundation
 import Testing
-
 @testable import FSKitBridge
 
-@Suite struct FrameCodecTests {
-
+struct FrameCodecTests {
 	private static func decode(_ hex: String) throws -> Frame {
 		try FrameCodec.decode(readingFrom: Data(hex: hex)!.reader())
 	}
@@ -19,7 +17,7 @@ import Testing
 
 	@Test func encodesTheExampleFrame() throws {
 		let vector = try Vector.load("frame.txt")
-		let frame = Frame(kind: .request, opcode: .getattr, requestId: 0x0102_0304_0506_0708, control: Data(hex: "aabbcc")!, payload: Data(hex: "ddeeff00")!)
+		let frame = try Frame(kind: .request, opcode: .getattr, requestId: 0x0102_0304_0506_0708, control: #require(Data(hex: "aabbcc")), payload: #require(Data(hex: "ddeeff00")))
 
 		#expect(try FrameCodec.encode(frame) == vector.bytes)
 	}
@@ -42,7 +40,7 @@ import Testing
 		"0000000f 00 0005 0000000000000001 ffffffff", // control length with the top bit set
 		"00100010 00 0005 0000000000000001 00000000", // payload exceeds its limit
 		"0000000f 00 0010 0000000000000001 00000000", // unknown opcode
-		"0000000f 02 0005 0000000000000001 00000000", // unknown kind
+		"0000000f 02 0005 0000000000000001 00000000" // unknown kind
 	])
 	func rejectsAnInvalidHeader(hex: String) {
 		#expect(throws: ProtocolError.self) {
@@ -66,9 +64,9 @@ import Testing
 	}
 }
 
-@Suite struct MessagesTests {
-
+struct MessagesTests {
 	/// Decodes the message in a frame, lists its fields and encodes it again.
+	// swiftlint:disable:next cyclomatic_complexity
 	private static func roundTrip(_ frame: Frame) throws -> (fields: [String], frame: Frame) {
 		switch frame.opcode {
 		case .hello: try roundTrip(HelloRequest.self, frame)
@@ -106,26 +104,26 @@ import Testing
 		Frame(kind: kind, opcode: opcode, requestId: 1, control: Data(hex: control)!, payload: Data(hex: payload)!)
 	}
 
-	@Test(arguments: Vector.messages)
+	@Test(arguments: try Vector.messages())
 	func decodesEveryExample(vector: Vector) throws {
 		let frame = try FrameCodec.decode(readingFrom: vector.bytes.reader())
 
-		let fields = ["kind = \(frame.kind)", "opcode = \(frame.opcode)", "requestId = \(frame.requestId)"] + (try Self.roundTrip(frame).fields)
+		let fields = try ["kind = \(frame.kind)", "opcode = \(frame.opcode)", "requestId = \(frame.requestId)"] + Self.roundTrip(frame).fields
 
 		#expect(fields == vector.fields)
 	}
 
-	@Test(arguments: Vector.messages)
+	@Test(arguments: try Vector.messages())
 	func encodesEveryExample(vector: Vector) throws {
 		let frame = try FrameCodec.decode(readingFrom: vector.bytes.reader())
 
-		let encoded = try FrameCodec.encode(try Self.roundTrip(frame).frame)
+		let encoded = try FrameCodec.encode(Self.roundTrip(frame).frame)
 
 		#expect(encoded == vector.bytes)
 	}
 
-	@Test func theExamplesCoverEveryOpcode() {
-		let names = Vector.messages.map(\.name)
+	@Test func theExamplesCoverEveryOpcode() throws {
+		let names = try Vector.messages().map(\.name)
 
 		for opcode in Opcode.allCases {
 			#expect(names.contains("\(opcode)-request.txt"))
@@ -216,8 +214,7 @@ import Testing
 	}
 }
 
-@Suite struct ManifestTests {
-
+struct ManifestTests {
 	@Test func decodesTheExampleManifest() throws {
 		let vector = try Vector.load("manifest.txt")
 
@@ -229,7 +226,7 @@ import Testing
 	@Test func encodesTheExampleManifest() throws {
 		let vector = try Vector.load("manifest.txt")
 
-		let manifest = Manifest(protocolVersion: 1, port: 51234, token: Data((0..<32).map { UInt8(0x20 + $0) }), volumeName: "Vault ä")
+		let manifest = Manifest(protocolVersion: 1, port: 51234, token: Data((0 ..< 32).map { UInt8(0x20 + $0) }), volumeName: "Vault ä")
 
 		#expect(manifest.encode() == vector.bytes)
 	}
@@ -256,7 +253,7 @@ import Testing
 	@Test func rejectsATruncatedManifest() throws {
 		let bytes = try Vector.load("manifest.txt").bytes
 
-		for length in 0..<bytes.count {
+		for length in 0 ..< bytes.count {
 			#expect(throws: ProtocolError.self, "length \(length)") {
 				try Manifest(decoding: Data(bytes.prefix(length)))
 			}

@@ -41,6 +41,10 @@ jobs:
           cache: 'maven'
       - name: Build and Test
         run: ./mvnw -B clean verify
+      - name: Install SwiftLint
+        run: brew install swiftlint
+      - name: Swift Format and Lint
+        run: fskit/scripts/process.sh
       - name: Swift Tests
         run: swift test --package-path fskit
       - name: Interop Test

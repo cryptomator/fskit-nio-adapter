@@ -1,11 +1,10 @@
+import Foundation
 import FSKit
 import FSKitBridge
-import Foundation
 import os
 
 /// Presents the session described by the manifest in the directory passed to `mount` as a volume.
 final class BridgeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
-
 	private let logger = Logger(subsystem: "org.cryptomator.fskit", category: "BridgeFileSystem")
 	private let volumes = OSAllocatedUnfairLock<[UUID: BridgeVolume]>(uncheckedState: [:])
 
@@ -37,7 +36,7 @@ final class BridgeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 		}
 		do {
 			let manifest = try Manifest.read(from: url)
-			let volume = BridgeVolume(uuid: uuid, name: manifest.volumeName, client: try BridgeClient(manifest: manifest))
+			let volume = try BridgeVolume(uuid: uuid, name: manifest.volumeName, client: BridgeClient(manifest: manifest))
 			volumes.withLockUnchecked { $0[uuid] = volume }
 			containerStatus = .ready
 			replyHandler(volume, nil)

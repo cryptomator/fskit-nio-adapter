@@ -19,7 +19,6 @@ public enum Opcode: UInt16, CaseIterable, Sendable {
 }
 
 public struct Frame: Equatable, Sendable {
-
 	public enum Kind: UInt8, Sendable {
 		case request = 0
 		case response = 1

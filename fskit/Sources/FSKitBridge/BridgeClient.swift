@@ -5,7 +5,6 @@ import os
 ///
 /// Calls block the calling thread and must not overlap; the extension makes them from the volume's serial queue.
 public final class BridgeClient {
-
 	private let logger = Logger(subsystem: "org.cryptomator.fskit", category: "BridgeClient")
 	/// Why the connection was lost, for the log.
 	private enum ConnectionError: Error {
@@ -19,7 +18,7 @@ public final class BridgeClient {
 
 	/// Connects to the loopback port named in the manifest and performs the handshake.
 	public init(manifest: Manifest) throws {
-		descriptor = socket(AF_INET, SOCK_STREAM, 0)
+		self.descriptor = socket(AF_INET, SOCK_STREAM, 0)
 		guard descriptor >= 0 else {
 			throw StatusError(status: errno)
 		}
@@ -116,7 +115,7 @@ public final class BridgeClient {
 			var sent = 0
 			while sent < buffer.count {
 				let result = Darwin.send(descriptor, buffer.baseAddress! + sent, buffer.count - sent, 0)
-				if result < 0 && errno == EINTR {
+				if result < 0, errno == EINTR {
 					continue
 				}
 				guard result > 0 else {
@@ -133,7 +132,7 @@ public final class BridgeClient {
 			var received = 0
 			while received < count {
 				let result = recv(descriptor, buffer.baseAddress! + received, count - received, 0)
-				if result < 0 && errno == EINTR {
+				if result < 0, errno == EINTR {
 					continue
 				}
 				guard result > 0 else {

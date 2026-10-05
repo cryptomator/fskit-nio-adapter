@@ -32,13 +32,27 @@ Java (JDK 25, on macOS or Linux, no Swift tooling needed):
 ./mvnw verify
 ```
 
+The build fails on a compiler warning.
+
 Swift (macOS 27 SDK, Swift 6.2 or later):
 
 ```
 cd fskit
 swift test                  # codec tests against protocol/vectors, and client tests
 scripts/interop-test.sh     # Swift client against the Java server, nothing is mounted
+scripts/process.sh          # SwiftFormat and SwiftLint, both have to be installed
 ```
+
+The Swift sources follow [SwiftFormat](https://github.com/nicklockwood/SwiftFormat) and [SwiftLint](https://github.com/realm/SwiftLint), configured in `fskit/.swiftformat` and `fskit/.swiftlint.yml`.
+
+To format and check what a commit contains, create `.git/hooks/pre-commit` with this content and make it executable:
+
+```sh
+#!/bin/sh
+./fskit/scripts/process.sh --staged
+```
+
+When the hook reformats a staged file, it stops the commit so that the result can be reviewed. Commit again to go on.
 
 ## Install the extension
 

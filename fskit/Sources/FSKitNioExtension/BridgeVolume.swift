@@ -1,13 +1,12 @@
+import Foundation
 import FSKit
 import FSKitBridge
-import Foundation
 import os
 
 /// Forwards the operations it supports to the server of the mount.
 ///
 /// Each of their handlers dispatches one block to the volume's serial queue. The block makes the blocking client call, populates the attributes, builds the result and replies, so requests are served one at a time, end to end. This keeps attribute population in order per item and keeps lookups from overlapping a reclaim.
 final class BridgeVolume: FSVolume {
-
 	private struct Statistics {
 		var totalBytes: UInt64 = 0
 		var usableBytes: UInt64 = 0
@@ -153,7 +152,6 @@ final class BridgeVolume: FSVolume {
 }
 
 extension BridgeVolume: FSVolume.PathConfOperations {
-
 	var maximumLinkCount: Int {
 		1
 	}
@@ -181,7 +179,6 @@ extension BridgeVolume: FSVolume.PathConfOperations {
 }
 
 extension BridgeVolume: FSVolume.Handler {
-
 	var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
 		let capabilities = FSVolume.SupportedCapabilities()
 		capabilities.supportsHardLinks = false
@@ -193,8 +190,8 @@ extension BridgeVolume: FSVolume.Handler {
 		return capabilities
 	}
 
-	// read from a snapshot, since this property must not wait for a request in flight
 	var volumeStatistics: FSStatFSResult {
+		// read from a snapshot, since this property must not wait for a request in flight
 		let snapshot = statistics.withLock { $0 }
 		let result = FSStatFSResult(fileSystemTypeName: fileSystemTypeName)
 		result.blockSize = Self.blockSize
@@ -215,13 +212,11 @@ extension BridgeVolume: FSVolume.Handler {
 	}
 
 	func deactivateVolume(options: FSDeactivateOptions = [], replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
-		}
+		serve(reply) {}
 	}
 
 	func mount(options: FSTaskOptions, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
-		}
+		serve(reply) {}
 	}
 
 	func unmount(replyHandler reply: @escaping () -> Void) {
@@ -232,7 +227,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
-			self.record(usableBytes: try self.client.request(SyncRequest()).usableBytes)
+			try self.record(usableBytes: self.client.request(SyncRequest()).usableBytes)
 		}
 	}
 
@@ -253,7 +248,7 @@ extension BridgeVolume: FSVolume.Handler {
 			_ = item.tryReclaim {
 				self.registry.remove(item)
 				do {
-					self.record(usableBytes: try self.client.request(ForgetRequest(nodeId: item.nodeId)).usableBytes)
+					try self.record(usableBytes: self.client.request(ForgetRequest(nodeId: item.nodeId)).usableBytes)
 				} catch {
 					failure = error
 				}
@@ -264,6 +259,7 @@ extension BridgeVolume: FSVolume.Handler {
 		}
 	}
 
+	// swiftlint:disable:next function_parameter_count
 	func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler reply: @escaping (FSCreateItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			let nodeType: NodeType
@@ -287,6 +283,7 @@ extension BridgeVolume: FSVolume.Handler {
 		}
 	}
 
+	// swiftlint:disable:next function_parameter_count
 	func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, linkContents contents: FSFileName, context: FSContext, replyHandler reply: @escaping (FSCreateSymlinkResult?, (any Error)?) -> Void) {
 		reply(nil, fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue))
 	}
@@ -295,6 +292,7 @@ extension BridgeVolume: FSVolume.Handler {
 		reply(nil, fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue))
 	}
 
+	// swiftlint:disable:next function_parameter_count
 	func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler reply: @escaping (FSRenameItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			let response = try self.client.request(RenameRequest(nodeId: self.nodeId(item), sourceParentId: self.nodeId(sourceDirectory), destinationParentId: self.nodeId(destinationDirectory), destinationName: self.string(destinationName)))
@@ -346,6 +344,7 @@ extension BridgeVolume: FSVolume.Handler {
 		}
 	}
 
+	// swiftlint:disable:next function_parameter_count
 	func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext, replyHandler reply: @escaping (FSEnumerateDirectoryResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			var cookie = cookie.rawValue
@@ -380,7 +379,6 @@ extension BridgeVolume: FSVolume.Handler {
 }
 
 extension BridgeVolume: FSVolume.OpenCloseHandler {
-
 	private func modes(_ modes: FSVolume.OpenModes) -> UInt8 {
 		(modes.contains(.read) ? Messages.modeRead : 0) | (modes.contains(.write) ? Messages.modeWrite : 0)
 	}
@@ -393,13 +391,12 @@ extension BridgeVolume: FSVolume.OpenCloseHandler {
 
 	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
-			self.record(usableBytes: try self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: self.modes(modes))).usableBytes)
+			try self.record(usableBytes: self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: self.modes(modes))).usableBytes)
 		}
 	}
 }
 
 extension BridgeVolume: FSVolume.ReadWriteHandler {
-
 	func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer, replyHandler reply: @escaping (FSReadFileResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			let response = try self.client.read(nodeId: self.nodeId(item), offset: UInt64(offset), length: min(length, buffer.length))

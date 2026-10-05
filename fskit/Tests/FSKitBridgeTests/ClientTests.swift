@@ -1,12 +1,10 @@
 import Foundation
-import Testing
 import os
-
+import Testing
 @testable import FSKitBridge
 
 /// Plays the server's part of the bridge protocol on a loopback port: accepts one connection, answers its handshake and hands every other request to a closure.
 final class ScriptedServer: Sendable {
-
 	/// After this many requests the server closes the connection, so that a client that never stops asking fails its test instead of hanging it.
 	private static let maxRequests = 16
 
@@ -28,7 +26,7 @@ final class ScriptedServer: Sendable {
 		}
 		try #require(bound)
 		self.listener = listener
-		manifest = Manifest(protocolVersion: Messages.protocolVersion, port: UInt16(bigEndian: address.sin_port), token: Data(count: Messages.tokenLength), volumeName: "Scripted")
+		self.manifest = Manifest(protocolVersion: Messages.protocolVersion, port: UInt16(bigEndian: address.sin_port), token: Data(count: Messages.tokenLength), volumeName: "Scripted")
 		Thread.detachNewThread {
 			let connection = accept(listener, nil, nil)
 			guard connection >= 0 else {
@@ -36,7 +34,7 @@ final class ScriptedServer: Sendable {
 			}
 			defer { close(connection) }
 			do {
-				for _ in 0...Self.maxRequests {
+				for _ in 0 ... Self.maxRequests {
 					let request = try FrameCodec.decode { try Self.receive(connection, $0) }
 					let response = request.opcode == .hello ? Messages.frame(for: HelloResponse(), opcode: .hello, requestId: request.requestId) : try respond(request)
 					guard let response else {
@@ -60,7 +58,7 @@ final class ScriptedServer: Sendable {
 			var received = 0
 			while received < count {
 				let result = recv(connection, buffer.baseAddress! + received, count - received, 0)
-				if result < 0 && errno == EINTR {
+				if result < 0, errno == EINTR {
 					continue
 				}
 				guard result > 0 else {
@@ -77,7 +75,7 @@ final class ScriptedServer: Sendable {
 			var sent = 0
 			while sent < buffer.count {
 				let result = Darwin.send(connection, buffer.baseAddress! + sent, buffer.count - sent, 0)
-				if result < 0 && errno == EINTR {
+				if result < 0, errno == EINTR {
 					continue
 				}
 				guard result > 0 else {
@@ -89,8 +87,7 @@ final class ScriptedServer: Sendable {
 	}
 }
 
-@Suite struct BridgeClientTests {
-
+struct BridgeClientTests {
 	private static let file: UInt64 = 64
 	private static let time = Timestamp(seconds: 1_700_000_000, nanos: 0)
 
@@ -109,7 +106,7 @@ final class ScriptedServer: Sendable {
 				if stored.count < offset + accepted.count {
 					stored.append(Data(count: offset + accepted.count - stored.count))
 				}
-				stored.replaceSubrange(offset..<(offset + accepted.count), with: accepted)
+				stored.replaceSubrange(offset ..< (offset + accepted.count), with: accepted)
 				return stored.count
 			}
 			return Messages.frame(for: WriteResponse(written: UInt32(accepted.count), attributes: attributes(size: size), usableBytes: 1), opcode: .write, requestId: frame.requestId)
@@ -123,7 +120,7 @@ final class ScriptedServer: Sendable {
 			requests.withLock { $0.append(request) }
 			let start = min(Int(request.offset), content.count)
 			let end = min(start + min(Int(request.length), limit), content.count)
-			return Messages.frame(for: ReadResponse(attributes: attributes(size: content.count), data: content.subdata(in: start..<end)), opcode: .read, requestId: frame.requestId)
+			return Messages.frame(for: ReadResponse(attributes: attributes(size: content.count), data: content.subdata(in: start ..< end)), opcode: .read, requestId: frame.requestId)
 		}
 	}
 
@@ -182,7 +179,7 @@ final class ScriptedServer: Sendable {
 		#expect(requests.withLock { $0 } == [
 			ReadRequest(nodeId: Self.file, offset: 3, length: UInt32(max)),
 			ReadRequest(nodeId: Self.file, offset: 3 + max, length: UInt32(max)),
-			ReadRequest(nodeId: Self.file, offset: 3 + 2 * max, length: 105),
+			ReadRequest(nodeId: Self.file, offset: 3 + 2 * max, length: 105)
 		])
 	}
 
