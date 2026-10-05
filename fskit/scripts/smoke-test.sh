@@ -15,8 +15,8 @@
 #
 # Scenarios:
 #   basics io listing modes renames names links unreadable-directory
-#   open-unlinked parallel two-mounts occupied external-unmount busy-unmount
-#   read-only vault
+#   open-unlinked backend-failure parallel two-mounts occupied external-unmount
+#   busy-unmount read-only vault
 #
 # Exit status: 0 if every check passed, 1 if checks failed, 2 if the test could
 # not run, 129, 130 or 143 if a signal ended it.
@@ -26,7 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 FSKIT_DIR="${SCRIPT_DIR:h}"
 REPO_ROOT="${FSKIT_DIR:h}"
-SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked parallel two-mounts occupied external-unmount busy-unmount read-only vault)
+SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only vault)
 
 usage() {
 	echo "usage: smoke-test.sh [--stop-on-failure] [scenario ...]" >&2
@@ -65,7 +65,9 @@ integer LOG_CURSOR=0
 integer WINDOW_START=0
 # pairs of offsets between which the script unmounted one volume
 typeset -a WINDOWS
+# part of a log line the current scenario expects: a warning or an error, and a failure the fs package reports. The scan accepts such a line and reports the scenario if there is none.
 EXPECTED_WARNING=""
+EXPECTED_FAILURE=""
 typeset -a BACKGROUND_PIDS
 integer CLEANED_UP=0
 
@@ -327,19 +329,26 @@ unmount_volume() {
 # scan_log <offset>: fails the scenario if the log reports a defect between the cursor and that offset, which becomes the cursor
 scan_log() {
 	local problems
-	problems="$(tail -c +$(( LOG_CURSOR + 1 )) "$PROGRAM_LOG" | EXPECTED_WARNING="$EXPECTED_WARNING" LC_ALL=C awk -v offset="$LOG_CURSOR" -v to="$1" -v windows="$WINDOWS" '
+	problems="$(tail -c +$(( LOG_CURSOR + 1 )) "$PROGRAM_LOG" | EXPECTED_WARNING="$EXPECTED_WARNING" EXPECTED_FAILURE="$EXPECTED_FAILURE" LC_ALL=C awk -v offset="$LOG_CURSOR" -v to="$1" -v windows="$WINDOWS" '
+		# declared(<variable>): whether the line holds the text a scenario declared in that variable
+		function declared(name) {
+			if (ENVIRON[name] == "" || !index($0, ENVIRON[name])) {
+				return 0
+			}
+			seen[name]++
+			return 1
+		}
+		function missing(name, kind) {
+			if (ENVIRON[name] != "" && !seen[name]) {
+				print "the expected " kind " is missing: " ENVIRON[name]
+			}
+		}
 		BEGIN { count = split(windows, bounds, " ") }
 		{ start = offset; offset += length($0) + 1 }
 		start >= to { next }
 		# every line of the fs package is a failure it reported for an operation
-		/^[0-9:.]+ \[[^]]*\] [A-Z]+ org\.cryptomator\.frontend\.fskit\.fs\./ { print "the fs package reported a failure: " $0 }
-		/^[0-9:.]+ \[[^]]*\] (WARN|ERROR) / {
-			if (ENVIRON["EXPECTED_WARNING"] != "" && index($0, ENVIRON["EXPECTED_WARNING"])) {
-				expected++
-			} else {
-				print "unexpected: " $0
-			}
-		}
+		/^[0-9:.]+ \[[^]]*\] [A-Z]+ org\.cryptomator\.frontend\.fskit\.fs\./ && !declared("EXPECTED_FAILURE") { print "the fs package reported a failure: " $0 }
+		/^[0-9:.]+ \[[^]]*\] (WARN|ERROR) / && !declared("EXPECTED_WARNING") { print "unexpected: " $0 }
 		/ org\.cryptomator\.frontend\.fskit\.BridgeSession - Session ended/ {
 			window = 0
 			for (i = 1; i < count; i += 2) {
@@ -353,25 +362,25 @@ scan_log() {
 				print "a second session ended during one unmount: " $0
 			}
 		}
-		# a clean run must contain one session end per unmount and the expected warning. That shows that the session rule and the warning rule still match the log. The rule for the fs package has no such control.
+		# a clean scan must contain one session end per unmount, and the warning and the failure a scenario declared. Over a run of all scenarios, that shows that the three rules still match the log.
 		END {
 			for (i = 1; i < count; i += 2) {
 				if (!ended[i]) {
 					print "no session ended during an unmount"
 				}
 			}
-			if (ENVIRON["EXPECTED_WARNING"] != "" && !expected) {
-				print "the expected warning is missing: " ENVIRON["EXPECTED_WARNING"]
-			}
+			missing("EXPECTED_WARNING", "warning")
+			missing("EXPECTED_FAILURE", "failure")
 		}
 	')" || problems="the log could not be scanned"
 	LOG_CURSOR=$1
 	WINDOWS=()
 	EXPECTED_WARNING=""
+	EXPECTED_FAILURE=""
 	if [[ -z "$problems" ]]; then
-		pass "the log reports no failure"
+		pass "the log reports no unexpected failure"
 	else
-		fail "the log reports no failure" "$problems"
+		fail "the log reports no unexpected failure" "$problems"
 	fi
 }
 
@@ -440,6 +449,10 @@ create_read_only() {
 # set_mode_and_time <file> <mode> <seconds>: sets a mode and a modification time in one setattrlist call, so that both reach the volume in one request. The buffer holds the values for ATTR_CMN_MODTIME and ATTR_CMN_ACCESSMASK.
 set_mode_and_time() {
 	/usr/bin/perl -e 'my $list = pack("S S L5", 5, 0, 0x400 | 0x20000, 0, 0, 0, 0); my $buffer = pack("q q L", $ARGV[2], 0, oct($ARGV[1])); syscall(221, $ARGV[0], $list, $buffer, length($buffer), 0) == 0 or die "setattrlist: $!"' "$1" "$2" "$3"
+}
+
+create_socket() {
+	/usr/bin/perl -e 'use IO::Socket::UNIX; IO::Socket::UNIX->new(Local => $ARGV[0]) or die "socket: $!"' "$1"
 }
 
 create_with_umask() {
@@ -615,6 +628,11 @@ modes() {
 	touch -t 201501010000 "$BACKING/times.txt"
 	: > "$BACKING/combined.txt"
 	chmod 644 "$BACKING/combined.txt"
+	: > "$BACKING/unreadable.txt"
+	chmod 000 "$BACKING/unreadable.txt"
+	: > "$BACKING/swapped.txt"
+	: > "$SCENARIO_DIR/outside.txt"
+	chmod 600 "$SCENARIO_DIR/outside.txt"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check "a file created with mode 0444 is written through its descriptor" create_read_only "$MNT/read-only.txt"
 	check "it holds what was written" test "$(cat "$BACKING/read-only.txt")" = data
@@ -641,6 +659,12 @@ modes() {
 	check "one request sets mode 0200 and a modification time" set_mode_and_time "$MNT/combined.txt" 0200 1500000000
 	check "stat shows both" test "$(stat -f '%Lp %m' "$MNT/combined.txt")" = "200 1500000000"
 	check "the backing directory has both" test "$(stat -f '%Lp %m' "$BACKING/combined.txt")" = "200 1500000000"
+	check_fails "touch is refused on a file its owner may not read" "Permission denied" touch -t 202001020304 "$MNT/unreadable.txt"
+	# Setting a mode follows a link, so the adapter has to notice by itself that an entry it has shown as a file became one. No link can be created through the mount, so the entry is replaced in the backing directory, against the rule for fixtures.
+	check "the volume shows another file as a regular file" test -f "$MNT/swapped.txt"
+	check "it is replaced with a link in the backing directory" ln -sf "$SCENARIO_DIR/outside.txt" "$BACKING/swapped.txt"
+	check "chmod on it through the volume succeeds" chmod 755 "$MNT/swapped.txt"
+	check "it leaves the link's target as it was" test "$(stat -f %Lp "$SCENARIO_DIR/outside.txt")" = 600
 	unmount_volume "$SCENARIO" "$MNT"
 }
 
@@ -714,6 +738,16 @@ open-unlinked() {
 	print -n 0123456789 > "$BACKING/dir/unlinked.txt"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check_lines remove_while_open "$MNT/dir/unlinked.txt" 0123456789 "$MNT/dir" "$BACKING/dir" "$BACKING"
+	unmount_volume "$SCENARIO" "$MNT"
+}
+
+# a failure of the backing store that reaches the caller as an I/O error only: a socket cannot be opened as a file
+backend-failure() {
+	create_socket "$BACKING/socket"
+	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
+	# the fs package logs what it hides from the caller
+	EXPECTED_FAILURE="OPEN returns EIO."
+	check_fails "cat fails on a socket with an I/O error" "Input/output error" cat "$MNT/socket"
 	unmount_volume "$SCENARIO" "$MNT"
 }
 

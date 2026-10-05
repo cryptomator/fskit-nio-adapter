@@ -114,6 +114,7 @@ Observed on macOS 27.0.1 with JDK 26.
   - An attribute set on a removed file that is still open leaves an orphaned companion behind.
   - Tools that scan their own directories see the companions. In a git repository on the volume, `git fsck` reports the ones inside `.git` as invalid refs and objects, and `git status` lists the others as untracked.
 - One slow operation stalls its volume, since requests are served one at a time.
+- A FIFO or a socket in the mounted `Path` is shown as a regular file. Opening the socket fails with "Input/output error". Opening the FIFO stalls the whole volume until a process opens it for writing in the mounted `Path` itself, not through the volume.
 - Nothing else may modify the mounted `Path` while it is mounted.
 - The mounted `Path` must not hold two names that differ only in Unicode normalization.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.
