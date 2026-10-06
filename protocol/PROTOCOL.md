@@ -1,6 +1,6 @@
 # Bridge Protocol
 
-The FSKit extension (client) forwards each file system operation to the JVM that called `mount()` (server) over a loopback TCP connection. This document is the normative description of protocol version **1**. Both codecs (`org.cryptomator.frontend.fskit.protocol` and `fskit/Sources/FSKitBridge`) implement it and are tested against the examples in `vectors/`.
+The FSKit extension (client) forwards file system operations to the JVM that called `mount()` (server) over a loopback TCP connection. This document is the normative description of protocol version **1**. Both codecs (`org.cryptomator.frontend.fskit.protocol` and `fskit/Sources/FSKitBridge`) implement it and are tested against the examples in `vectors/`.
 
 ## Primitives
 

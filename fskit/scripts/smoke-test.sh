@@ -17,6 +17,12 @@
 #   basics io listing modes renames names links unreadable-directory
 #   open-unlinked backend-failure parallel two-mounts occupied external-unmount
 #   busy-unmount read-only vault
+#   access, which joins them only where SMOKE_OTHER_ACCOUNT is set
+#
+# Environment:
+#   SMOKE_OTHER_ACCOUNT  a second account, not root. The scenario access works
+#                        on a volume as that account, which `sudo -n -u` has
+#                        to reach without a password.
 #
 # Exit status: 0 if every check passed, 1 if checks failed, 2 if the test could
 # not run, 129, 130 or 143 if a signal ended it.
@@ -27,10 +33,13 @@ SCRIPT_DIR="${0:A:h}"
 FSKIT_DIR="${SCRIPT_DIR:h}"
 REPO_ROOT="${FSKIT_DIR:h}"
 SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only vault)
+# access needs a second account and joins the others only where SMOKE_OTHER_ACCOUNT names one
+OPT_IN_SCENARIOS=(access)
 
 usage() {
 	echo "usage: smoke-test.sh [--stop-on-failure] [scenario ...]" >&2
 	echo "scenarios: $SCENARIOS" >&2
+	echo "with SMOKE_OTHER_ACCOUNT: $OPT_IN_SCENARIOS" >&2
 	exit 2
 }
 
@@ -39,7 +48,7 @@ typeset -aU SELECTED
 for argument in "$@"; do
 	if [[ "$argument" == --stop-on-failure ]]; then
 		STOP_ON_FAILURE=1
-	elif (( ${SCENARIOS[(Ie)$argument]} )); then
+	elif (( ${SCENARIOS[(Ie)$argument]} || ${OPT_IN_SCENARIOS[(Ie)$argument]} )); then
 		SELECTED+=("$argument")
 	else
 		usage
@@ -51,6 +60,16 @@ if (( STOP_ON_FAILURE )) && [[ ! -t 0 ]]; then
 fi
 if (( ${#SELECTED} == 0 )); then
 	SELECTED=($SCENARIOS)
+	if [[ -n "${SMOKE_OTHER_ACCOUNT:-}" ]]; then
+		SELECTED+=($OPT_IN_SCENARIOS)
+	fi
+fi
+if (( ${SELECTED[(Ie)access]} )); then
+	OTHER_UID="$(sudo -n -u "${SMOKE_OTHER_ACCOUNT:-}" id -u 2> /dev/null)" || OTHER_UID=""
+	if [[ -z "$OTHER_UID" || "$OTHER_UID" == 0 || "$OTHER_UID" == "$UID" ]]; then
+		echo "error: the scenario access needs SMOKE_OTHER_ACCOUNT to name a second account, not root, that sudo -n -u reaches without a password" >&2
+		exit 2
+	fi
 fi
 
 PROGRAM_PID=""
@@ -386,9 +405,27 @@ scan_log() {
 
 # --- helpers of the scenarios ---
 
-# Prints the names in a directory, without the entries macOS adds to a volume.
+# Prints the names in a directory, without the entry macOS adds to a volume.
 entries() {
-	ls -A "$1" | grep -v -E '^(\._.*|\.Trashes)$'
+	ls -A "$1" | grep -v -E '^\.Trashes$'
+}
+
+# Fails if the directory or anything below it holds an AppleDouble companion file, or if find cannot read a directory. .Trashes is left out, since macOS creates it unreadable.
+no_companion_files() {
+	local found
+	found="$(find "$1" -name .Trashes -prune -o -name '._*' -print)" || return 1
+	[[ -z "$found" ]]
+}
+
+as_other() {
+	sudo -n -u "$SMOKE_OTHER_ACCOUNT" "$@"
+}
+
+# holding_open <file> <command> [<argument> ...]: runs the command while the script holds the file open for reading. sudo closes the descriptor for what it starts, so the other account has to open the file itself.
+holding_open() {
+	local file="$1"
+	shift
+	"$@" 9< "$file"
 }
 
 checksum() {
@@ -401,11 +438,6 @@ echo_to() {
 
 append_to() {
 	echo "$1" >> "$2"
-}
-
-# rm -r may report a companion file it had listed as missing and fail although everything is removed (see the README's known limitations), so only the result counts.
-remove_tree() {
-	rm -r "$1" > /dev/null 2>&1
 }
 
 # Prints the space df reports as available at a mount point, in KiB, or nothing if df fails.
@@ -444,6 +476,11 @@ write_and_fsync() {
 # Creates a file with mode 0444 and writes to it through the descriptor that created it.
 create_read_only() {
 	/usr/bin/perl -e 'use Fcntl; sysopen(my $file, $ARGV[0], O_WRONLY | O_CREAT | O_EXCL, 0444) or die "open: $!"; syswrite($file, "data") or die "write: $!"; close($file) or die "close: $!"' "$1"
+}
+
+# replace_xattr <file> <name> <value>: sets an extended attribute that has to exist already, with setxattr and XATTR_REPLACE
+replace_xattr() {
+	/usr/bin/perl -e 'syscall(236, $ARGV[0], $ARGV[1], $ARGV[2], length($ARGV[2]), 0, 4) == 0 or die "setxattr: $!"' "$1" "$2" "$3"
 }
 
 # set_mode_and_time <file> <mode> <seconds>: sets a mode and a modification time in one setattrlist call, so that both reach the volume in one request. The buffer holds the values for ATTR_CMN_MODTIME and ATTR_CMN_ACCESSMASK.
@@ -587,8 +624,19 @@ check_parallel() {
 # Fixtures are placed in the backing directory before it is mounted, since nothing else may modify a mounted directory. Only the first read of a fixture is sure to reach the adapter: a cache may answer for what was read or written through the mount before.
 
 basics() {
+	echo tagged > "$SCENARIO_DIR/tagged.txt"
+	xattr -w user.smoke value "$SCENARIO_DIR/tagged.txt"
+	check "the fixture carries an attribute" xattr -p user.smoke "$SCENARIO_DIR/tagged.txt"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check_basics "$MNT" "$BACKING"
+	# on a volume that took no extended attributes, macOS would keep them in companion files in the backing directory
+	check "xattr -w is accepted" xattr -w user.smoke value "$MNT/file.txt"
+	check_fails "the attribute is not stored" "No such xattr" xattr -p user.smoke "$MNT/file.txt"
+	check_fails "xattr -d finds no attribute to remove" "No such xattr" xattr -d user.smoke "$MNT/file.txt"
+	check_fails "setxattr finds no attribute to replace" "Attribute not found" replace_xattr "$MNT/file.txt" user.smoke value
+	check "cp copies a file that carries an attribute" cp "$SCENARIO_DIR/tagged.txt" "$MNT/tagged.txt"
+	check "the copy has the content" test "$(cat "$BACKING/tagged.txt")" = tagged
+	check "the backing directory holds no companion file" no_companion_files "$BACKING"
 	# fseventsd looks for .fseventsd/no_log right after the mount. Where the file is missing, it creates .fseventsd and keeps its log in it, which ends up in the backing directory.
 	check "the volume shows .fseventsd/no_log" test -f "$MNT/.fseventsd/no_log"
 	check "the backing directory holds no .fseventsd" test ! -e "$BACKING/.fseventsd"
@@ -622,8 +670,8 @@ listing() {
 	check "ls lists all of them" test "$(ls "$MNT/many" | wc -l)" -eq 5000
 	check "ls -l succeeds" ls -l "$MNT/many"
 	check "the backing directory holds all of them" test "$(ls "$BACKING/many" | wc -l)" -eq 5000
-	remove_tree "$MNT/many"
-	check "rm -r removes the directory" test ! -e "$BACKING/many"
+	check "rm -r removes the directory" rm -r "$MNT/many"
+	check "the backing directory holds it no longer" test ! -e "$BACKING/many"
 	unmount_volume "$SCENARIO" "$MNT"
 }
 
@@ -716,8 +764,8 @@ links() {
 	check_fails "ln -s is refused as unsupported" "Operation not supported" ln -s "$MNT/sub/regular.txt" "$MNT/sub/new-symlink"
 	check_fails "ln is refused as unsupported" "Operation not supported" ln "$MNT/sub/regular.txt" "$MNT/sub/new-hardlink"
 	check "neither link exists" test "$(entries "$BACKING/sub")" = $'link\nregular.txt'
-	remove_tree "$MNT/sub"
-	check "rm -r removes the directory that holds the link" test ! -e "$BACKING/sub"
+	check "rm -r removes the directory that holds the link" rm -r "$MNT/sub"
+	check "the backing directory holds it no longer" test ! -e "$BACKING/sub"
 	check "the link's target is untouched" test "$(cat "$SCENARIO_DIR/target/kept.txt")" = kept
 	unmount_volume "$SCENARIO" "$MNT"
 }
@@ -862,6 +910,41 @@ vault() {
 	unmount_volume "$SCENARIO-2" "$MNT"
 }
 
+# The volume serves the user who mounted it and root, and refuses every other account. Root is not checked: no volume that refuses root can be mounted.
+access() {
+	echo fixture > "$BACKING/fixture.txt"
+	echo held > "$BACKING/held.txt"
+	mkdir "$BACKING/dir"
+	echo inner > "$BACKING/dir/inner.txt"
+	# the work directory is the script's alone. The other account has to get through it and the scenario's directory to the mount point, whatever its group and the umask.
+	chmod go+x "$WORK_DIR" "$SCENARIO_DIR"
+	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
+	# a refusal below counts only if it is not the path to the mount point that refuses
+	check "the other account reaches the directory of the mount point" as_other test -x "$SCENARIO_DIR"
+	check_fails "the other account cannot list the volume" "Permission denied" as_other ls "$MNT"
+	check_fails "it cannot read a file's attributes" "Permission denied" as_other stat "$MNT/fixture.txt"
+	check_fails "it cannot read a file" "Permission denied" as_other cat "$MNT/fixture.txt"
+	check_fails "it cannot create a file" "Permission denied" as_other touch "$MNT/foreign.txt"
+	check_fails "it cannot create a directory" "Permission denied" as_other mkdir "$MNT/foreign"
+	check_fails "it cannot remove a file" "Permission denied" as_other rm -f "$MNT/dir/inner.txt"
+	# once the mounting user has listed and read, the kernel knows the entries and asks the volume for less
+	check "the mounting user lists the volume" ls -l "$MNT" "$MNT/dir"
+	check "the mounting user reads a file" test "$(cat "$MNT/fixture.txt")" = fixture
+	check_fails "the other account cannot list the volume after that" "Permission denied" as_other ls "$MNT"
+	check_fails "it cannot read the file" "Permission denied" as_other cat "$MNT/fixture.txt"
+	check_fails "it cannot read a file the mounting user holds open" "Permission denied" holding_open "$MNT/held.txt" as_other cat "$MNT/held.txt"
+	# a mode the file cannot have under any umask: one it already has would not reach the volume
+	check_fails "it cannot change the file's mode" "Permission denied" as_other chmod 700 "$MNT/fixture.txt"
+	check_fails "it cannot rename the file" "Permission denied" as_other mv "$MNT/fixture.txt" "$MNT/renamed.txt"
+	# for a refused account, macOS reports the removal of an entry the kernel knows as a success and never asks the volume. Only the outcome counts.
+	as_other rm -f "$MNT/fixture.txt" > /dev/null 2>&1
+	check "the backing directory holds what it held" test "$(entries "$BACKING")" = $'dir\nfixture.txt\nheld.txt'
+	check "the file in its directory is still there" test "$(cat "$BACKING/dir/inner.txt")" = inner
+	check "the mounting user creates a file" echo_to mine "$MNT/mine.txt"
+	check "the mounting user removes it" rm "$MNT/mine.txt"
+	unmount_volume "$SCENARIO" "$MNT"
+}
+
 # --- run ---
 
 # cleanup [<exit status>]: runs once, however the script ends. Every phase runs whether or not the earlier ones succeeded.
@@ -918,8 +1001,9 @@ trap 'cleanup 143' TERM
 # so would a write to a program that is gone
 trap '' PIPE
 
-mkdir "$JVM_TMP" || exit 2
-mkfifo "$PROGRAM_STDIN" || exit 2
+# the JVM's temp directory and the command FIFO stay the script's alone, also once a scenario lets another account into the work directory
+mkdir -m 700 "$JVM_TMP" || exit 2
+mkfifo -m 600 "$PROGRAM_STDIN" || exit 2
 : > "$PROGRAM_LOG" || exit 2
 echo "==> Starting SmokeMountMain"
 # the program writes its log and its replies to standard error

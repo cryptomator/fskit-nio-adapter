@@ -69,6 +69,14 @@ final class BridgeVolume: FSVolume {
 		return failure.status == Messages.statusInvalidCookie ? FSError(.invalidDirectoryCookie) : fs_errorForPOSIXError(failure.status)
 	}
 
+	/// - Throws: `EACCES` unless the caller is root or the user the extension runs as, who is the one who mounted the volume. The volume is mounted with `noowners`, under which the kernel treats every caller as the owner and keeps nobody out.
+	private func authorize(_ context: FSContext) throws {
+		// root has to pass, since the final step of `mount` reaches the volume as uid 0
+		guard context.effectiveUserID == Int(getuid()) || context.effectiveUserID == 0 else {
+			throw fs_errorForPOSIXError(POSIXError.EACCES.rawValue)
+		}
+	}
+
 	private func nodeId(_ item: FSItem) throws -> UInt64 {
 		guard let item = item as? BridgeItem else {
 			throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
@@ -169,6 +177,7 @@ extension BridgeVolume: FSVolume.PathConfOperations {
 	}
 
 	var maximumXattrSize: Int {
+		// no effect was observed: macOS refuses the same attribute sizes whatever is declared here
 		0
 	}
 
@@ -233,6 +242,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSLookupItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let response = try self.client.request(LookupRequest(parentId: self.nodeId(directory), name: self.string(name)))
 			return FSLookupItemResult(foundItem: self.registry.item(for: response.attributes.nodeId), itemName: FSFileName(string: response.name), itemAttributes: self.fsAttributes(response.attributes))
 		}
@@ -262,6 +272,7 @@ extension BridgeVolume: FSVolume.Handler {
 	// swiftlint:disable:next function_parameter_count
 	func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler reply: @escaping (FSCreateItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let nodeType: NodeType
 			switch type {
 			case .file: nodeType = .file
@@ -295,6 +306,7 @@ extension BridgeVolume: FSVolume.Handler {
 	// swiftlint:disable:next function_parameter_count
 	func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler reply: @escaping (FSRenameItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let response = try self.client.request(RenameRequest(nodeId: self.nodeId(item), sourceParentId: self.nodeId(sourceDirectory), destinationParentId: self.nodeId(destinationDirectory), destinationName: self.string(destinationName)))
 			return FSRenameItemResult(
 				newName: FSFileName(string: response.name),
@@ -309,6 +321,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSRemoveItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let response = try self.client.request(RemoveRequest(nodeId: self.nodeId(item), parentId: self.nodeId(directory)))
 			return FSRemoveItemResult(
 				itemAttributes: self.fsAttributes(response.attributes),
@@ -320,6 +333,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func getAttributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSGetAttributesResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let response = try self.client.request(GetattrRequest(nodeId: self.nodeId(item)))
 			return FSGetAttributesResult(attributes: self.fsAttributes(response.attributes))
 		}
@@ -327,6 +341,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext, replyHandler reply: @escaping (FSSetAttributesResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			let settable: [(FSItem.Attribute, UInt8)] = [(.size, Messages.attributeSize), (.mode, Messages.attributeMode), (.accessTime, Messages.attributeAccessed), (.modifyTime, Messages.attributeModified)]
 			let valid = settable.filter { newAttributes.isValid($0.0) }.reduce(0) { $0 | $1.1 }
 			let response = try self.client.request(SetattrRequest(
@@ -347,6 +362,7 @@ extension BridgeVolume: FSVolume.Handler {
 	// swiftlint:disable:next function_parameter_count
 	func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext, replyHandler reply: @escaping (FSEnumerateDirectoryResult?, (any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			var cookie = cookie.rawValue
 			var verifier = verifier.rawValue
 			var morePages = true
@@ -385,12 +401,14 @@ extension BridgeVolume: FSVolume.OpenCloseHandler {
 
 	func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
+			try self.authorize(context)
 			_ = try self.client.request(OpenRequest(nodeId: self.nodeId(item), modes: self.modes(modes)))
 		}
 	}
 
 	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
+			// no caller is refused here: a close that does not reach the server leaves its channel open
 			try self.record(usableBytes: self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: self.modes(modes))).usableBytes)
 		}
 	}
@@ -412,5 +430,30 @@ extension BridgeVolume: FSVolume.ReadWriteHandler {
 			let response = try self.client.write(nodeId: self.nodeId(item), offset: UInt64(offset), data: contents)
 			return FSWriteFileResult(bytesWritten: Int(response.written), itemAttributes: self.fsAttributes(response.attributes), freeSpace: self.freeSpace(response.usableBytes))
 		}
+	}
+}
+
+/// Accepts every extended attribute and stores none.
+///
+/// Without this conformance macOS keeps attributes in AppleDouble companion files named `._<name>` in the mounted `Path`. Refusing them is no alternative: Finder then copies nothing onto the volume.
+///
+/// The handlers cannot tell callers apart, since FSKit calls them with uid 0 for every caller.
+extension BridgeVolume: FSVolume.XattrHandler {
+	func getXattr(named name: FSFileName, of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSGetXattrResult?, (any Error)?) -> Void) {
+		reply(nil, fs_errorForPOSIXError(POSIXError.ENOATTR.rawValue))
+	}
+
+	// swiftlint:disable:next function_parameter_count
+	func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler reply: @escaping (FSSetXattrResult?, (any Error)?) -> Void) {
+		// nothing is stored, so there is never an attribute to replace or to remove
+		if policy == .mustReplace || policy == .delete {
+			reply(nil, fs_errorForPOSIXError(POSIXError.ENOATTR.rawValue))
+			return
+		}
+		reply(FSSetXattrResult(freeSpace: FSFreeSpace.noUpdate), nil)
+	}
+
+	func listXattrs(of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSListXattrsResult?, (any Error)?) -> Void) {
+		reply(FSListXattrsResult(xattrNames: []), nil)
 	}
 }

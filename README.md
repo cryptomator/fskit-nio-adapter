@@ -6,7 +6,7 @@ The adapter registers as an `org.cryptomator.integrations.mount.MountService` na
 
 ## Architecture
 
-FSKit runs a file system as a sandboxed app extension launched by `fskitd`, while `MountService.forFileSystem(Path)` hands over a live `Path` in the caller's JVM. So the JVM that calls `mount()` serves the file system, and a thin Swift extension forwards each FSKit operation to it over an authenticated loopback TCP connection:
+FSKit runs a file system as a sandboxed app extension launched by `fskitd`, while `MountService.forFileSystem(Path)` hands over a live `Path` in the caller's JVM. So the JVM that calls `mount()` serves the file system, and a thin Swift extension forwards FSKit operations to it over an authenticated loopback TCP connection:
 
 ```mermaid
 flowchart LR
@@ -17,7 +17,7 @@ flowchart LR
 ```
 
 - `mount()` starts a session on an ephemeral loopback port, writes the port and a random token into a manifest in an owner-only directory under the temp directory, and runs `/sbin/mount -F -t cryptomatorfs <that directory> <mountpoint>`.
-- The extension reads the manifest, connects and presents the token. From then on it forwards every operation. The only file system state it holds is a map from node ids to FSKit items and the volume's size and free space as the server last reported them.
+- The extension reads the manifest, connects and presents the token. From then on it forwards the operations it supports, answers extended attributes itself, and refuses every caller but root and the user who mounted. The only file system state it holds is a map from node ids to FSKit items and the volume's size and free space as the server last reported them.
 - The item table, name handling, directory listings and open channels live in Java (`org.cryptomator.frontend.fskit.fs`).
 - Each volume serves its requests one at a time, end to end. Separate mounts are independent.
 - The wire format is specified in [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
@@ -113,21 +113,31 @@ With the extension installed and enabled, and built with the default `FS_TYPE_NA
 fskit/scripts/smoke-test.sh
 ```
 
-It does not cover Finder, a disabled extension, a killed extension process or a killed JVM. The script's header lists its arguments and exit statuses.
+It does not cover Finder, a disabled extension, a killed extension process or a killed JVM. The scenario `access` checks that another account is refused. It joins the run only when `SMOKE_OTHER_ACCOUNT` names a second account, which `sudo -n -u` has to reach without a password:
+
+```
+SMOKE_OTHER_ACCOUNT=<account> fskit/scripts/smoke-test.sh
+```
+
+The script's header lists its arguments, scenarios, environment and exit statuses.
 
 ## Known limitations
 
 Observed on macOS 27.0.1 with JDK 26.
 
-- A mounted volume may not be confined to the user who mounted it. macOS mounts it with `noowners`, and the extension checks no caller identity, so another local account that can reach the mount point may be able to read and write it. That is untested, so mount only data that other accounts on the Mac may see.
+- Another account gets "Permission denied" on a mounted volume, but root reads and changes it like the user who mounted it. An account that can get to the mount point is not kept from everything:
+  - It can enter the volume's root and a directory the mounting user has accessed, though not list them. While it stays there, the volume can only be unmounted by force.
+  - For an entry the mounting user has accessed, `stat` answers with the entry's attributes, such as its size, from the kernel's cache.
+  - Removing such an entry reports success, although nothing is removed.
+  - Extended attribute calls by path on such an entry are not refused. They reveal nothing, and what they set is discarded.
+  - An FSEvents stream on the mount point reports the paths of entries as they change.
+
+  A mount point below a directory the other account cannot enter keeps all of this from it.
 - Finder's Trash creates `.Trashes` in the volume root, which appears in the mounted `Path`.
 - The name `.fseventsd` in the volume root is taken. The volume shows a directory of that name with an empty file `no_log` in it, which keeps macOS from creating the directory in the mounted `Path` and storing its log of file system events there. Neither is stored or can be changed, and the root's listing leaves the directory out. An entry named `.fseventsd` that the mounted `Path` already holds cannot be reached through the volume and stays as it is. Without that log, macOS has no event history for the volume, and an FSEvents stream created relative to the device reports absolute paths. Events are still delivered as they happen.
 - Symbolic links are shown but cannot be read, followed or created. Hard links cannot be created.
-- No extended attributes. macOS stores attributes in AppleDouble companion files named `._<name>` next to the file instead, which appear in the mounted `Path` as well. `xattr -w` therefore succeeds, and:
-  - A process whose files are tagged with `com.apple.provenance` creates a companion for every file it creates.
-  - The kernel removes a companion together with its file. `rm -r` may therefore report `No such file or directory` for a companion it had listed, and exit with status 1 although everything is removed.
-  - An attribute set on a removed file that is still open leaves an orphaned companion behind.
-  - Tools that scan their own directories see the companions. In a git repository on the volume, `git fsck` reports the ones inside `.git` as invalid refs and objects, and `git status` lists the others as untracked.
+- Extended attributes are accepted and not stored: `xattr -w` succeeds, and the attribute is gone. A file copied or saved to the volume loses its Finder tags, its resource fork and its quarantine flag, which marks a download for the check macOS runs before opening it.
+- An extended attribute or resource fork from 256 KiB up to at least 1 MiB is refused with "File too large". `cp` then copies the data, reports that it could not copy the extended attributes and exits with status 1, while Finder copies such a file without complaint. One of 2 MiB or more is accepted.
 - One slow operation stalls its volume, since requests are served one at a time.
 - A FIFO or a socket in the mounted `Path` is shown as a regular file. Opening the socket fails with "Input/output error". Opening the FIFO stalls the whole volume until a process opens it for writing in the mounted `Path` itself, not through the volume.
 - Nothing else may modify the mounted `Path` while it is mounted.
