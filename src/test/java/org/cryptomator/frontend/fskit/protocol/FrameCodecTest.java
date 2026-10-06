@@ -94,7 +94,7 @@ public class FrameCodecTest {
 	@Test
 	@DisplayName("rejects an unknown opcode")
 	public void testReadUnknownOpcode() {
-		Assertions.assertThrows(ProtocolException.class, () -> read(Vector.hex("0000000f 00 0010 0000000000000001 00000000")));
+		Assertions.assertThrows(ProtocolException.class, () -> read(Vector.hex("0000000f 00 7fff 0000000000000001 00000000")));
 	}
 
 	@Test

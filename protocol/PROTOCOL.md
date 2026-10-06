@@ -83,20 +83,25 @@ timestamp created
 | 13 | `READ` | `u64 nodeId`, `u64 offset`, `u32 length` | `attributes`; payload: the bytes read |
 | 14 | `WRITE` | `u64 nodeId`, `u64 offset`; payload: the bytes to write | `u32 written`, `attributes`, `u64 usableBytes` |
 | 15 | `SYNC` | | `u64 usableBytes` |
+| 16 | `READLINK` | `u64 nodeId` | `attributes`, `string target` |
+| 17 | `SYMLINK` | `u64 parentId`, `string name`, `string target` | `attributes`, `string name`, `attributes directoryAttributes`, `u64 usableBytes` |
 
 Notes:
 
 - `HELLO`: `magic` is `0x46534B4E` (`FSKN`). The server compares `magic` and `protocolVersion` first and answers a mismatch with `EPROTONOSUPPORT` (43) without interpreting the rest. A `HELLO` that cannot be decoded is answered the same way. The version must match exactly. A wrong token is answered with `EACCES` (13). After a non-zero status the server closes the connection.
-- `LOOKUP`, `CREATE` and `RENAME` responses carry the item's name as the backing file system stores it, which may differ from the requested name in Unicode normalization.
+- `LOOKUP`, `CREATE`, `RENAME` and `SYMLINK` responses carry the item's name as the backing file system stores it, which may differ from the requested name in Unicode normalization.
 - `SETATTR`: `valid` and `applied` are bit sets: 1 size, 2 mode, 4 accessed, 8 modified. Fields whose bit is not set in `valid` are ignored. A size or time the server cannot represent is answered with `EINVAL` (22), and nothing is applied. So is a time whose nanoseconds amount to a second or more. `applied` is the subset of `valid` that the server applied. An attribute that does not apply to the item is left out, as is a `mode` where the backing file system has no POSIX permissions. The server applies the size first. It applies the times before a `mode` that lacks the owner's read permission, and after any other `mode`. When the backing file system refuses an attribute after another has been applied, the response still has status 0, and `applied` leaves out the refused attribute and any not attempted yet. A refusal before any attribute has been applied is answered with its status.
 - `CREATE` accepts the types file and directory. The server applies `mode` as given. If the backing file system refuses that once the item exists, the response still has status 0. A created file is open for reading and writing from then on, as after an `OPEN` with both modes, so that whoever creates it can write to it whatever its mode.
 - `REMOVE` and `RENAME`: the `attributes` of an item that is removed or replaced are the ones read just before the change. `replaced` is set when the rename replaced an item the client was given a node id for.
 - `RENAME`: a rename that replaces nothing, or replaces a file with a file, is done in one step. Where the backing file system cannot do that, as across its file stores, the reply is `EXDEV` (18) and nothing has changed. A rename that replaces a directory or a symbolic link, or moves either onto an existing item, removes the target first. A directory cannot be renamed into itself or below itself (`EINVAL`, 22).
+- `OPEN` of a directory or a symbolic link succeeds without opening anything. A `READ` or `WRITE` of a symbolic link is answered with `ENOTSUP` (45).
 - `CLOSE`: `keptModes` are the modes that stay open. With none kept, the server closes the item's channel.
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.
 - `SYNC` forces every open channel.
-- The root directory holds a directory `.fseventsd` (id 3) with an empty file `no_log` (id 4) in it, which keeps macOS from storing a log of file system events on the volume. The server stores neither, leaves the directory out of the root's listing, and passes no request on to an entry of that name in the backing file system. A `CREATE` of `.fseventsd` in the root is answered with `EEXIST` (17). A request that would change either item, open one for writing, or move an item onto or into the directory is answered with `EPERM` (1). The directory's listing never changes and always has the same verifier.
+- `READLINK` replies with the target of a symbolic link as the backing file system returns it. An item that is no symbolic link is answered with `EINVAL` (22). A target of more than 1023 bytes, the longest macOS passes on, is answered with `ENAMETOOLONG` (63).
+- `SYMLINK`: the server stores `target` in the form a path of the backing file system gives it, which may drop a trailing slash or change the Unicode normalization. It neither resolves the target nor checks that it exists, and it applies no mode. An existing `name` is answered with `EEXIST` (17). A target that takes more than 1023 bytes in that form is answered with `ENAMETOOLONG` (63).
+- The root directory holds a directory `.fseventsd` (id 3) with an empty file `no_log` (id 4) in it, which keeps macOS from storing a log of file system events on the volume. The server stores neither, leaves the directory out of the root's listing, and passes no request on to an entry of that name in the backing file system. A `CREATE` or `SYMLINK` of `.fseventsd` in the root is answered with `EEXIST` (17). A request that would change either item, create an item in the directory, open one for writing, or move an item onto or into the directory is answered with `EPERM` (1). The directory's listing never changes and always has the same verifier.
 
 ### Directory listings
 

@@ -27,6 +27,7 @@ public final class Errno {
 	public static final int EROFS = 30;
 	public static final int EPROTONOSUPPORT = 43;
 	public static final int ENOTSUP = 45;
+	public static final int ENAMETOOLONG = 63;
 	public static final int ENOTEMPTY = 66;
 	public static final int ESTALE = 70;
 

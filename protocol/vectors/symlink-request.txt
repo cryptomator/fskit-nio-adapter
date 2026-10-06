@@ -1,0 +1,10 @@
+kind = request
+opcode = symlink
+requestId = 21
+parentId = 84
+name = Verknüpfung
+target = /Volumes/Tresor/Neuer Ordner
+hex:
+00000043 00 0011 0000000000000015 00000034
+0000000000000054000c5665726b6ec3bc7066756e67001c2f566f6c756d6573
+2f547265736f722f4e65756572204f72646e6572

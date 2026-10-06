@@ -59,6 +59,8 @@ public final class Messages {
 				case READ -> ReadRequest.decode(control);
 				case WRITE -> WriteRequest.decode(control, payload);
 				case SYNC -> new SyncRequest();
+				case READLINK -> ReadlinkRequest.decode(control);
+				case SYMLINK -> SymlinkRequest.decode(control);
 			};
 			assertConsumed(control, frame.opcode() == Opcode.WRITE ? EMPTY : payload);
 			return request;
@@ -95,6 +97,8 @@ public final class Messages {
 				case READ -> ReadResponse.decode(control, payload);
 				case WRITE -> WriteResponse.decode(control);
 				case SYNC -> SyncResponse.decode(control);
+				case READLINK -> ReadlinkResponse.decode(control);
+				case SYMLINK -> SymlinkResponse.decode(control);
 			};
 			assertConsumed(control, frame.opcode() == Opcode.READ ? EMPTY : payload);
 			return response;
@@ -473,6 +477,42 @@ public final class Messages {
 		}
 	}
 
+	public record ReadlinkRequest(long nodeId) implements Request {
+
+		@Override
+		public Opcode opcode() {
+			return Opcode.READLINK;
+		}
+
+		@Override
+		public void encode(ByteBuffer control) {
+			control.putLong(nodeId);
+		}
+
+		static ReadlinkRequest decode(ByteBuffer control) {
+			return new ReadlinkRequest(control.getLong());
+		}
+	}
+
+	public record SymlinkRequest(long parentId, String name, String target) implements Request {
+
+		@Override
+		public Opcode opcode() {
+			return Opcode.SYMLINK;
+		}
+
+		@Override
+		public void encode(ByteBuffer control) {
+			control.putLong(parentId);
+			Wire.putString(control, name);
+			Wire.putString(control, target);
+		}
+
+		static SymlinkRequest decode(ByteBuffer control) throws ProtocolException {
+			return new SymlinkRequest(control.getLong(), Wire.getString(control), Wire.getString(control));
+		}
+	}
+
 	/* responses */
 
 	public sealed interface Response {
@@ -707,6 +747,34 @@ public final class Messages {
 
 		static SyncResponse decode(ByteBuffer control) {
 			return new SyncResponse(control.getLong());
+		}
+	}
+
+	public record ReadlinkResponse(Attributes attributes, String target) implements Response {
+
+		@Override
+		public void encode(ByteBuffer control) {
+			attributes.encode(control);
+			Wire.putString(control, target);
+		}
+
+		static ReadlinkResponse decode(ByteBuffer control) throws ProtocolException {
+			return new ReadlinkResponse(Attributes.decode(control), Wire.getString(control));
+		}
+	}
+
+	public record SymlinkResponse(Attributes attributes, String name, Attributes directoryAttributes, long usableBytes) implements Response {
+
+		@Override
+		public void encode(ByteBuffer control) {
+			attributes.encode(control);
+			Wire.putString(control, name);
+			directoryAttributes.encode(control);
+			control.putLong(usableBytes);
+		}
+
+		static SymlinkResponse decode(ByteBuffer control) throws ProtocolException {
+			return new SymlinkResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), control.getLong());
 		}
 	}
 }

@@ -67,6 +67,16 @@ struct InteropTests {
 		#expect(throws: StatusError(status: ENOENT)) {
 			try client.request(LookupRequest(parentId: Self.root, name: "missing"))
 		}
+
+		let link = try client.request(SymlinkRequest(parentId: Self.root, name: "link", target: "../outside/renamed.txt"))
+		#expect(link.name == "link")
+		#expect(link.attributes.type == .symlink)
+		#expect(link.directoryAttributes.nodeId == Self.root)
+		let target = try client.request(ReadlinkRequest(nodeId: link.attributes.nodeId))
+		#expect(target.target == "../outside/renamed.txt")
+		#expect(target.attributes.nodeId == link.attributes.nodeId)
+		_ = try client.request(RemoveRequest(nodeId: link.attributes.nodeId, parentId: Self.root))
+
 		#expect(try client.request(RemoveRequest(nodeId: file, parentId: Self.root)).attributes.size == 3)
 		_ = try client.request(RemoveRequest(nodeId: directory.attributes.nodeId, parentId: Self.root))
 		#expect(try client.request(ReaddirRequest(nodeId: Self.root, cookie: 0, verifier: 0, wantAttributes: true)).entries.isEmpty)

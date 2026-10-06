@@ -1,0 +1,7 @@
+kind = request
+opcode = readlink
+requestId = 20
+nodeId = 82
+hex:
+00000017 00 0010 0000000000000014 00000008
+0000000000000052

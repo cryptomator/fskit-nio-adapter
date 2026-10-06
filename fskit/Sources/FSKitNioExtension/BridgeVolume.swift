@@ -191,7 +191,7 @@ extension BridgeVolume: FSVolume.Handler {
 	var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
 		let capabilities = FSVolume.SupportedCapabilities()
 		capabilities.supportsHardLinks = false
-		capabilities.supportsSymbolicLinks = false
+		capabilities.supportsSymbolicLinks = true
 		capabilities.supportsPersistentObjectIDs = false
 		capabilities.supports2TBFiles = true
 		capabilities.doesNotSupportImmutableFiles = true
@@ -296,7 +296,18 @@ extension BridgeVolume: FSVolume.Handler {
 
 	// swiftlint:disable:next function_parameter_count
 	func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, linkContents contents: FSFileName, context: FSContext, replyHandler reply: @escaping (FSCreateSymlinkResult?, (any Error)?) -> Void) {
-		reply(nil, fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue))
+		serve(reply) {
+			try self.authorize(context)
+			// the mode is not marked as consumed, since the server applies none to a link
+			let response = try self.client.request(SymlinkRequest(parentId: self.nodeId(directory), name: self.string(name), target: self.string(contents)))
+			return FSCreateSymlinkResult(
+				newItem: self.registry.item(for: response.attributes.nodeId),
+				newItemName: FSFileName(string: response.name),
+				newItemAttributes: self.fsAttributes(response.attributes),
+				directoryAttributes: self.fsAttributes(response.directoryAttributes),
+				freeSpace: self.freeSpace(response.usableBytes)
+			)
+		}
 	}
 
 	func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSCreateLinkResult?, (any Error)?) -> Void) {
@@ -390,7 +401,11 @@ extension BridgeVolume: FSVolume.Handler {
 	}
 
 	func readSymbolicLink(_ item: FSItem, context: FSContext, replyHandler reply: @escaping (FSReadSymlinkResult?, (any Error)?) -> Void) {
-		reply(nil, fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue))
+		serve(reply) {
+			try self.authorize(context)
+			let response = try self.client.request(ReadlinkRequest(nodeId: self.nodeId(item)))
+			return FSReadSymlinkResult(contents: FSFileName(string: response.target), symlinkAttributes: self.fsAttributes(response.attributes))
+		}
 	}
 }
 

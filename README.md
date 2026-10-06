@@ -131,11 +131,17 @@ Observed on macOS 27.0.1 with JDK 26.
   - Removing such an entry reports success, although nothing is removed.
   - Extended attribute calls by path on such an entry are not refused. They reveal nothing, and what they set is discarded.
   - An FSEvents stream on the mount point reports the paths of entries as they change.
+  - For a symbolic link the mounting user has read, `readlink` answers with the target. Reading a file of the volume through the link is still refused.
 
   A mount point below a directory the other account cannot enter keeps all of this from it.
 - Finder's Trash creates `.Trashes` in the volume root, which appears in the mounted `Path`.
 - The name `.fseventsd` in the volume root is taken. The volume shows a directory of that name with an empty file `no_log` in it, which keeps macOS from creating the directory in the mounted `Path` and storing its log of file system events there. Neither is stored or can be changed, and the root's listing leaves the directory out. An entry named `.fseventsd` that the mounted `Path` already holds cannot be reached through the volume and stays as it is. Without that log, macOS has no event history for the volume, and an FSEvents stream created relative to the device reports absolute paths. Events are still delivered as they happen.
-- Symbolic links are shown but cannot be read, followed or created. Hard links cannot be created.
+- Hard links cannot be created: `ln` fails with "Operation not supported".
+- macOS follows a symbolic link itself. A relative target leads to an entry of the volume, an absolute one into the Mac's own file system and not into the mounted `Path`.
+- A symbolic link created on the volume has its target without a trailing slash and without doubled slashes: `ln -s dir/ name` stores `dir`. A vault also stores the target in composed Unicode form.
+- A symbolic link whose target is longer than 1023 bytes cannot be read or followed: `readlink` and `cat` fail with "File name too long", `ls -l` lists it without a target, and Finder shows it with a question mark. A vault can hold such a link, but none can be created on the volume.
+- A change to the mode or the times of a symbolic link reports success and has no effect (`chmod -h`, `touch -h`).
+- A symbolic link whose target is not valid UTF-8, which a plain directory can hold, is shown with the invalid bytes replaced by `�`, so it leads elsewhere or nowhere.
 - Extended attributes are accepted and not stored: `xattr -w` succeeds, and the attribute is gone. A file copied or saved to the volume loses its Finder tags, its resource fork and its quarantine flag, which marks a download for the check macOS runs before opening it.
 - An extended attribute or resource fork from 256 KiB up to at least 1 MiB is refused with "File too large". `cp` then copies the data, reports that it could not copy the extended attributes and exits with status 1, while Finder copies such a file without complaint. One of 2 MiB or more is accepted.
 - One slow operation stalls its volume, since requests are served one at a time.

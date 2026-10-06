@@ -19,11 +19,13 @@ import org.cryptomator.frontend.fskit.protocol.Messages.ReadRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReadResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RenameRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.Request;
 import org.cryptomator.frontend.fskit.protocol.Messages.Response;
 import org.cryptomator.frontend.fskit.protocol.Messages.SetattrRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.Timestamp;
 import org.cryptomator.frontend.fskit.protocol.Messages.WriteRequest;
 import org.jetbrains.annotations.Nullable;
@@ -88,10 +90,13 @@ final class EventLogOptOut {
 				yield new OpenResponse();
 			}
 			case ReadRequest r when r.nodeId() == FILE_ID -> new ReadResponse(file, ByteBuffer.allocate(0));
+			case ReadlinkRequest r when shows(r.nodeId()) -> throw new StatusException(Errno.EINVAL);
 			case CloseRequest r when shows(r.nodeId()) -> new CloseResponse(Messages.UNKNOWN_USABLE_BYTES);
 			case ForgetRequest r when shows(r.nodeId()) -> new ForgetResponse(Messages.UNKNOWN_USABLE_BYTES);
 			case CreateRequest r when takes(r.parentId(), r.name()) -> throw new StatusException(Errno.EEXIST);
 			case CreateRequest r when shows(r.parentId()) -> throw new StatusException(Errno.EPERM);
+			case SymlinkRequest r when takes(r.parentId(), r.name()) -> throw new StatusException(Errno.EEXIST);
+			case SymlinkRequest r when shows(r.parentId()) -> throw new StatusException(Errno.EPERM);
 			case SetattrRequest r when shows(r.nodeId()) -> throw new StatusException(Errno.EPERM);
 			case RemoveRequest r when shows(r.nodeId()) -> throw new StatusException(Errno.EPERM);
 			case RenameRequest r when shows(r.nodeId()) || shows(r.destinationParentId()) || takes(r.destinationParentId(), r.destinationName()) -> throw new StatusException(Errno.EPERM);

@@ -421,6 +421,9 @@ as_other() {
 	sudo -n -u "$SMOKE_OTHER_ACCOUNT" "$@"
 }
 
+# $READ_LINK <link>: prints a link's target or fails with the error's message. /usr/bin/readlink fails without one. A command and no function, so that the other account can run it.
+READ_LINK=(/usr/bin/perl -e 'defined(my $target = readlink($ARGV[0])) or die "readlink: $!\n"; print "$target\n"')
+
 # holding_open <file> <command> [<argument> ...]: runs the command while the script holds the file open for reading. sudo closes the descriptor for what it starts, so the other account has to open the file itself.
 holding_open() {
 	local file="$1"
@@ -711,7 +714,7 @@ modes() {
 	check "stat shows both" test "$(stat -f '%Lp %m' "$MNT/combined.txt")" = "200 1500000000"
 	check "the backing directory has both" test "$(stat -f '%Lp %m' "$BACKING/combined.txt")" = "200 1500000000"
 	check_fails "touch is refused on a file its owner may not read" "Permission denied" touch -t 202001020304 "$MNT/unreadable.txt"
-	# Setting a mode follows a link, so the adapter has to notice by itself that an entry it has shown as a file became one. No link can be created through the mount, so the entry is replaced in the backing directory, against the rule for fixtures.
+	# Setting a mode follows a link, so the adapter has to notice by itself that an entry it has shown as a file became one. The entry is replaced in the backing directory, against the rule for fixtures: replaced through the mount, it would be a new entry to the adapter.
 	check "the volume shows another file as a regular file" test -f "$MNT/swapped.txt"
 	check "it is replaced with a link in the backing directory" ln -sf "$SCENARIO_DIR/outside.txt" "$BACKING/swapped.txt"
 	check "chmod on it through the volume succeeds" chmod 755 "$MNT/swapped.txt"
@@ -758,15 +761,31 @@ links() {
 	echo regular > "$BACKING/sub/regular.txt"
 	echo kept > "$SCENARIO_DIR/target/kept.txt"
 	ln -s "$SCENARIO_DIR/target" "$BACKING/sub/link"
+	ln -s regular.txt "$BACKING/sub/relative"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
-	check "ls -l shows the link as a link" test "$(ls -l "$MNT/sub" 2> /dev/null | grep -c '^l')" -eq 1
-	check_fails "cd into the link fails" "" cd "$MNT/sub/link"
-	check_fails "ln -s is refused as unsupported" "Operation not supported" ln -s "$MNT/sub/regular.txt" "$MNT/sub/new-symlink"
+	check "ls -l shows both links as links" test "$(ls -l "$MNT/sub" 2> /dev/null | grep -c '^l')" -eq 2
+	check "readlink shows the target of the link to a directory outside the volume" test "$($READ_LINK "$MNT/sub/link")" = "$SCENARIO_DIR/target"
+	check "readlink shows the relative target" test "$($READ_LINK "$MNT/sub/relative")" = regular.txt
+	check "cat reads a file through the relative link" test "$(cat "$MNT/sub/relative")" = regular
+	check "cat reads a file through the link to the directory" test "$(cat "$MNT/sub/link/kept.txt")" = kept
+	check "ln -s creates a link with a relative target" ln -s regular.txt "$MNT/sub/new-relative"
+	check "the backing directory holds it with that target" test "$($READ_LINK "$BACKING/sub/new-relative")" = regular.txt
+	check "cat reads a file through it" test "$(cat "$MNT/sub/new-relative")" = regular
+	check "ln -s creates a link with an absolute target" ln -s "$SCENARIO_DIR/target/kept.txt" "$MNT/sub/new-absolute"
+	check "the backing directory holds it with that target" test "$($READ_LINK "$BACKING/sub/new-absolute")" = "$SCENARIO_DIR/target/kept.txt"
+	check "ln -s creates a link whose target is missing" ln -s missing/target.txt "$MNT/sub/new-dangling"
+	check "the backing directory holds it with that target" test "$($READ_LINK "$BACKING/sub/new-dangling")" = missing/target.txt
+	# macOS opens a link itself to copy it
+	check "cp -P copies a link off the volume" cp -P "$MNT/sub/relative" "$SCENARIO_DIR/copied-off"
+	check "the copy has the target" test "$($READ_LINK "$SCENARIO_DIR/copied-off")" = regular.txt
+	check "cp -P copies a link onto the volume" cp -P "$SCENARIO_DIR/copied-off" "$MNT/sub/copied-on"
+	check "the backing directory holds it with that target" test "$($READ_LINK "$BACKING/sub/copied-on")" = regular.txt
+	check_fails "ln -s onto an existing name fails" "File exists" ln -s regular.txt "$MNT/sub/regular.txt"
 	check_fails "ln is refused as unsupported" "Operation not supported" ln "$MNT/sub/regular.txt" "$MNT/sub/new-hardlink"
-	check "neither link exists" test "$(entries "$BACKING/sub")" = $'link\nregular.txt'
-	check "rm -r removes the directory that holds the link" rm -r "$MNT/sub"
+	check "the backing directory holds the fixtures and the new links, and nothing else" test "$(entries "$BACKING/sub")" = $'copied-on\nlink\nnew-absolute\nnew-dangling\nnew-relative\nregular.txt\nrelative'
+	check "rm -r removes the directory that holds the links" rm -r "$MNT/sub"
 	check "the backing directory holds it no longer" test ! -e "$BACKING/sub"
-	check "the link's target is untouched" test "$(cat "$SCENARIO_DIR/target/kept.txt")" = kept
+	check "the target outside the volume is untouched" test "$(cat "$SCENARIO_DIR/target/kept.txt")" = kept
 	unmount_volume "$SCENARIO" "$MNT"
 }
 
@@ -895,6 +914,9 @@ vault() {
 	check "a directory is created" mkdir "$MNT/dir"
 	check "a file is created in it" echo_to 0123456789 "$MNT/dir/unlinked.txt"
 	check_lines remove_while_open "$MNT/dir/unlinked.txt" $'0123456789\n' "$MNT/dir" "$MNT"
+	check "ln -s creates a link in the directory" ln -s ../file.txt "$MNT/dir/link"
+	check "readlink shows its target" test "$($READ_LINK "$MNT/dir/link")" = ../file.txt
+	check "cat reads a file through it" test "$(cat "$MNT/dir/link")" = replacement
 	check "cp writes a file larger than 10 MiB" cp "$large" "$MNT/large.bin"
 	# no operation may come between the write and df, since every reply refreshes the free space the volume reports
 	check "df shows the backing store's free space right after the write" shows_space_of "$MNT" "$BACKING"
@@ -905,8 +927,8 @@ vault() {
 	check "it holds the files written in parallel" parallel_writes_intact "$MNT/parallel" "$SCENARIO_DIR/first.bin" "$SCENARIO_DIR/second.bin"
 	check "it holds the large file" cmp -s "$large" "$MNT/large.bin"
 	check "it holds nothing that was removed" test "$(entries "$MNT")" = $'dir\nfile.txt\nlarge.bin\nparallel'
-	check "the directory of the removed file is listed" ls -A "$MNT/dir"
-	check "it is empty" test -z "$(entries "$MNT/dir")"
+	check "the directory of the removed file holds nothing but the link" test "$(entries "$MNT/dir")" = link
+	check "the link still has its target" test "$($READ_LINK "$MNT/dir/link")" = ../file.txt
 	unmount_volume "$SCENARIO-2" "$MNT"
 }
 
@@ -916,6 +938,7 @@ access() {
 	echo held > "$BACKING/held.txt"
 	mkdir "$BACKING/dir"
 	echo inner > "$BACKING/dir/inner.txt"
+	ln -s inner.txt "$BACKING/dir/link"
 	# the work directory is the script's alone. The other account has to get through it and the scenario's directory to the mount point, whatever its group and the umask.
 	chmod go+x "$WORK_DIR" "$SCENARIO_DIR"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
@@ -927,6 +950,11 @@ access() {
 	check_fails "it cannot create a file" "Permission denied" as_other touch "$MNT/foreign.txt"
 	check_fails "it cannot create a directory" "Permission denied" as_other mkdir "$MNT/foreign"
 	check_fails "it cannot remove a file" "Permission denied" as_other rm -f "$MNT/dir/inner.txt"
+	check_fails "it cannot create a link" "Permission denied" as_other ln -s fixture.txt "$MNT/foreign-link"
+	check_fails "it cannot read a link" "Permission denied" as_other $READ_LINK "$MNT/dir/link"
+	# a lookup leaves the link in the kernel's cache without its target, which the volume is then asked for directly
+	check "the mounting user looks the link up without reading it" test -L "$MNT/dir/link"
+	check_fails "the other account cannot read the link after that" "Permission denied" as_other $READ_LINK "$MNT/dir/link"
 	# once the mounting user has listed and read, the kernel knows the entries and asks the volume for less
 	check "the mounting user lists the volume" ls -l "$MNT" "$MNT/dir"
 	check "the mounting user reads a file" test "$(cat "$MNT/fixture.txt")" = fixture

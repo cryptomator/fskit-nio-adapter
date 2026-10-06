@@ -29,6 +29,8 @@ import org.cryptomator.frontend.fskit.protocol.Messages.ReadRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReadResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RenameRequest;
@@ -39,6 +41,8 @@ import org.cryptomator.frontend.fskit.protocol.Messages.SetattrRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.SetattrResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.SyncRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.SyncResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.Timestamp;
@@ -272,6 +276,7 @@ public class FileSystemOperationsTest {
 
 			assertStatus(Errno.EINVAL, new LookupRequest(ROOT, name));
 			assertStatus(Errno.EINVAL, new CreateRequest(ROOT, name, NodeType.FILE, 0644));
+			assertStatus(Errno.EINVAL, new SymlinkRequest(ROOT, name, "target"));
 			assertStatus(Errno.EINVAL, new RenameRequest(file, ROOT, ROOT, name));
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 		}
@@ -351,6 +356,15 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(created.attributes().nodeId(), lookup(ROOT, DECOMPOSED).nodeId());
 			Assertions.assertEquals(created.attributes().nodeId(), lookup(ROOT, COMPOSED).nodeId());
 			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(ROOT, DECOMPOSED), LookupResponse.class).name());
+		}
+
+		@Test
+		@DisplayName("a link created through a decomposed name is stored composed, and the reply carries the stored name")
+		public void testSymlinkDecomposedName() throws IOException {
+			SymlinkResponse created = ok(new SymlinkRequest(ROOT, DECOMPOSED, "target"), SymlinkResponse.class);
+
+			Assertions.assertEquals(COMPOSED, created.name());
+			Assertions.assertEquals(List.of(COMPOSED), backingNames());
 		}
 
 		@Test
@@ -572,7 +586,7 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("creating a symlink yields ENOTSUP")
+		@DisplayName("a create of type symlink yields ENOTSUP")
 		public void testCreateUnsupportedType() throws IOException {
 			assertStatus(Errno.ENOTSUP, new CreateRequest(ROOT, "link", NodeType.SYMLINK, 0644));
 
@@ -1235,6 +1249,69 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("a link is created with the given target and read back, and its missing target stays absent")
+		public void testSymlink() throws IOException {
+			SymlinkResponse response = ok(new SymlinkRequest(ROOT, "link", "dir/target.txt"), SymlinkResponse.class);
+
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+			Assertions.assertEquals("dir/target.txt", Files.readSymbolicLink(vault.getPath("/link")).toString());
+			Assertions.assertEquals("dir/target.txt", ok(new ReadlinkRequest(response.attributes().nodeId()), ReadlinkResponse.class).target());
+			Assertions.assertFalse(Files.exists(vault.getPath("/dir")));
+		}
+
+		@Test
+		@DisplayName("a link created on the vault is read with the target the vault returns")
+		public void testReadlink() throws IOException {
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere/" + DECOMPOSED));
+			long link = lookup(ROOT, "link").nodeId();
+
+			ReadlinkResponse response = ok(new ReadlinkRequest(link), ReadlinkResponse.class);
+
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+			Assertions.assertEquals(Files.readSymbolicLink(vault.getPath("/link")).toString(), response.target());
+		}
+
+		@Test
+		@DisplayName("a link is opened without a channel")
+		public void testOpenLink() throws IOException {
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
+			long link = lookup(ROOT, "link").nodeId();
+
+			ok(new OpenRequest(link, READ | WRITE), OpenResponse.class);
+
+			Assertions.assertEquals(List.of(), ops.openedChannels);
+		}
+
+		@Test
+		@DisplayName("reading a link whose target is longer than 1023 bytes yields ENAMETOOLONG")
+		public void testReadlinkOfLongTarget() throws IOException {
+			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("a".repeat(2000)));
+			long link = lookup(ROOT, "link").nodeId();
+
+			assertStatus(Errno.ENAMETOOLONG, new ReadlinkRequest(link));
+		}
+
+		@Test
+		@DisplayName("a target that the vault's normalization lengthens beyond 1023 bytes yields ENAMETOOLONG and creates nothing")
+		public void testSymlinkWithTargetLengthenedByNormalization() {
+			// 512 bytes as requested. NFC, the form the vault stores, replaces each character with two of two bytes each.
+			String target = "\u0344".repeat(256);
+
+			assertStatus(Errno.ENAMETOOLONG, new SymlinkRequest(ROOT, "link", target));
+
+			Assertions.assertEquals(List.of(".", ".."), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("a link created through a decomposed name is found under the composed name, which the reply carries")
+		public void testSymlinkDecomposedName() {
+			SymlinkResponse created = ok(new SymlinkRequest(ROOT, DECOMPOSED, "target"), SymlinkResponse.class);
+
+			Assertions.assertEquals(COMPOSED, created.name());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(ROOT, COMPOSED).nodeId());
+		}
+
+		@Test
 		@DisplayName("an entry created through a decomposed name is found under both spellings as one node")
 		public void testDecomposedName() {
 			long file = createFile(DECOMPOSED, "content");
@@ -1866,7 +1943,7 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("create and remove invalidate the listings of their directory, rename those of all directories")
+		@DisplayName("create, symlink and remove invalidate the listings of their directory, rename those of all directories")
 		public void testInvalidation() {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long file = create(directory, "file.txt", NodeType.FILE).nodeId();
@@ -1874,6 +1951,11 @@ public class FileSystemOperationsTest {
 			long rootVerifier = readdir(ROOT, 0, 0, false).verifier();
 			long verifier = readdir(directory, 0, 0, false).verifier();
 			create(directory, "created.txt", NodeType.FILE);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
+			readdir(ROOT, 1, rootVerifier, false);
+
+			verifier = readdir(directory, 0, 0, false).verifier();
+			ok(new SymlinkRequest(directory, "link", "file.txt"), SymlinkResponse.class);
 			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
 			readdir(ROOT, 1, rootVerifier, false);
 
@@ -1908,6 +1990,7 @@ public class FileSystemOperationsTest {
 			backing("listed.txt", "");
 			backing("held.txt", "");
 			long held = lookup(ROOT, "held.txt").nodeId();
+			long link = ok(new SymlinkRequest(ROOT, "link", "held.txt"), SymlinkResponse.class).attributes().nodeId();
 			long listed = readdir(ROOT, 0, 0, false).entries().stream().filter(entry -> entry.name().equals("listed.txt")).findFirst().orElseThrow().nodeId();
 			Assertions.assertEquals(listed, getattr(listed).nodeId());
 
@@ -1915,6 +1998,7 @@ public class FileSystemOperationsTest {
 
 			assertStatus(Errno.ESTALE, new GetattrRequest(listed));
 			Assertions.assertEquals(held, getattr(held).nodeId());
+			Assertions.assertEquals(link, getattr(link).nodeId());
 		}
 
 		@Test
@@ -2008,13 +2092,99 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a link cannot be traversed or opened")
+		@DisplayName("a link cannot be traversed, read or written")
 		public void testNotFollowed() {
 			assertStatus(Errno.ENOTDIR, new LookupRequest(link, "secret.txt"));
 			assertStatus(Errno.ENOTDIR, new ReaddirRequest(link, 0, 0, false));
 			assertStatus(Errno.ENOTDIR, new CreateRequest(link, "new.txt", NodeType.FILE, 0644));
-			assertStatus(Errno.ENOTSUP, new OpenRequest(link, READ));
+			assertStatus(Errno.ENOTDIR, new SymlinkRequest(link, "new", "target"));
 			assertStatus(Errno.ENOTSUP, new ReadRequest(link, 0, 10));
+			assertStatus(Errno.ENOTSUP, new WriteRequest(link, 0, ByteBuffer.allocate(1)));
+		}
+
+		@Test
+		@DisplayName("a link gets no channel when it is opened, as macOS does to copy the link itself")
+		public void testOpen() {
+			ok(new OpenRequest(link, READ | WRITE), OpenResponse.class);
+			ok(new CloseRequest(link, 0), CloseResponse.class);
+
+			Assertions.assertEquals(List.of(), ops.openedChannels);
+		}
+
+		@Test
+		@DisplayName("reads a link's target and replies with the link's attributes")
+		public void testReadlink() {
+			ReadlinkResponse response = ok(new ReadlinkRequest(link), ReadlinkResponse.class);
+
+			Assertions.assertEquals(outside.toString(), response.target());
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+			Assertions.assertEquals(link, response.attributes().nodeId());
+		}
+
+		@Test
+		@DisplayName("reading a file as a link yields EINVAL")
+		public void testReadlinkOfFile() throws IOException {
+			backing("file.txt", "content");
+
+			assertStatus(Errno.EINVAL, new ReadlinkRequest(lookup(ROOT, "file.txt").nodeId()));
+		}
+
+		@Test
+		@DisplayName("reading a link that was removed yields ESTALE")
+		public void testReadlinkOfRemovedLink() {
+			ok(new RemoveRequest(link, ROOT), RemoveResponse.class);
+
+			assertStatus(Errno.ESTALE, new ReadlinkRequest(link));
+		}
+
+		@ParameterizedTest(name = "{0}")
+		@DisplayName("creates a link to a missing target with the target as given, whether relative, absolute or not ASCII")
+		@ValueSource(strings = {"sub/target.txt", "../target.txt", "/absolute/target.txt", "t\u00e4rget.txt"})
+		public void testSymlink(String target) throws IOException {
+			SymlinkResponse response = ok(new SymlinkRequest(ROOT, "new", target), SymlinkResponse.class);
+
+			Assertions.assertEquals(target, Files.readSymbolicLink(root.resolve("new")).toString());
+			Assertions.assertEquals("new", response.name());
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+			Assertions.assertEquals(ROOT, response.attributes().parentId());
+			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
+			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertEquals(response.attributes().nodeId(), lookup(ROOT, "new").nodeId());
+			Assertions.assertEquals(target, ok(new ReadlinkRequest(response.attributes().nodeId()), ReadlinkResponse.class).target());
+			Assertions.assertEquals(List.of("link", "new"), backingNames());
+		}
+
+		@Test
+		@DisplayName("creating a link sets no permissions, so its target keeps its mode")
+		public void testSymlinkLeavesTargetUntouched() throws IOException {
+			List<Path> permissionsSet = new ArrayList<>();
+			ops.beforeSettingPermissions = permissionsSet::add;
+			Files.setPosixFilePermissions(outside, PosixFilePermissions.fromString("rwx-----x"));
+
+			ok(new SymlinkRequest(ROOT, "new", outside.toString()), SymlinkResponse.class);
+
+			Assertions.assertEquals(List.of(), permissionsSet);
+			Assertions.assertEquals("rwx-----x", PosixFilePermissions.toString(Files.getPosixFilePermissions(outside)));
+		}
+
+		@Test
+		@DisplayName("creating a link under an existing name yields EEXIST and leaves the entry as it is")
+		public void testSymlinkExisting() throws IOException {
+			assertStatus(Errno.EEXIST, new SymlinkRequest(ROOT, "link", "other"));
+
+			Assertions.assertEquals(outside, Files.readSymbolicLink(root.resolve("link")));
+		}
+
+		@Test
+		@DisplayName("a target of 1023 bytes is the longest a link is created with")
+		public void testSymlinkWithLongTarget() throws IOException {
+			ok(new SymlinkRequest(ROOT, "longest", "a".repeat(1023)), SymlinkResponse.class);
+
+			assertStatus(Errno.ENAMETOOLONG, new SymlinkRequest(ROOT, "too long", "a".repeat(1024)));
+			// 1022 characters that take 1024 bytes
+			assertStatus(Errno.ENAMETOOLONG, new SymlinkRequest(ROOT, "too long", "\u00e4\u00e4" + "a".repeat(1020)));
+
+			Assertions.assertEquals(List.of("link", "longest"), backingNames());
 		}
 
 		@Test
@@ -2174,6 +2344,29 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("a symlink still succeeds, with the type it established and the length of its target")
+		public void testSymlink() throws IOException {
+			// the name's node is left from a file that is gone. Nothing of its last known attributes may reach the reply.
+			Files.setPosixFilePermissions(backing("link", "stale"), PosixFilePermissions.fromString("rw-------"));
+			lookup(ROOT, "link");
+			Files.delete(root.resolve("link"));
+			Attributes directory = getattr(ROOT);
+			ops.beforeReadingAttributes = failing;
+			ops.beforeReadingUsableSpace = failing;
+
+			SymlinkResponse response = ok(new SymlinkRequest(ROOT, "link", "t\u00e4rget"), SymlinkResponse.class);
+
+			Assertions.assertEquals("t\u00e4rget", Files.readSymbolicLink(root.resolve("link")).toString());
+			Assertions.assertEquals("link", response.name());
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+			Assertions.assertEquals(0644, response.attributes().mode());
+			Assertions.assertEquals(7, response.attributes().size());
+			Assertions.assertEquals(ROOT, response.attributes().parentId());
+			Assertions.assertEquals(directory, response.directoryAttributes());
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+		}
+
+		@Test
 		@DisplayName("a rename still succeeds, with the last known attributes")
 		public void testRename() throws IOException {
 			backing("old.txt", "content");
@@ -2195,16 +2388,17 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a create and a rename still succeed when the stored name cannot be read, with the requested name")
+		@DisplayName("a create, a symlink and a rename still succeed when the stored name cannot be read, with the requested name")
 		public void testStoredNameUnreadable() throws IOException {
 			backing("old.txt", "content");
 			long file = lookup(ROOT, "old.txt").nodeId();
 			ops.beforeResolvingRealPath = failing;
 
 			Assertions.assertEquals("created.txt", ok(new CreateRequest(ROOT, "created.txt", NodeType.FILE, 0644), CreateResponse.class).name());
+			Assertions.assertEquals("link", ok(new SymlinkRequest(ROOT, "link", "target"), SymlinkResponse.class).name());
 			Assertions.assertEquals("new.txt", ok(new RenameRequest(file, ROOT, ROOT, "new.txt"), RenameResponse.class).name());
 
-			Assertions.assertEquals(List.of("created.txt", "new.txt"), backingNames());
+			Assertions.assertEquals(List.of("created.txt", "link", "new.txt"), backingNames());
 		}
 
 		@Test
@@ -2356,11 +2550,19 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("reading either as a link yields EINVAL")
+		public void testReadlink() {
+			assertStatus(Errno.EINVAL, new ReadlinkRequest(directory.nodeId()));
+			assertStatus(Errno.EINVAL, new ReadlinkRequest(file.nodeId()));
+		}
+
+		@Test
 		@DisplayName("refuses every change to the two and stores nothing under their names")
 		public void testChangesRefused() throws IOException {
 			long stored = create(ROOT, "file.txt", NodeType.FILE).nodeId();
 			List<Request> changes = List.of( //
 					new CreateRequest(directory.nodeId(), "new.txt", NodeType.FILE, 0644), //
+					new SymlinkRequest(directory.nodeId(), "link", "no_log"), //
 					new OpenRequest(file.nodeId(), WRITE), //
 					new OpenRequest(file.nodeId(), READ | WRITE), //
 					new WriteRequest(file.nodeId(), 0, ByteBuffer.allocate(1)), //
@@ -2374,6 +2576,7 @@ public class FileSystemOperationsTest {
 					new RenameRequest(stored, ROOT, ROOT, ".fseventsd"));
 
 			assertStatus(Errno.EEXIST, new CreateRequest(ROOT, ".fseventsd", NodeType.DIRECTORY, 0700));
+			assertStatus(Errno.EEXIST, new SymlinkRequest(ROOT, ".fseventsd", "file.txt"));
 			for (Request change : changes) {
 				assertStatus(Errno.EPERM, change);
 			}
@@ -2407,6 +2610,7 @@ public class FileSystemOperationsTest {
 					new SetattrRequest(file, Messages.ATTRIBUTE_MODIFIED, 0, 0, EPOCH, EPOCH), //
 					new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0644), //
 					new CreateRequest(ROOT, "dir", NodeType.DIRECTORY, 0755), //
+					new SymlinkRequest(ROOT, "link", "file.txt"), //
 					new RemoveRequest(file, ROOT), //
 					new RenameRequest(file, ROOT, ROOT, "renamed.txt"), //
 					new WriteRequest(file, 0, ByteBuffer.allocate(1)), //

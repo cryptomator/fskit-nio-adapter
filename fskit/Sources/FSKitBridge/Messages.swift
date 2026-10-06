@@ -925,3 +925,101 @@ public struct SyncResponse: Message, Equatable {
 		control.write(usableBytes)
 	}
 }
+
+// MARK: - READLINK
+
+public struct ReadlinkRequest: Request, Equatable {
+	public typealias Response = ReadlinkResponse
+	public static let opcode = Opcode.readlink
+
+	public var nodeId: UInt64
+
+	public init(nodeId: UInt64) {
+		self.nodeId = nodeId
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		self.nodeId = try control.read()
+	}
+
+	public func encode(control: inout ByteWriter) {
+		control.write(nodeId)
+	}
+}
+
+public struct ReadlinkResponse: Message, Equatable {
+	public var attributes: Attributes
+	public var target: String
+
+	public init(attributes: Attributes, target: String) {
+		self.attributes = attributes
+		self.target = target
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		self.attributes = try Attributes(control: &control)
+		self.target = try control.readString()
+	}
+
+	public func encode(control: inout ByteWriter) {
+		attributes.encode(control: &control)
+		control.write(target)
+	}
+}
+
+// MARK: - SYMLINK
+
+public struct SymlinkRequest: Request, Equatable {
+	public typealias Response = SymlinkResponse
+	public static let opcode = Opcode.symlink
+
+	public var parentId: UInt64
+	public var name: String
+	public var target: String
+
+	public init(parentId: UInt64, name: String, target: String) {
+		self.parentId = parentId
+		self.name = name
+		self.target = target
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		self.parentId = try control.read()
+		self.name = try control.readString()
+		self.target = try control.readString()
+	}
+
+	public func encode(control: inout ByteWriter) {
+		control.write(parentId)
+		control.write(name)
+		control.write(target)
+	}
+}
+
+public struct SymlinkResponse: Message, Equatable {
+	public var attributes: Attributes
+	public var name: String
+	public var directoryAttributes: Attributes
+	public var usableBytes: UInt64
+
+	public init(attributes: Attributes, name: String, directoryAttributes: Attributes, usableBytes: UInt64) {
+		self.attributes = attributes
+		self.name = name
+		self.directoryAttributes = directoryAttributes
+		self.usableBytes = usableBytes
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		self.attributes = try Attributes(control: &control)
+		self.name = try control.readString()
+		self.directoryAttributes = try Attributes(control: &control)
+		self.usableBytes = try control.read()
+	}
+
+	public func encode(control: inout ByteWriter) {
+		attributes.encode(control: &control)
+		control.write(name)
+		directoryAttributes.encode(control: &control)
+		control.write(usableBytes)
+	}
+}

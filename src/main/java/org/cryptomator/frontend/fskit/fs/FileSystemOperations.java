@@ -23,6 +23,8 @@ import org.cryptomator.frontend.fskit.protocol.Messages.ReadRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReadResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RenameRequest;
@@ -33,6 +35,8 @@ import org.cryptomator.frontend.fskit.protocol.Messages.SetattrRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.SetattrResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.SyncRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.SyncResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.Timestamp;
@@ -46,6 +50,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryIteratorException;
@@ -88,6 +93,7 @@ public class FileSystemOperations implements Closeable {
 	private static final int DEFAULT_FILE_MODE = 0644;
 	private static final int DEFAULT_DIRECTORY_MODE = 0755;
 	private static final int FIRST_CHILD_INDEX = 2; // listings start with "." and ".."
+	private static final int MAX_LINK_TARGET_BYTES = 1023; // macOS cuts a longer target off without an error
 
 	private final boolean readOnly;
 	private final FileStore fileStore;
@@ -127,6 +133,8 @@ public class FileSystemOperations implements Closeable {
 				case ReadRequest r -> read(r);
 				case WriteRequest r -> write(r);
 				case SyncRequest _ -> sync();
+				case ReadlinkRequest r -> readlink(r);
+				case SymlinkRequest r -> symlink(r);
 			};
 		} catch (IOException | RuntimeException e) {
 			int status = Errno.of(e);
@@ -348,7 +356,8 @@ public class FileSystemOperations implements Closeable {
 
 	private OpenResponse open(OpenRequest request) throws IOException {
 		Node node = nodes.get(request.nodeId());
-		if (node.type != NodeType.DIRECTORY) {
+		// macOS opens a link itself to copy it. Like a directory, a link gets no channel, so nothing is followed.
+		if (node.type == NodeType.FILE) {
 			ensureOpen(node, request.modes() & (Messages.MODE_READ | Messages.MODE_WRITE));
 		}
 		return new OpenResponse();
@@ -407,6 +416,44 @@ public class FileSystemOperations implements Closeable {
 			throw firstFailure;
 		}
 		return new SyncResponse(usableBytes());
+	}
+
+	private ReadlinkResponse readlink(ReadlinkRequest request) throws IOException {
+		Node node = linked(request.nodeId());
+		Attributes attributes = refresh(node);
+		if (node.type != NodeType.SYMLINK) {
+			throw new StatusException(Errno.EINVAL);
+		}
+		String target = Files.readSymbolicLink(node.path).toString();
+		checkLinkTarget(target);
+		return new ReadlinkResponse(attributes, target);
+	}
+
+	private SymlinkResponse symlink(SymlinkRequest request) throws IOException {
+		assertWritable();
+		Node directory = linkedDirectory(request.parentId());
+		checkName(request.name());
+		Path link = directory.path.resolve(compose(request.name()));
+		Path target = link.getFileSystem().getPath(request.target());
+		// checked as the backing file system spells it, since a vault's normalization can lengthen a target
+		String stored = target.toString();
+		checkLinkTarget(stored);
+		Files.createSymbolicLink(link, target);
+		snapshots.invalidate(directory.id);
+		Node node = nodes.hold(storedPathOrElse(link), NodeType.SYMLINK, directory);
+		Timestamp now = now();
+		Attributes attributes = refreshAfterChange(node, _ -> new Attributes(NodeType.SYMLINK, DEFAULT_FILE_MODE, utf8Length(stored), node.id, node.parentId, now, now, now));
+		return new SymlinkResponse(attributes, name(node), refreshAfterChange(directory, UnaryOperator.identity()), usableBytes());
+	}
+
+	private static void checkLinkTarget(String target) throws StatusException {
+		if (utf8Length(target) > MAX_LINK_TARGET_BYTES) {
+			throw new StatusException(Errno.ENAMETOOLONG);
+		}
+	}
+
+	private static int utf8Length(String string) {
+		return string.getBytes(StandardCharsets.UTF_8).length;
 	}
 
 	/* nodes */

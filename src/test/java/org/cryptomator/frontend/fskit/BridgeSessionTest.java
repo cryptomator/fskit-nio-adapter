@@ -22,12 +22,16 @@ import org.cryptomator.frontend.fskit.protocol.Messages.ReadRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReadResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ReadlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RemoveResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.RenameRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.RenameResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.StatfsResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.SymlinkResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.SyncRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.WriteRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.WriteResponse;
@@ -270,6 +274,9 @@ public class BridgeSessionTest {
 			ReaddirResponse listing = ok(client.request(new ReaddirRequest(ROOT, 0, 0, false)), ReaddirResponse.class);
 			Assertions.assertEquals(List.of(".", "..", "dir", "renamed.txt"), listing.entries().stream().map(DirectoryEntry::name).sorted().toList());
 			Assertions.assertEquals("hello world", Files.readString(root.resolve("renamed.txt")));
+			long link = ok(client.request(new SymlinkRequest(ROOT, "link", "renamed.txt")), SymlinkResponse.class).attributes().nodeId();
+			Assertions.assertEquals("renamed.txt", ok(client.request(new ReadlinkRequest(link)), ReadlinkResponse.class).target());
+			ok(client.request(new RemoveRequest(link, ROOT)), RemoveResponse.class);
 			ok(client.request(new RemoveRequest(file, ROOT)), RemoveResponse.class);
 			ok(client.request(new RemoveRequest(directory, ROOT)), RemoveResponse.class);
 		}

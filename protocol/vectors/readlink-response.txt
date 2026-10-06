@@ -1,0 +1,21 @@
+kind = response
+opcode = readlink
+requestId = 20
+status = 0
+attributes.type = symlink
+attributes.mode = 418
+attributes.size = 18007
+attributes.nodeId = 82
+attributes.parentId = 56
+attributes.modified.seconds = 1700001800
+attributes.modified.nanos = 100000018
+attributes.accessed.seconds = 1700001801
+attributes.accessed.nanos = 200000018
+attributes.created.seconds = 1700001802
+attributes.created.nanos = 300000018
+target = ../Neuer Ordner/ä.txt
+hex:
+0000006a 01 0010 0000000000000014 0000005b
+000000000301a200000000000046570000000000000052000000000000003800
+0000006553f80805f5e112000000006553f8090bebc212000000006553f80a11
+e1a31200162e2e2f4e65756572204f72646e65722fc3a42e747874

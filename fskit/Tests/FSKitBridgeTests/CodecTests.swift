@@ -39,7 +39,7 @@ struct FrameCodecTests {
 		"0001000f 00 0005 0000000000000001 00010001", // control exceeds its limit
 		"0000000f 00 0005 0000000000000001 ffffffff", // control length with the top bit set
 		"00100010 00 0005 0000000000000001 00000000", // payload exceeds its limit
-		"0000000f 00 0010 0000000000000001 00000000", // unknown opcode
+		"0000000f 00 7fff 0000000000000001 00000000", // unknown opcode
 		"0000000f 02 0005 0000000000000001 00000000" // unknown kind
 	])
 	func rejectsAnInvalidHeader(hex: String) {
@@ -84,6 +84,8 @@ struct MessagesTests {
 		case .read: try roundTrip(ReadRequest.self, frame)
 		case .write: try roundTrip(WriteRequest.self, frame)
 		case .sync: try roundTrip(SyncRequest.self, frame)
+		case .readlink: try roundTrip(ReadlinkRequest.self, frame)
+		case .symlink: try roundTrip(SymlinkRequest.self, frame)
 		}
 	}
 
