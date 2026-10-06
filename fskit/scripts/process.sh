@@ -32,7 +32,14 @@ if [[ "${1:-}" == "--staged" ]]; then
 	# git-format-staged.py passes paths relative to the repository root
 	cd "$REPO_ROOT"
 	process_output "SwiftFormat" python3 fskit/scripts/git-format-staged.py -f 'swiftformat stdin --stdinpath "{}" --quiet' 'fskit/*.swift'
-	process_output "SwiftLint" python3 fskit/scripts/git-format-staged.py --no-write -f 'swiftlint --use-stdin --strict --quiet --config fskit/.swiftlint.yml >&2' 'fskit/*.swift'
+	# SwiftLint prints <nopath> as the path of a finding in content it reads from standard input, so sed replaces it with the file's path.
+	# git-format-staged.py stops at the first file whose command fails, so the command succeeds once it has printed findings. They fail the check as output, and the remaining files are linted as well.
+	process_output "SwiftLint" python3 fskit/scripts/git-format-staged.py --no-write -f '
+		output="$(swiftlint --use-stdin --strict --quiet --config fskit/.swiftlint.yml 2>&1)"
+		lint_status=$?
+		[ -n "$output" ] || exit $lint_status
+		printf "%s\n" "$output" | sed "s|^<nopath>|{}|" >&2
+	' 'fskit/*.swift'
 	if (( FINAL_STATUS )); then
 		echo "error: changes were made or are required, see the output above" >&2
 	fi
