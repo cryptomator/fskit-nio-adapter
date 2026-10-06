@@ -120,7 +120,8 @@ It does not cover Finder, a disabled extension, a killed extension process or a 
 Observed on macOS 27.0.1 with JDK 26.
 
 - A mounted volume may not be confined to the user who mounted it. macOS mounts it with `noowners`, and the extension checks no caller identity, so another local account that can reach the mount point may be able to read and write it. That is untested, so mount only data that other accounts on the Mac may see.
-- macOS creates directories of its own in the volume root, which appear in the mounted `Path`: `fseventsd` creates `.fseventsd` right after mounting, and Finder's Trash needs `.Trashes`.
+- Finder's Trash creates `.Trashes` in the volume root, which appears in the mounted `Path`.
+- The name `.fseventsd` in the volume root is taken. The volume shows a directory of that name with an empty file `no_log` in it, which keeps macOS from creating the directory in the mounted `Path` and storing its log of file system events there. Neither is stored or can be changed, and the root's listing leaves the directory out. An entry named `.fseventsd` that the mounted `Path` already holds cannot be reached through the volume and stays as it is. Without that log, macOS has no event history for the volume, and an FSEvents stream created relative to the device reports absolute paths. Events are still delivered as they happen.
 - Symbolic links are shown but cannot be read, followed or created. Hard links cannot be created.
 - No extended attributes. macOS stores attributes in AppleDouble companion files named `._<name>` next to the file instead, which appear in the mounted `Path` as well. `xattr -w` therefore succeeds, and:
   - A process whose files are tagged with `com.apple.provenance` creates a companion for every file it creates.

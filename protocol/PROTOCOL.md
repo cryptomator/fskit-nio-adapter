@@ -47,7 +47,7 @@ Only requests to `WRITE` and responses to `READ` have a payload.
 
 ## Items
 
-Items are addressed by `u64 nodeId`. 2 is the root directory and 1 its parent, matching FSKit's `FSItem.Identifier.rootDirectory` and `.parentOfRoot`. The server assigns ids from 64 upwards and never reuses one within a connection.
+Items are addressed by `u64 nodeId`. 2 is the root directory and 1 its parent, matching FSKit's `FSItem.Identifier.rootDirectory` and `.parentOfRoot`. 3 and 4 are the directory `.fseventsd` and the file `no_log` in it, which the notes on the messages describe. The server assigns every other id from 64 upwards and never reuses one within a connection.
 
 An `attributes` record:
 
@@ -96,6 +96,7 @@ Notes:
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.
 - `SYNC` forces every open channel.
+- The root directory holds a directory `.fseventsd` (id 3) with an empty file `no_log` (id 4) in it, which keeps macOS from storing a log of file system events on the volume. The server stores neither, leaves the directory out of the root's listing, and passes no request on to an entry of that name in the backing file system. A `CREATE` of `.fseventsd` in the root is answered with `EEXIST` (17). A request that would change either item, open one for writing, or move an item onto or into the directory is answered with `EPERM` (1). The directory's listing never changes and always has the same verifier.
 
 ### Directory listings
 

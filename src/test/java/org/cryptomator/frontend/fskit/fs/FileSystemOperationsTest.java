@@ -2285,6 +2285,106 @@ public class FileSystemOperationsTest {
 	}
 
 	@Nested
+	@DisplayName("the event log opt-out")
+	public class EventLogOptOutEntries {
+
+		private Attributes directory;
+		private Attributes file;
+
+		@BeforeEach
+		public void setup() {
+			directory = lookup(ROOT, ".fseventsd");
+			file = lookup(directory.nodeId(), "no_log");
+		}
+
+		@Test
+		@DisplayName("the root shows .fseventsd with an empty no_log in it and stores neither")
+		public void testShownWithoutBeingStored() throws IOException {
+			Assertions.assertEquals(NodeType.DIRECTORY, directory.type());
+			Assertions.assertEquals(ROOT, directory.parentId());
+			Assertions.assertEquals(NodeType.FILE, file.type());
+			Assertions.assertEquals(0, file.size());
+			Assertions.assertEquals(directory.nodeId(), file.parentId());
+			Assertions.assertEquals(directory, getattr(directory.nodeId()));
+			Assertions.assertEquals(file, getattr(file.nodeId()));
+			assertStatus(Errno.ENOENT, new LookupRequest(directory.nodeId(), "ignore"));
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("the root's listing leaves .fseventsd out, and its own listing holds no_log")
+		public void testListings() throws IOException {
+			backing("file.txt", "");
+
+			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals(List.of("file.txt"), names(readdir(ROOT, 0, 0, true)));
+			Assertions.assertEquals(List.of( //
+					new DirectoryEntry(".", NodeType.DIRECTORY, directory.nodeId(), 1, null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
+					new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), 3, null)), readdir(directory.nodeId(), 0, 0, false).entries());
+			ReaddirResponse withAttributes = readdir(directory.nodeId(), 0, 0, true);
+			Assertions.assertEquals(List.of(new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), 3, file)), withAttributes.entries());
+			Assertions.assertEquals(List.of(), readdir(directory.nodeId(), 3, withAttributes.verifier(), true).entries());
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), 4, withAttributes.verifier(), true));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), 3, withAttributes.verifier() + 1, true));
+		}
+
+		@Test
+		@DisplayName("an entry named .fseventsd in the mounted path is hidden and left alone")
+		public void testHidesStoredEntry() throws IOException {
+			Files.createDirectory(root.resolve(".fseventsd"));
+			backing(".fseventsd/fseventsd-uuid", "uuid");
+
+			Assertions.assertEquals(directory, lookup(ROOT, ".fseventsd"));
+			assertStatus(Errno.ENOENT, new LookupRequest(directory.nodeId(), "fseventsd-uuid"));
+			Assertions.assertEquals(List.of(".", ".."), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals("uuid", Files.readString(root.resolve(".fseventsd/fseventsd-uuid")));
+		}
+
+		@Test
+		@DisplayName("both can be opened, no_log can be read, and both are still there after a close and a forget")
+		public void testReading() {
+			ok(new OpenRequest(directory.nodeId(), READ), OpenResponse.class);
+			ok(new OpenRequest(file.nodeId(), READ), OpenResponse.class);
+
+			Assertions.assertEquals("", read(file.nodeId(), 0, 100));
+			ok(new CloseRequest(file.nodeId(), 0), CloseResponse.class);
+			ok(new CloseRequest(directory.nodeId(), 0), CloseResponse.class);
+			ok(new ForgetRequest(file.nodeId()), ForgetResponse.class);
+			ok(new ForgetRequest(directory.nodeId()), ForgetResponse.class);
+			Assertions.assertEquals(file, lookup(directory.nodeId(), "no_log"));
+		}
+
+		@Test
+		@DisplayName("refuses every change to the two and stores nothing under their names")
+		public void testChangesRefused() throws IOException {
+			long stored = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+			List<Request> changes = List.of( //
+					new CreateRequest(directory.nodeId(), "new.txt", NodeType.FILE, 0644), //
+					new OpenRequest(file.nodeId(), WRITE), //
+					new OpenRequest(file.nodeId(), READ | WRITE), //
+					new WriteRequest(file.nodeId(), 0, ByteBuffer.allocate(1)), //
+					new SetattrRequest(file.nodeId(), Messages.ATTRIBUTE_SIZE, 1, 0, EPOCH, EPOCH), //
+					new SetattrRequest(directory.nodeId(), Messages.ATTRIBUTE_MODE, 0, 0700, EPOCH, EPOCH), //
+					new RemoveRequest(file.nodeId(), directory.nodeId()), //
+					new RemoveRequest(directory.nodeId(), ROOT), //
+					new RenameRequest(file.nodeId(), directory.nodeId(), ROOT, "moved"), //
+					new RenameRequest(directory.nodeId(), ROOT, ROOT, "moved"), //
+					new RenameRequest(stored, ROOT, directory.nodeId(), "file.txt"), //
+					new RenameRequest(stored, ROOT, ROOT, ".fseventsd"));
+
+			assertStatus(Errno.EEXIST, new CreateRequest(ROOT, ".fseventsd", NodeType.DIRECTORY, 0700));
+			for (Request change : changes) {
+				assertStatus(Errno.EPERM, change);
+			}
+
+			Assertions.assertEquals(List.of("file.txt"), backingNames());
+			Assertions.assertEquals(file, getattr(file.nodeId()));
+			Assertions.assertEquals(directory, getattr(directory.nodeId()));
+		}
+	}
+
+	@Nested
 	@DisplayName("read-only")
 	public class ReadOnly {
 

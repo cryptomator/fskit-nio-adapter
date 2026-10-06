@@ -94,6 +94,7 @@ public class FileSystemOperations implements Closeable {
 	private final boolean posix;
 	private final NodeTable nodes;
 	private final DirectorySnapshots snapshots;
+	private final EventLogOptOut eventLogOptOut;
 
 	public FileSystemOperations(Path root, boolean readOnly) throws IOException {
 		this.readOnly = readOnly;
@@ -101,10 +102,15 @@ public class FileSystemOperations implements Closeable {
 		this.posix = fileStore.supportsFileAttributeView(PosixFileAttributeView.class);
 		this.nodes = new NodeTable(root);
 		this.snapshots = new DirectorySnapshots(nodes);
+		this.eventLogOptOut = new EventLogOptOut(now());
 	}
 
 	public Response handle(Request request) {
 		try {
+			Response answer = eventLogOptOut.handle(request);
+			if (answer != null) {
+				return answer;
+			}
 			return switch (request) {
 				case HelloRequest _ -> throw new StatusException(Errno.EINVAL);
 				case StatfsRequest _ -> statfs();
@@ -224,13 +230,10 @@ public class FileSystemOperations implements Closeable {
 	private ReaddirResponse readdir(ReaddirRequest request) throws IOException {
 		Node directory = linkedDirectory(request.nodeId());
 		DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? snapshots.add(directory.id, list(directory)) : snapshots.get(directory.id, request.verifier());
-		if (snapshot == null || Long.compareUnsigned(request.cookie(), snapshot.entries().size()) > 0) {
+		if (snapshot == null) {
 			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
 		}
-		int index = (int) request.cookie();
-		if (request.wantAttributes()) {
-			index = Math.max(index, FIRST_CHILD_INDEX);
-		}
+		int index = firstIndex(request, snapshot.entries().size());
 		List<DirectoryEntry> page = new ArrayList<>();
 		int capacity = ReaddirResponse.ENTRIES_CAPACITY;
 		for (; index < snapshot.entries().size(); index++) {
@@ -518,8 +521,12 @@ public class FileSystemOperations implements Closeable {
 		List<DirectorySnapshots.Entry> entries = new ArrayList<>();
 		try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory.path)) {
 			for (Path child : stream) {
+				String name = child.getFileName().toString();
+				if (EventLogOptOut.takes(directory.id, name)) {
+					continue;
+				}
 				try {
-					entries.add(new DirectorySnapshots.Entry(child.getFileName().toString(), typeOf(readFileAttributes(child))));
+					entries.add(new DirectorySnapshots.Entry(name, typeOf(readFileAttributes(child))));
 				} catch (NoSuchFileException e) {
 					// vanished while listing
 				}
@@ -528,6 +535,17 @@ public class FileSystemOperations implements Closeable {
 			throw e.getCause();
 		}
 		return entries;
+	}
+
+	/**
+	 * @return The index of the first entry a request asks for in a listing of that length
+	 */
+	static int firstIndex(ReaddirRequest request, int listingLength) throws StatusException {
+		if (Long.compareUnsigned(request.cookie(), listingLength) > 0) {
+			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
+		}
+		int index = (int) request.cookie();
+		return request.wantAttributes() ? Math.max(index, FIRST_CHILD_INDEX) : index;
 	}
 
 	private @Nullable DirectoryEntry resolve(Node directory, DirectorySnapshots.Entry entry, int index, boolean wantAttributes) throws IOException {

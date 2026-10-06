@@ -14,6 +14,7 @@ import java.nio.file.ReadOnlyFileSystemException;
  */
 public final class Errno {
 
+	public static final int EPERM = 1;
 	public static final int ENOENT = 2;
 	public static final int EIO = 5;
 	public static final int EACCES = 13;

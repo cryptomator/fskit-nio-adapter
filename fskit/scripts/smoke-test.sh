@@ -388,7 +388,7 @@ scan_log() {
 
 # Prints the names in a directory, without the entries macOS adds to a volume.
 entries() {
-	ls -A "$1" | grep -v -E '^(\._.*|\.fseventsd|\.Trashes)$'
+	ls -A "$1" | grep -v -E '^(\._.*|\.Trashes)$'
 }
 
 checksum() {
@@ -589,6 +589,9 @@ check_parallel() {
 basics() {
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check_basics "$MNT" "$BACKING"
+	# fseventsd looks for .fseventsd/no_log right after the mount. Where the file is missing, it creates .fseventsd and keeps its log in it, which ends up in the backing directory.
+	check "the volume shows .fseventsd/no_log" test -f "$MNT/.fseventsd/no_log"
+	check "the backing directory holds no .fseventsd" test ! -e "$BACKING/.fseventsd"
 	unmount_volume "$SCENARIO" "$MNT"
 }
 
