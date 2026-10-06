@@ -7,11 +7,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Maps node ids to nodes and stored paths to the one node of that entry. Confined to the session's request thread.
@@ -22,6 +25,8 @@ final class NodeTable {
 
 	private final Map<Long, Node> nodesById = new HashMap<>();
 	private final Map<Path, Node> nodesByPath = new HashMap<>();
+	// FSKit sends a SYNC before every FORGET, so a sync that visited every node to find the few with a channel would make an unmount quadratic
+	private final Set<Node> nodesWithChannel = new HashSet<>();
 	private long nextId = Messages.FIRST_ASSIGNED_NODE_ID;
 
 	NodeTable(Path root) {
@@ -43,8 +48,24 @@ final class NodeTable {
 		return nodesByPath.get(storedPath);
 	}
 
-	Collection<Node> all() {
-		return nodesById.values();
+	Collection<Node> withChannel() {
+		return nodesWithChannel;
+	}
+
+	void setChannel(Node node, FileChannel channel, int modes) {
+		node.channel = channel;
+		node.modes = modes;
+		nodesWithChannel.add(node);
+	}
+
+	void closeChannel(Node node) throws IOException {
+		FileChannel closing = node.channel;
+		nodesWithChannel.remove(node);
+		node.channel = null;
+		node.modes = 0;
+		if (closing != null) {
+			closing.close();
+		}
 	}
 
 	/**
@@ -74,7 +95,7 @@ final class NodeTable {
 		Node node = nodesById.get(id);
 		if (node != null && id != Messages.ROOT_NODE_ID) {
 			remove(node);
-			node.closeChannel();
+			closeChannel(node);
 		}
 	}
 
@@ -86,6 +107,7 @@ final class NodeTable {
 		nodesByPath.remove(node.path, node);
 		if (!node.held) {
 			nodesById.remove(node.id);
+			nodesWithChannel.remove(node);
 		}
 	}
 
@@ -114,17 +136,19 @@ final class NodeTable {
 	void clear() {
 		for (Node node : nodesById.values()) {
 			try {
-				node.closeChannel();
+				closeChannel(node);
 			} catch (IOException | RuntimeException e) {
 				FailureLog.warn(LOG, "Failed to close the channel of node " + node.id + ". Data written to it may be lost.", e);
 			}
 		}
 		nodesById.clear();
 		nodesByPath.clear();
+		nodesWithChannel.clear();
 	}
 
 	private void remove(Node node) {
 		nodesById.remove(node.id);
 		nodesByPath.remove(node.path, node);
+		nodesWithChannel.remove(node);
 	}
 }

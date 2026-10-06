@@ -237,7 +237,9 @@ public class FileSystemOperations implements Closeable {
 
 	private ReaddirResponse readdir(ReaddirRequest request) throws IOException {
 		Node directory = linkedDirectory(request.nodeId());
-		DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? snapshots.add(directory.id, list(directory)) : snapshots.get(directory.id, request.verifier());
+		// A listing that starts with attributes gets each entry's type with the attributes its pages read, so the listing itself reads none.
+		// One that starts without them reads every type with the listing. The extension asks again for the entries of a page that FSKit did not take, so reading the types page by page would read many of them twice.
+		DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? snapshots.add(directory.id, list(directory, !request.wantAttributes())) : snapshots.get(directory.id, request.verifier());
 		if (snapshot == null) {
 			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
 		}
@@ -279,8 +281,7 @@ public class FileSystemOperations implements Closeable {
 		snapshots.invalidate(directory.id);
 		Node node = nodes.hold(storedPathOrElse(target), request.type(), directory);
 		if (channel != null) {
-			node.channel = channel;
-			node.modes = Messages.MODE_READ | Messages.MODE_WRITE;
+			nodes.setChannel(node, channel, Messages.MODE_READ | Messages.MODE_WRITE);
 		}
 		Timestamp now = now();
 		Attributes attributes = refreshAfterChange(node, _ -> new Attributes(request.type(), request.mode(), 0, node.id, node.parentId, now, now, now));
@@ -366,7 +367,7 @@ public class FileSystemOperations implements Closeable {
 	private CloseResponse close(CloseRequest request) throws IOException {
 		Node node = nodes.get(request.nodeId());
 		if ((request.keptModes() & (Messages.MODE_READ | Messages.MODE_WRITE)) == 0) {
-			node.closeChannel();
+			nodes.closeChannel(node);
 		}
 		return new CloseResponse(usableBytes());
 	}
@@ -403,13 +404,11 @@ public class FileSystemOperations implements Closeable {
 
 	private SyncResponse sync() throws IOException {
 		IOException firstFailure = null;
-		for (Node node : nodes.all()) {
-			if (node.channel != null) {
-				try {
-					node.channel.force(false);
-				} catch (IOException e) {
-					firstFailure = firstFailure != null ? firstFailure : e;
-				}
+		for (Node node : nodes.withChannel()) {
+			try {
+				node.channel.force(false);
+			} catch (IOException e) {
+				firstFailure = firstFailure != null ? firstFailure : e;
 			}
 		}
 		if (firstFailure != null) {
@@ -564,7 +563,10 @@ public class FileSystemOperations implements Closeable {
 
 	/* listings */
 
-	private List<DirectorySnapshots.Entry> list(Node directory) throws IOException {
+	/**
+	 * @param withTypes Whether to read every entry's type, which takes a read of its attributes
+	 */
+	private List<DirectorySnapshots.Entry> list(Node directory, boolean withTypes) throws IOException {
 		List<DirectorySnapshots.Entry> entries = new ArrayList<>();
 		try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory.path)) {
 			for (Path child : stream) {
@@ -573,7 +575,7 @@ public class FileSystemOperations implements Closeable {
 					continue;
 				}
 				try {
-					entries.add(new DirectorySnapshots.Entry(name, typeOf(readFileAttributes(child))));
+					entries.add(new DirectorySnapshots.Entry(name, withTypes ? typeOf(readFileAttributes(child)) : null));
 				} catch (NoSuchFileException e) {
 					// vanished while listing
 				}
@@ -603,14 +605,14 @@ public class FileSystemOperations implements Closeable {
 			return new DirectoryEntry(entry.name(), entry.type(), self ? directory.id : directory.parentId, nextCookie, null);
 		}
 		Path path = directory.path.resolve(entry.name());
-		if (!wantAttributes) {
+		if (!wantAttributes && entry.type() != null) {
 			return new DirectoryEntry(entry.name(), entry.type(), nodes.list(path, entry.type(), directory).id, nextCookie, null);
 		}
 		try {
 			BasicFileAttributes attributes = readFileAttributes(path);
 			Node node = nodes.list(path, typeOf(attributes), directory);
 			node.attributes = toAttributes(node, attributes);
-			return new DirectoryEntry(entry.name(), node.type, node.id, nextCookie, node.attributes);
+			return new DirectoryEntry(entry.name(), node.type, node.id, nextCookie, wantAttributes ? node.attributes : null);
 		} catch (NoSuchFileException e) {
 			return null;
 		}
@@ -634,8 +636,7 @@ public class FileSystemOperations implements Closeable {
 			// a channel cannot be upgraded in place, so open one with the widened modes and swap it in
 			FileChannel opened = openChannel(node.path, openOptions(widened));
 			FileChannel previous = node.channel;
-			node.channel = opened;
-			node.modes = widened;
+			nodes.setChannel(node, opened, widened);
 			if (previous != null) {
 				previous.close();
 			}

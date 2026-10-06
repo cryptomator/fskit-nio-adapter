@@ -32,6 +32,8 @@ public final class Messages {
 	public static final int ATTRIBUTE_MODIFIED = 8;
 
 	private static final ByteBuffer EMPTY = ByteBuffer.allocate(0).asReadOnlyBuffer();
+	// A control section's length is known only once it is encoded, so it is encoded into a buffer of the maximum length. Each thread reuses its buffer, which spares allocating and zeroing that much for every frame.
+	private static final ThreadLocal<ByteBuffer> CONTROL_SCRATCH = ThreadLocal.withInitial(() -> ByteBuffer.allocate(FrameCodec.MAX_CONTROL_LENGTH));
 
 	private Messages() {
 	}
@@ -117,9 +119,10 @@ public final class Messages {
 	}
 
 	private static Frame frame(Frame.Kind kind, Opcode opcode, long requestId, ControlEncoder encoder, ByteBuffer payload) {
-		ByteBuffer control = ByteBuffer.allocate(FrameCodec.MAX_CONTROL_LENGTH);
-		encoder.encode(control);
-		return new Frame(kind, opcode, requestId, control.flip(), payload);
+		ByteBuffer scratch = CONTROL_SCRATCH.get().clear();
+		encoder.encode(scratch);
+		ByteBuffer control = ByteBuffer.allocate(scratch.position()).put(scratch.flip()).flip();
+		return new Frame(kind, opcode, requestId, control, payload);
 	}
 
 	@FunctionalInterface

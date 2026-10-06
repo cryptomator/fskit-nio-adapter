@@ -4,7 +4,6 @@ import org.cryptomator.frontend.fskit.protocol.Messages.Attributes;
 import org.cryptomator.frontend.fskit.protocol.Messages.NodeType;
 import org.jetbrains.annotations.Nullable;
 
-import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 
@@ -26,6 +25,9 @@ final class Node {
 	boolean held;
 	boolean unlinked;
 	@Nullable Attributes attributes;
+	/**
+	 * Set and closed through {@link NodeTable}, which keeps track of the nodes that have one.
+	 */
 	@Nullable FileChannel channel;
 	/**
 	 * The modes {@link #channel} was opened with.
@@ -37,14 +39,5 @@ final class Node {
 		this.parentId = parentId;
 		this.path = path;
 		this.type = type;
-	}
-
-	void closeChannel() throws IOException {
-		FileChannel closing = channel;
-		channel = null;
-		modes = 0;
-		if (closing != null) {
-			closing.close();
-		}
 	}
 }

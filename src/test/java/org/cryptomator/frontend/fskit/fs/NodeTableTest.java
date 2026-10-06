@@ -80,14 +80,15 @@ public class NodeTableTest {
 	@DisplayName("forgetting removes a node and closes its channel")
 	public void testForget(@TempDir Path tmpDir) throws IOException {
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
-		node.channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
-		FileChannel channel = node.channel;
+		FileChannel channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
+		nodes.setChannel(node, channel, Messages.MODE_WRITE);
 
 		nodes.forget(node.id);
 
 		Assertions.assertFalse(channel.isOpen());
 		Assertions.assertNull(nodes.find(ROOT.resolve("a")));
 		Assertions.assertThrows(StatusException.class, () -> nodes.get(node.id));
+		Assertions.assertTrue(nodes.withChannel().isEmpty());
 	}
 
 	@Test
@@ -195,13 +196,14 @@ public class NodeTableTest {
 	@DisplayName("clearing closes every channel")
 	public void testClear(@TempDir Path tmpDir) throws IOException {
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
-		node.channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
-		FileChannel channel = node.channel;
+		FileChannel channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
+		nodes.setChannel(node, channel, Messages.MODE_WRITE);
 
 		nodes.clear();
 
 		Assertions.assertFalse(channel.isOpen());
-		Assertions.assertTrue(nodes.all().isEmpty());
+		Assertions.assertThrows(StatusException.class, () -> nodes.get(node.id));
+		Assertions.assertTrue(nodes.withChannel().isEmpty());
 	}
 
 	@Test
@@ -210,14 +212,15 @@ public class NodeTableTest {
 		FileChannel failing = Mockito.mock(FileChannel.class);
 		FileChannel other = Mockito.mock(FileChannel.class);
 		Mockito.doThrow(new IOException("disk on fire")).when(failing).close();
-		nodes.hold(ROOT.resolve("a"), NodeType.FILE, root).channel = failing;
-		nodes.hold(ROOT.resolve("b"), NodeType.FILE, root).channel = other;
-		nodes.hold(ROOT.resolve("c"), NodeType.FILE, root).channel = failing;
+		nodes.setChannel(nodes.hold(ROOT.resolve("a"), NodeType.FILE, root), failing, Messages.MODE_WRITE);
+		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), other, Messages.MODE_WRITE);
+		nodes.setChannel(nodes.hold(ROOT.resolve("c"), NodeType.FILE, root), failing, Messages.MODE_WRITE);
 
 		nodes.clear();
 
 		Mockito.verify(failing, Mockito.times(2)).close();
 		Mockito.verify(other).close();
-		Assertions.assertTrue(nodes.all().isEmpty());
+		Assertions.assertThrows(StatusException.class, () -> nodes.get(Messages.ROOT_NODE_ID));
+		Assertions.assertTrue(nodes.withChannel().isEmpty());
 	}
 }

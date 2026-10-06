@@ -17,7 +17,10 @@ final class DirectorySnapshots {
 
 	private static final int MAX_SNAPSHOTS = 16;
 
-	record Entry(String name, NodeType type) {
+	/**
+	 * @param type The entry's type when the listing was taken, or {@code null} if it was not read then
+	 */
+	record Entry(String name, @Nullable NodeType type) {
 	}
 
 	/**

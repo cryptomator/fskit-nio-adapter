@@ -68,6 +68,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
@@ -91,6 +92,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
 @SuppressWarnings("OctalInteger")
@@ -478,6 +480,27 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(List.of("File.txt", "other.txt"), backingNames());
 			Assertions.assertEquals("original", Files.readString(root.resolve("File.txt")));
+		}
+
+		@Test
+		@DisplayName("a case variant found while its directory could not be read is absent once the directory can be read")
+		public void testCaseVariantAfterDirectoryBecomesReadable() throws IOException {
+			Path dir = Files.createDirectory(root.resolve("dir"));
+			Files.writeString(dir.resolve("Entry.txt"), "original");
+			backing("other.txt", "other");
+			long dirId = lookup(ROOT, "dir").nodeId();
+			long other = lookup(ROOT, "other.txt").nodeId();
+			Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("-wx--x--x"));
+			boolean unreadable = !Files.isReadable(dir);
+			Response whileUnreadable = ops.handle(new LookupRequest(dirId, "entry.txt"));
+			Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+			Assumptions.assumeTrue(unreadable, "permissions do not apply to this user");
+			// nothing could tell the stored spelling then, so the variant was found
+			Assertions.assertEquals("entry.txt", Assertions.assertInstanceOf(LookupResponse.class, whileUnreadable).name());
+
+			assertStatus(Errno.ENOENT, new LookupRequest(dirId, "entry.txt"));
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, dirId, "entry.txt"));
+			Assertions.assertEquals("original", Files.readString(dir.resolve("Entry.txt")));
 		}
 	}
 
@@ -1490,6 +1513,48 @@ public class FileSystemOperationsTest {
 			Mockito.doNothing().when(failing).force(false);
 			Assertions.assertTrue(ok(new SyncRequest(), SyncResponse.class).usableBytes() > 0);
 		}
+
+		@Test
+		@DisplayName("sync leaves out the channel of a file that was closed or forgotten")
+		public void testSyncAfterCloseAndForget() throws IOException {
+			backing("other.txt", "");
+			long other = lookup(ROOT, "other.txt").nodeId();
+			FileChannel closed = Mockito.mock(FileChannel.class);
+			FileChannel forgotten = Mockito.mock(FileChannel.class);
+			ops.channelWrapper = _ -> closed;
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			ops.channelWrapper = _ -> forgotten;
+			ok(new OpenRequest(other, WRITE), OpenResponse.class);
+
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			ok(new ForgetRequest(other), ForgetResponse.class);
+			ok(new SyncRequest(), SyncResponse.class);
+
+			Mockito.verify(closed, Mockito.never()).force(false);
+			Mockito.verify(forgotten, Mockito.never()).force(false);
+		}
+
+		@Test
+		@DisplayName("a channel that fails to close is gone all the same, and so is its node when forgotten")
+		public void testSyncAfterFailedCloseAndForget() throws IOException {
+			backing("other.txt", "");
+			long other = lookup(ROOT, "other.txt").nodeId();
+			FileChannel failing = Mockito.mock(FileChannel.class);
+			Mockito.doThrow(new IOException("disk on fire")).when(failing).close();
+			Mockito.when(failing.read(Mockito.any(ByteBuffer.class), Mockito.anyLong())).thenThrow(new ClosedChannelException());
+			ops.channelWrapper = _ -> failing;
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ok(new OpenRequest(other, WRITE), OpenResponse.class);
+			ops.channelWrapper = UnaryOperator.identity();
+
+			assertStatus(Errno.EIO, new CloseRequest(file, 0));
+			assertStatus(Errno.EIO, new ForgetRequest(other));
+
+			ok(new SyncRequest(), SyncResponse.class);
+			Mockito.verify(failing, Mockito.never()).force(false);
+			Assertions.assertEquals("0123", read(file, 0, 4));
+			assertStatus(Errno.ESTALE, new GetattrRequest(other));
+		}
 	}
 
 	@Nested
@@ -2027,6 +2092,37 @@ public class FileSystemOperationsTest {
 			};
 
 			Assertions.assertEquals(List.of(".", "..", "stays.txt"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("a listing that fits into one page reads the attributes of each entry once")
+		@ValueSource(booleans = {false, true})
+		public void testAttributesAreReadOnce(boolean wantAttributes) throws IOException {
+			backing("file.txt", "");
+			Files.createDirectory(root.resolve("dir"));
+			List<Path> read = new ArrayList<>();
+			ops.beforeReadingAttributes = read::add;
+
+			readdir(ROOT, 0, 0, wantAttributes);
+
+			Assertions.assertEquals(Set.of(root.resolve("file.txt"), root.resolve("dir")), Set.copyOf(read));
+			Assertions.assertEquals(2, read.size());
+		}
+
+		@Test
+		@DisplayName("a listing that started with attributes reports each entry's type on a page without them")
+		public void testTypesAfterListingWithAttributes() throws IOException {
+			backing("file.txt", "");
+			Files.createDirectory(root.resolve("dir"));
+			long verifier = readdir(ROOT, 0, 0, true).verifier();
+
+			ReaddirResponse page = readdir(ROOT, 2, verifier, false);
+
+			Assertions.assertEquals(Set.of("file.txt", "dir"), Set.copyOf(names(page)));
+			for (DirectoryEntry entry : page.entries()) {
+				Assertions.assertEquals(lookup(ROOT, entry.name()).type(), entry.type());
+				Assertions.assertNull(entry.attributes());
+			}
 		}
 
 		@ParameterizedTest(name = "wantAttributes = {0}")
