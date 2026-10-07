@@ -15,6 +15,7 @@ final class BridgeVolume: FSVolume {
 	private static let blockSize = 4096
 
 	private let client: BridgeClient
+	private let lister: DirectoryLister
 	private let queue = DispatchQueue(label: "org.cryptomator.fskit.volume")
 	private let registry = ItemRegistry()
 	private let statistics = OSAllocatedUnfairLock(initialState: Statistics())
@@ -22,6 +23,7 @@ final class BridgeVolume: FSVolume {
 
 	init(uuid: UUID, name: String, client: BridgeClient) {
 		self.client = client
+		self.lister = DirectoryLister(client: client)
 		let extensionAttributes = Bundle.main.object(forInfoDictionaryKey: "EXAppExtensionAttributes") as? [String: Any]
 		self.fileSystemTypeName = extensionAttributes?["FSShortName"] as? String ?? ""
 		super.init(volumeID: FSVolume.Identifier(uuid: uuid), volumeName: FSFileName(string: name))
@@ -236,6 +238,10 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
+			// FSKit asks before every reclaim, mostly with nothing to force
+			guard self.client.hasUnsyncedChanges else {
+				return
+			}
 			try self.record(usableBytes: self.client.request(SyncRequest()).usableBytes)
 		}
 	}
@@ -243,7 +249,12 @@ extension BridgeVolume: FSVolume.Handler {
 	func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSLookupItemResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			try self.authorize(context)
-			let response = try self.client.request(LookupRequest(parentId: self.nodeId(directory), name: self.string(name)))
+			let string = try self.string(name)
+			// macOS looks up `._<name>` after every first lookup of an entry. The server answers a hidden name with ENOENT as well, so the request is not sent.
+			if HiddenNames.contains(string) {
+				throw fs_errorForPOSIXError(POSIXError.ENOENT.rawValue)
+			}
+			let response = try self.client.request(LookupRequest(parentId: self.nodeId(directory), name: string))
 			return FSLookupItemResult(foundItem: self.registry.item(for: response.attributes.nodeId), itemName: FSFileName(string: response.name), itemAttributes: self.fsAttributes(response.attributes))
 		}
 	}
@@ -284,8 +295,12 @@ extension BridgeVolume: FSVolume.Handler {
 			if newAttributes.isValid(.mode) {
 				newAttributes.consumedAttributes.insert(.mode)
 			}
+			let item = self.registry.item(for: response.attributes.nodeId)
+			if nodeType == .file {
+				item.openedByCreate = true
+			}
 			return FSCreateItemResult(
-				newItem: self.registry.item(for: response.attributes.nodeId),
+				newItem: item,
 				newItemName: FSFileName(string: response.name),
 				newItemAttributes: self.fsAttributes(response.attributes),
 				directoryAttributes: self.fsAttributes(response.directoryAttributes),
@@ -374,27 +389,14 @@ extension BridgeVolume: FSVolume.Handler {
 	func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext, replyHandler reply: @escaping (FSEnumerateDirectoryResult?, (any Error)?) -> Void) {
 		serve(reply) {
 			try self.authorize(context)
-			var cookie = cookie.rawValue
-			var verifier = verifier.rawValue
-			var morePages = true
-			while morePages {
-				let page = try self.client.request(ReaddirRequest(nodeId: self.nodeId(directory), cookie: cookie, verifier: verifier, wantAttributes: attributes != nil))
-				verifier = page.verifier
-				morePages = page.more && !page.entries.isEmpty
-				for entry in page.entries {
-					let packed = packer.packEntry(
-						name: FSFileName(string: entry.name),
-						itemType: self.itemType(entry.type),
-						itemID: FSItem.Identifier(entry.nodeId),
-						nextCookie: FSDirectoryCookie(entry.nextCookie),
-						attributes: entry.attributes.map { self.fsAttributes($0) }
-					)
-					guard packed else {
-						morePages = false
-						break
-					}
-					cookie = entry.nextCookie
-				}
+			let verifier = try self.lister.list(directory: self.nodeId(directory), cookie: cookie.rawValue, verifier: verifier.rawValue, wantAttributes: attributes != nil) { entry in
+				packer.packEntry(
+					name: FSFileName(string: entry.name),
+					itemType: self.itemType(entry.type),
+					itemID: FSItem.Identifier(entry.nodeId),
+					nextCookie: FSDirectoryCookie(entry.nextCookie),
+					attributes: entry.attributes.map { self.fsAttributes($0) }
+				)
 			}
 			return FSEnumerateDirectoryResult(verifier: verifier)
 		}
@@ -417,6 +419,9 @@ extension BridgeVolume: FSVolume.OpenCloseHandler {
 	func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
 			try self.authorize(context)
+			if (item as? BridgeItem)?.openedByCreate == true {
+				return
+			}
 			_ = try self.client.request(OpenRequest(nodeId: self.nodeId(item), modes: self.modes(modes)))
 		}
 	}
@@ -424,7 +429,11 @@ extension BridgeVolume: FSVolume.OpenCloseHandler {
 	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
 		serve(reply) {
 			// no caller is refused here: a close that does not reach the server leaves its channel open
-			try self.record(usableBytes: self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: self.modes(modes))).usableBytes)
+			let keptModes = self.modes(modes)
+			if keptModes == 0 {
+				(item as? BridgeItem)?.openedByCreate = false
+			}
+			try self.record(usableBytes: self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: keptModes)).usableBytes)
 		}
 	}
 }

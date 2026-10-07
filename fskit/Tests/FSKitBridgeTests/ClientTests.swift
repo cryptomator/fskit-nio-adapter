@@ -124,6 +124,78 @@ struct BridgeClientTests {
 		}
 	}
 
+	/// A successful response to each request `send(_:through:)` makes.
+	private static func success(for frame: Frame) -> Frame {
+		let attributes = attributes(size: 0)
+		return switch frame.opcode {
+		case .write: Messages.frame(for: WriteResponse(written: 1, attributes: attributes, usableBytes: 1), opcode: .write, requestId: frame.requestId)
+		case .setattr: Messages.frame(for: SetattrResponse(applied: Messages.attributeSize, attributes: attributes, usableBytes: 1), opcode: .setattr, requestId: frame.requestId)
+		case .create: Messages.frame(for: CreateResponse(attributes: attributes, name: "new", directoryAttributes: attributes, usableBytes: 1), opcode: .create, requestId: frame.requestId)
+		case .getattr: Messages.frame(for: GetattrResponse(attributes: attributes), opcode: .getattr, requestId: frame.requestId)
+		case .remove: Messages.frame(for: RemoveResponse(attributes: attributes, directoryAttributes: attributes, usableBytes: 1), opcode: .remove, requestId: frame.requestId)
+		default: Messages.frame(for: SyncResponse(usableBytes: 1), opcode: frame.opcode, requestId: frame.requestId)
+		}
+	}
+
+	private static func send(_ opcode: Opcode, through client: BridgeClient) throws {
+		switch opcode {
+		case .write: _ = try client.request(WriteRequest(nodeId: file, offset: 0, data: Data([1])))
+		case .setattr: _ = try client.request(SetattrRequest(nodeId: file, valid: Messages.attributeSize, size: 0, mode: 0, accessed: time, modified: time))
+		case .create: _ = try client.request(CreateRequest(parentId: Messages.rootNodeId, name: "new", type: .file, mode: 0o644))
+		case .getattr: _ = try client.request(GetattrRequest(nodeId: file))
+		case .remove: _ = try client.request(RemoveRequest(nodeId: file, parentId: Messages.rootNodeId))
+		default: _ = try client.request(SyncRequest())
+		}
+	}
+
+	@Test func aNewClientHasNoUnsyncedChanges() throws {
+		let server = try ScriptedServer { Self.success(for: $0) }
+		let client = try BridgeClient(manifest: server.manifest)
+
+		#expect(!client.hasUnsyncedChanges)
+	}
+
+	@Test(arguments: [Opcode.write, .setattr, .create], [true, false])
+	func aRequestThatMayLeaveDataInAChannelLeavesUnsyncedChangesWhateverItsOutcome(opcode: Opcode, succeeds: Bool) throws {
+		let server = try ScriptedServer { frame in
+			succeeds ? Self.success(for: frame) : Messages.frame(forFailure: ENOSPC, opcode: frame.opcode, requestId: frame.requestId)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+
+		_ = try? Self.send(opcode, through: client)
+
+		#expect(client.hasUnsyncedChanges)
+	}
+
+	@Test(arguments: [Opcode.getattr, .remove])
+	func anotherRequestLeavesNone(opcode: Opcode) throws {
+		let server = try ScriptedServer { Self.success(for: $0) }
+		let client = try BridgeClient(manifest: server.manifest)
+
+		try Self.send(opcode, through: client)
+
+		#expect(!client.hasUnsyncedChanges)
+	}
+
+	@Test func aSuccessfulSyncClearsUnsyncedChangesAndAFailedOneDoesNot() throws {
+		let syncs = OSAllocatedUnfairLock(initialState: 0)
+		let server = try ScriptedServer { frame in
+			guard frame.opcode == .sync, syncs.withLock({ $0 += 1; return $0 }) == 1 else {
+				return Self.success(for: frame)
+			}
+			return Messages.frame(forFailure: EIO, opcode: .sync, requestId: frame.requestId)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+		try Self.send(.write, through: client)
+
+		#expect(throws: StatusError(status: EIO)) {
+			try client.request(SyncRequest())
+		}
+		#expect(client.hasUnsyncedChanges)
+		_ = try client.request(SyncRequest())
+		#expect(!client.hasUnsyncedChanges)
+	}
+
 	@Test func splitsAWriteByThePayloadLimit() throws {
 		let content = Data(testContentOfLength: 2 * FrameCodec.maxPayloadLength + 5)
 		let stored = OSAllocatedUnfairLock(initialState: Data())

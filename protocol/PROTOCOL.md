@@ -98,10 +98,12 @@ Notes:
 - `CLOSE`: `keptModes` are the modes that stay open. With none kept, the server closes the item's channel.
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.
-- `SYNC` forces every open channel.
+- `SYNC` forces every open channel. Only `WRITE`, `SETATTR` and `CREATE` leave data in a channel for it to force, so a client that has sent none of them since its last successful `SYNC` may answer a sync itself.
 - `READLINK` replies with the target of a symbolic link as the backing file system returns it. An item that is no symbolic link is answered with `EINVAL` (22). A target of more than 1023 bytes, the longest macOS passes on, is answered with `ENAMETOOLONG` (63).
 - `SYMLINK`: the server stores `target` in the form a path of the backing file system gives it, which may drop a trailing slash or change the Unicode normalization. It neither resolves the target nor checks that it exists, and it applies no mode. An existing `name` is answered with `EEXIST` (17). A target that takes more than 1023 bytes in that form is answered with `ENAMETOOLONG` (63).
 - The root directory holds a directory `.fseventsd` (id 3) with an empty file `no_log` (id 4) in it, which keeps macOS from storing a log of file system events on the volume. The server stores neither, leaves the directory out of the root's listing, and passes no request on to an entry of that name in the backing file system. A `CREATE` or `SYMLINK` of `.fseventsd` in the root is answered with `EEXIST` (17). A request that would change either item, create an item in the directory, open one for writing, or move an item onto or into the directory is answered with `EPERM` (1). The directory's listing never changes and always has the same verifier.
+- The names `.DS_Store` and every name longer than `._` that starts with `._`, compared exactly, are hidden. A `LOOKUP` of such a name is answered with `ENOENT` (2) whatever the parent, so a client may answer it itself. Listings leave such names out. A `CREATE` or `SYMLINK` of such a name, and a `RENAME` onto one, is answered with `EPERM` (1).
+- A directory whose entries are all hidden, and none of them a directory, counts as empty: a `REMOVE` of it, or a `RENAME` of a directory onto it, deletes those entries first. Such a request for a directory that holds anything else, or a hidden directory, is answered with `ENOTEMPTY` (66), and the server deletes nothing. A backing file system whose own `rmdir` deletes `._` files may have deleted them all the same, as macOS does on its own disks for a directory that holds nothing but `._` names.
 
 ### Directory listings
 

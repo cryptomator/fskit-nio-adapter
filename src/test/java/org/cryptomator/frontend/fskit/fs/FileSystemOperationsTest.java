@@ -162,7 +162,11 @@ public class FileSystemOperationsTest {
 	}
 
 	private List<String> backingNames() throws IOException {
-		try (Stream<Path> children = Files.list(root)) {
+		return backingNames(root);
+	}
+
+	private static List<String> backingNames(Path directory) throws IOException {
+		try (Stream<Path> children = Files.list(directory)) {
 			return children.map(child -> child.getFileName().toString()).sorted().toList();
 		}
 	}
@@ -1115,6 +1119,70 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals("content", read(lookup(source, "child.txt").nodeId(), 0, 100));
+		}
+
+		@Test
+		@DisplayName("a directory replaces a directory that holds only hidden files")
+		public void testRenameOverDirectoryWithHiddenFiles() throws IOException {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			Files.writeString(vault.getPath("/source/content.txt"), "content");
+			create(ROOT, "target", NodeType.DIRECTORY);
+			Files.writeString(vault.getPath("/target/._a"), "");
+
+			ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals(List.of("content.txt"), backingNames(vault.getPath("/target")));
+		}
+
+		@Test
+		@DisplayName("removing a directory that holds only hidden files removes them with it")
+		public void testRemoveDirectoryWithHiddenFiles() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			Files.writeString(vault.getPath("/dir/._a"), "");
+			Files.writeString(vault.getPath("/dir/.DS_Store"), "");
+
+			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(), backingNames(vault.getPath("/")));
+		}
+
+		@Test
+		@DisplayName("removing a directory that also holds a visible entry yields ENOTEMPTY and deletes nothing")
+		public void testRemoveDirectoryWithVisibleEntry() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			Files.writeString(vault.getPath("/dir/._a"), "");
+			Files.writeString(vault.getPath("/dir/visible.txt"), "");
+
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+
+			Assertions.assertEquals(List.of("._a", "visible.txt"), backingNames(vault.getPath("/dir")));
+		}
+
+		@Test
+		@DisplayName("removing a directory that holds a hidden directory yields ENOTEMPTY and deletes nothing")
+		public void testRemoveDirectoryWithHiddenDirectory() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			Files.writeString(vault.getPath("/dir/.DS_Store"), "");
+			Files.createDirectory(vault.getPath("/dir/._d"));
+
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+
+			Assertions.assertEquals(List.of(".DS_Store", "._d"), backingNames(vault.getPath("/dir")));
+		}
+
+		@Test
+		@DisplayName("a file does not replace a directory that holds only hidden files, which keeps them")
+		public void testRenameFileOverDirectoryWithHiddenFiles() throws IOException {
+			long file = createFile("file.txt", "content");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			create(ROOT, "target", NodeType.DIRECTORY);
+			Files.writeString(vault.getPath("/target/.DS_Store"), "");
+
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, ROOT, "target"));
+
+			Assertions.assertEquals(List.of(".", "..", "file.txt", "target"), names(readdir(ROOT, 0, 0, false)).stream().sorted().toList());
+			Assertions.assertEquals(List.of(".DS_Store"), backingNames(vault.getPath("/target")));
 		}
 
 		@Test
@@ -2680,6 +2748,146 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 			Assertions.assertEquals(file, getattr(file.nodeId()));
 			Assertions.assertEquals(directory, getattr(directory.nodeId()));
+		}
+	}
+
+	@Nested
+	@DisplayName("AppleDouble and .DS_Store names")
+	public class HiddenEntries {
+
+		@Test
+		@DisplayName("lookup of a hidden name that the backing directory holds yields ENOENT")
+		public void testLookup() throws IOException {
+			backing("._a", "companion");
+			backing(".DS_Store", "settings");
+
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "._a"));
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, ".DS_Store"));
+		}
+
+		@Test
+		@DisplayName("lookup of a hidden name in a removed directory or in a file yields ENOENT")
+		public void testLookupWhereNoEntryCanBe() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			assertStatus(Errno.ENOENT, new LookupRequest(directory, "._a"));
+			assertStatus(Errno.ENOENT, new LookupRequest(file, ".DS_Store"));
+		}
+
+		@Test
+		@DisplayName("._ and .ds_store are names like any other")
+		public void testNamesThatAreNotHidden() throws IOException {
+			backing("._", "");
+			backing(".ds_store", "");
+
+			lookup(ROOT, "._");
+			lookup(ROOT, ".ds_store");
+			Assertions.assertEquals(Set.of("._", ".ds_store"), Set.copyOf(names(readdir(ROOT, 0, 0, true))));
+		}
+
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("listings leave hidden names out")
+		@ValueSource(booleans = {false, true})
+		public void testListing(boolean wantAttributes) throws IOException {
+			backing("._a", "");
+			backing(".DS_Store", "");
+			backing("visible.txt", "");
+
+			Assertions.assertEquals(wantAttributes ? List.of("visible.txt") : List.of(".", "..", "visible.txt"), names(readdir(ROOT, 0, 0, wantAttributes)));
+		}
+
+		@Test
+		@DisplayName("creating a file, a directory or a link under a hidden name yields EPERM and creates nothing")
+		public void testCreate() throws IOException {
+			assertStatus(Errno.EPERM, new CreateRequest(ROOT, "._a", NodeType.FILE, 0644));
+			assertStatus(Errno.EPERM, new CreateRequest(ROOT, ".DS_Store", NodeType.FILE, 0644));
+			assertStatus(Errno.EPERM, new CreateRequest(ROOT, "._d", NodeType.DIRECTORY, 0755));
+			assertStatus(Errno.EPERM, new SymlinkRequest(ROOT, "._l", "target"));
+
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("renaming onto a hidden name yields EPERM and moves nothing")
+		public void testRenameOnto() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, ROOT, "._file.txt"));
+			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, ROOT, ".DS_Store"));
+
+			Assertions.assertEquals(List.of("file.txt"), backingNames());
+		}
+
+		@Test
+		@DisplayName("removing a directory that holds only hidden files removes them with it")
+		public void testRemoveDirectory() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			backing("dir/._a", "");
+			backing("dir/.DS_Store", "");
+
+			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("removing a directory that also holds a visible entry yields ENOTEMPTY and deletes nothing")
+		public void testRemoveDirectoryWithVisibleEntry() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			backing("dir/._a", "");
+			backing("dir/visible.txt", "");
+
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+
+			Assertions.assertEquals(List.of("._a", "visible.txt"), backingNames(root.resolve("dir")));
+		}
+
+		@Test
+		@DisplayName("removing a directory that holds a hidden directory yields ENOTEMPTY and deletes nothing")
+		public void testRemoveDirectoryWithHiddenDirectory() throws IOException {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			// not a ._ file: macOS's rmdir deletes those of a directory that holds nothing else before it finds that one of them is a directory
+			backing("dir/.DS_Store", "");
+			Files.createDirectory(root.resolve("dir/._d"));
+
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+
+			Assertions.assertEquals(List.of(".DS_Store", "._d"), backingNames(root.resolve("dir")));
+		}
+
+		@Test
+		@DisplayName("a directory replaces a directory that holds only hidden files")
+		public void testRenameOverDirectory() throws IOException {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			backing("source/content.txt", "content");
+			Attributes target = create(ROOT, "target", NodeType.DIRECTORY);
+			// not a ._ file, which macOS's rmdir would delete by itself
+			backing("target/.DS_Store", "");
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+
+			Assertions.assertEquals(target.nodeId(), response.replacedAttributes().nodeId());
+			Assertions.assertEquals(List.of("target"), backingNames());
+			Assertions.assertEquals(List.of("content.txt"), backingNames(root.resolve("target")));
+		}
+
+		@Test
+		@DisplayName("a file does not replace a directory that holds only hidden files, which keeps them")
+		public void testRenameFileOverDirectory() throws IOException {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			create(ROOT, "target", NodeType.DIRECTORY);
+			// not a ._ file, which macOS's rmdir would delete by itself
+			backing("target/.DS_Store", "");
+
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, ROOT, "target"));
+
+			Assertions.assertEquals(List.of("file.txt", "target"), backingNames());
+			Assertions.assertEquals(List.of(".DS_Store"), backingNames(root.resolve("target")));
 		}
 	}
 

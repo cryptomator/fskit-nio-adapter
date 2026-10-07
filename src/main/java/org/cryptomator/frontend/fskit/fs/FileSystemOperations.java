@@ -54,6 +54,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
@@ -160,6 +161,10 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	private LookupResponse lookup(LookupRequest request) throws IOException {
+		// ahead of every check of the parent, since the extension answers the same without asking
+		if (HiddenNames.contains(request.name())) {
+			throw new StatusException(Errno.ENOENT);
+		}
 		Node directory = linkedDirectory(request.parentId());
 		Child child = findChild(directory, request.name());
 		if (child == null || !child.sameName()) {
@@ -237,8 +242,7 @@ public class FileSystemOperations implements Closeable {
 
 	private ReaddirResponse readdir(ReaddirRequest request) throws IOException {
 		Node directory = linkedDirectory(request.nodeId());
-		// A listing that starts with attributes gets each entry's type with the attributes its pages read, so the listing itself reads none.
-		// One that starts without them reads every type with the listing. The extension asks again for the entries of a page that FSKit did not take, so reading the types page by page would read many of them twice.
+		// A listing that starts with attributes gets each entry's type with the attributes its pages read, so only one that starts without them reads the types with the listing.
 		DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? snapshots.add(directory.id, list(directory, !request.wantAttributes())) : snapshots.get(directory.id, request.verifier());
 		if (snapshot == null) {
 			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
@@ -263,7 +267,7 @@ public class FileSystemOperations implements Closeable {
 	private CreateResponse create(CreateRequest request) throws IOException {
 		assertWritable();
 		Node directory = linkedDirectory(request.parentId());
-		checkName(request.name());
+		checkNewName(request.name());
 		Path target = directory.path.resolve(compose(request.name()));
 		Set<PosixFilePermission> permissions = FileAttributesUtil.octalModeToPosixPermissions(request.mode());
 		FileAttribute<?>[] initialPermissions = posix ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(permissions)} : new FileAttribute<?>[0];
@@ -302,7 +306,12 @@ public class FileSystemOperations implements Closeable {
 		Node node = linked(request.nodeId());
 		Node directory = linkedDirectory(request.parentId());
 		Attributes attributes = refresh(node);
-		Files.delete(node.path);
+		try {
+			Files.delete(node.path);
+		} catch (DirectoryNotEmptyException e) {
+			deleteHiddenEntries(node.path);
+			Files.delete(node.path);
+		}
 		nodes.unlink(node);
 		snapshots.invalidate(directory.id);
 		return new RemoveResponse(attributes, refreshAfterChange(directory, UnaryOperator.identity()), usableBytes());
@@ -317,6 +326,7 @@ public class FileSystemOperations implements Closeable {
 			// A directory cannot move into itself or below itself. The kernel forwards such a request, and cryptofs carries it out, which detaches the directory and everything in it.
 			throw new StatusException(Errno.EINVAL);
 		}
+		checkNewName(request.destinationName());
 		Child existing = findChild(destinationDirectory, request.destinationName());
 		// the entry this rename would replace. The renamed entry itself, found under another spelling, does not count.
 		Child other = existing != null && !existing.path().equals(node.path) ? existing : null;
@@ -339,7 +349,16 @@ public class FileSystemOperations implements Closeable {
 				move(node.path, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 			} else {
 				// cryptofs cannot replace a directory or a link in one step
-				move(node.path, target, StandardCopyOption.REPLACE_EXISTING);
+				try {
+					move(node.path, target, StandardCopyOption.REPLACE_EXISTING);
+				} catch (DirectoryNotEmptyException e) {
+					if (node.type != NodeType.DIRECTORY) {
+						throw e;
+					}
+					// a directory that holds only hidden files looks empty, and an empty one may be replaced
+					deleteHiddenEntries(target);
+					move(node.path, target, StandardCopyOption.REPLACE_EXISTING);
+				}
 			}
 		} catch (FileAlreadyExistsException e) {
 			// the backing file system refuses to replace the target although asked to, as cryptofs does for a file that is open
@@ -431,7 +450,7 @@ public class FileSystemOperations implements Closeable {
 	private SymlinkResponse symlink(SymlinkRequest request) throws IOException {
 		assertWritable();
 		Node directory = linkedDirectory(request.parentId());
-		checkName(request.name());
+		checkNewName(request.name());
 		Path link = directory.path.resolve(compose(request.name()));
 		Path target = link.getFileSystem().getPath(request.target());
 		// checked as the backing file system spells it, since a vault's normalization can lengthen a target
@@ -517,6 +536,13 @@ public class FileSystemOperations implements Closeable {
 		}
 	}
 
+	private static void checkNewName(String name) throws StatusException {
+		checkName(name);
+		if (HiddenNames.contains(name)) {
+			throw new StatusException(Errno.EPERM);
+		}
+	}
+
 	private static String compose(String name) {
 		return Normalizer.normalize(name, Normalizer.Form.NFC);
 	}
@@ -571,7 +597,7 @@ public class FileSystemOperations implements Closeable {
 		try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory.path)) {
 			for (Path child : stream) {
 				String name = child.getFileName().toString();
-				if (EventLogOptOut.takes(directory.id, name)) {
+				if (EventLogOptOut.takes(directory.id, name) || HiddenNames.contains(name)) {
 					continue;
 				}
 				try {
@@ -584,6 +610,28 @@ public class FileSystemOperations implements Closeable {
 			throw e.getCause();
 		}
 		return entries;
+	}
+
+	/**
+	 * Deletes the entries of a directory that holds nothing but hidden files, which looks empty to the caller.
+	 *
+	 * @throws DirectoryNotEmptyException If the directory holds a visible entry or a hidden directory. Nothing is deleted then.
+	 */
+	private void deleteHiddenEntries(Path directory) throws IOException {
+		List<Path> hidden = new ArrayList<>();
+		try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+			for (Path child : stream) {
+				if (!HiddenNames.contains(child.getFileName().toString()) || readFileAttributes(child).isDirectory()) {
+					throw new DirectoryNotEmptyException(directory.toString());
+				}
+				hidden.add(child);
+			}
+		} catch (DirectoryIteratorException e) {
+			throw e.getCause();
+		}
+		for (Path child : hidden) {
+			Files.delete(child);
+		}
 	}
 
 	/**

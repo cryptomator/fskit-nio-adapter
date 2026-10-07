@@ -3,7 +3,7 @@ import os
 
 /// Connects to the server of one mount and exchanges one request for one response at a time.
 ///
-/// Calls block the calling thread and must not overlap; the extension makes them from the volume's serial queue.
+/// Calls block the calling thread and must not overlap; the extension makes them from the volume's serial queue. `hasUnsyncedChanges` and `nextRequestId` rely on that.
 public final class BridgeClient {
 	private let logger = Logger(subsystem: "org.cryptomator.fskit", category: "BridgeClient")
 	/// Why the connection was lost, for the log.
@@ -14,7 +14,13 @@ public final class BridgeClient {
 	}
 
 	private var descriptor: Int32
-	private var nextRequestId: UInt64 = 1
+	/// Raised for every request sent, also for each part of a split read or write, so a value that has not changed means that nothing was sent in between.
+	public private(set) var nextRequestId: UInt64 = 1
+
+	/// Whether a `WRITE`, `SETATTR` or `CREATE` was sent since the last `SYNC` that succeeded. Only these leave data in a channel of the server that a `SYNC` forces, see `protocol/PROTOCOL.md`.
+	///
+	/// One flag suffices because calls do not overlap, so nothing can be sent between a `SYNC` and its response.
+	public private(set) var hasUnsyncedChanges = false
 
 	/// Connects to the loopback port named in the manifest and performs the handshake.
 	public init(manifest: Manifest) throws {
@@ -63,13 +69,20 @@ public final class BridgeClient {
 	public func request<R: Request>(_ request: R) throws -> R.Response {
 		let requestId = nextRequestId
 		nextRequestId += 1
+		if R.opcode == .write || R.opcode == .setattr || R.opcode == .create {
+			hasUnsyncedChanges = true
+		}
 		do {
 			try send(FrameCodec.encode(Messages.frame(for: request, requestId: requestId)))
 			let frame = try FrameCodec.decode(readingFrom: receive)
 			guard frame.kind == .response, frame.opcode == R.opcode, frame.requestId == requestId else {
 				throw ProtocolError("Response does not match request \(requestId)")
 			}
-			return try Messages.decodeResponse(from: frame)
+			let response: R.Response = try Messages.decodeResponse(from: frame)
+			if R.opcode == .sync {
+				hasUnsyncedChanges = false
+			}
+			return response
 		} catch let status as StatusError {
 			throw status
 		} catch {

@@ -472,6 +472,47 @@ move_with_open_file() {
 	/usr/bin/perl -e 'open(my $file, ">", "$ARGV[0]/open.txt") or die "open: $!"; syswrite($file, "before") or die "write: $!"; rename($ARGV[0], $ARGV[1]) or die "rename: $!"; syswrite($file, " and after") or die "write: $!"; close($file) or die "close: $!"' "$1" "$2"
 }
 
+# rename_onto <source> <target>: renames with rename(2), which replaces an existing directory. mv would move the source into it.
+rename_onto() {
+	/usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die "rename: $!\n"' "$1" "$2"
+}
+
+# lists_backing_names <directory on the volume> <backing directory> [-l]: ls on the volume, with -l if given, names exactly the entries of the backing directory, and neither ls fails
+lists_backing_names() {
+	local backing mounted
+	backing="$(ls "$2")" || return 1
+	if [[ "${3:-}" == -l ]]; then
+		mounted="$(ls -l "$1")" || return 1
+		mounted="$(print -r -- "$mounted" | awk 'NR > 1 { print $NF }')"
+	else
+		mounted="$(ls "$1")" || return 1
+	fi
+	[[ "$mounted" == "$backing" ]]
+}
+
+# requests_between <first name> <second name> <start of a request>: counts the requests that the program's log shows between the lookups of the two names and that start with the third argument, such as "SyncRequest[". BridgeSession traces every request it serves. Prints nothing unless the log shows both lookups.
+requests_between() {
+	LC_ALL=C awk -v from="name=$1]" -v to="name=$2]" -v kind="BridgeSession - $3" '
+		!index($0, "BridgeSession - ") { next }
+		index($0, from) { opened = 1; inside = 1; next }
+		opened && index($0, to) { closed = 1; inside = 0 }
+		inside && index($0, kind) { count++ }
+		END { if (opened && closed) print count + 0 }
+	' "$PROGRAM_LOG"
+}
+
+# node_of <name> <requests>: prints the node id that the last reply to one of the requests gave the item of that name in the program's log. <requests> is an alternation such as Create|Lookup.
+node_of() {
+	LC_ALL=C sed -n -E "s/.*BridgeSession - ($2)Request\\[[^]]*name=$1[],].*-> ($2)Response\\[attributes=Attributes\\[[^]]*nodeId=([0-9]+),.*/\\3/p" "$PROGRAM_LOG" | tail -n 1
+}
+
+# sync_and_reopen <directory>: creates a file, writes to it, syncs it twice and closes it in one process, then reads it with cat. Looks up the missing names mark-1 to mark-6 between and around these steps, which marks them in the program's log.
+sync_and_reopen() {
+	/usr/bin/perl -e 'use IO::Handle; use Fcntl; my $d = $ARGV[0]; lstat("$d/mark-1"); sysopen(my $file, "$d/reopened.txt", O_WRONLY | O_CREAT | O_EXCL, 0644) or die "open: $!"; syswrite($file, "data") or die "write: $!"; lstat("$d/mark-2"); $file->sync or die "fsync: $!"; lstat("$d/mark-3"); $file->sync or die "fsync: $!"; lstat("$d/mark-4"); close($file) or die "close: $!"; lstat("$d/mark-5")' "$1" || return 1
+	cat "$1/reopened.txt" > /dev/null || return 1
+	/usr/bin/perl -e 'lstat($ARGV[0])' "$1/mark-6"
+}
+
 write_and_fsync() {
 	/usr/bin/perl -e 'use IO::Handle; open(my $file, ">", $ARGV[0]) or die "open: $!"; syswrite($file, "synced") or die "write: $!"; $file->sync or die "fsync: $!"; close($file) or die "close: $!"' "$1"
 }
@@ -662,6 +703,19 @@ io() {
 	check "that copy is intact" test "$(checksum < "$BACKING/dd.bin")" = "$expected"
 	check "fsync on a written file succeeds" write_and_fsync "$MNT/synced.txt"
 	check "the synced file holds what was written" test "$(cat "$BACKING/synced.txt")" = synced
+	# the extension answers two requests itself: an open of a file it created, and a sync with nothing written since the last one
+	check "a file is created, written, synced twice, closed and read" sync_and_reopen "$MNT"
+	# once the program has replied, the log holds every request served before
+	request sync "$SCENARIO"
+	# a reclaim between the close and cat would give the file a new node
+	local created="$(node_of reopened.txt Create)" reopened="$(node_of reopened.txt 'Create|Lookup')"
+	check "the program's log shows the file created" test -n "$created"
+	# counted for the file alone, since macOS opens the root now and then
+	check "the open after creating the file does not reach the server" test "$(requests_between mark-1 mark-5 "OpenRequest[nodeId=$created,")" = 0
+	# from the create on, since a sync FSKit asks for before a reclaim may come before the first fsync
+	check "a sync after creating and writing the file reaches the server" test "$(requests_between mark-1 mark-3 'SyncRequest[')" -ge 1
+	check "the second sync, with nothing written since, does not" test "$(requests_between mark-3 mark-4 'SyncRequest[')" = 0
+	check "cat after the close opens the file on the server" test "$(requests_between mark-5 mark-6 "OpenRequest[nodeId=$reopened,")" -ge 1
 	check "df shows the backing store's free space after the copies" shows_space_of "$MNT" "$BACKING"
 	unmount_volume "$SCENARIO" "$MNT"
 }
@@ -670,9 +724,9 @@ io() {
 listing() {
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check "5,000 files are created in one directory" create_files "$MNT/many" 5000
-	check "ls lists all of them" test "$(ls "$MNT/many" | wc -l)" -eq 5000
-	check "ls -l succeeds" ls -l "$MNT/many"
 	check "the backing directory holds all of them" test "$(ls "$BACKING/many" | wc -l)" -eq 5000
+	check "ls lists each of them once" lists_backing_names "$MNT/many" "$BACKING/many"
+	check "ls -l lists each of them once" lists_backing_names "$MNT/many" "$BACKING/many" -l
 	check "rm -r removes the directory" rm -r "$MNT/many"
 	check "the backing directory holds it no longer" test ! -e "$BACKING/many"
 	unmount_volume "$SCENARIO" "$MNT"
@@ -743,16 +797,43 @@ names() {
 	local o_decomposed=$'o\xcc\x88.txt' o_composed=$'\xc3\xb6.txt'
 	echo fixture > "$BACKING/$u_decomposed"
 	echo cased > "$BACKING/File.txt"
+	mkdir -p "$BACKING/hidden/emptied" "$BACKING/hidden/src" "$BACKING/hidden/dst" "$BACKING/hidden/kept"
+	: > "$BACKING/hidden/._hidden"
+	: > "$BACKING/hidden/.DS_Store"
+	: > "$BACKING/hidden/visible"
+	: > "$BACKING/hidden/emptied/._x"
+	: > "$BACKING/hidden/emptied/.DS_Store"
+	: > "$BACKING/hidden/src/content"
+	# no ._ file: rmdir on the backing disk deletes those of a directory that holds nothing else, so the rename would succeed without the server's cleanup
+	: > "$BACKING/hidden/dst/.DS_Store"
+	: > "$BACKING/hidden/kept/._x"
+	: > "$BACKING/hidden/kept/.DS_Store"
+	: > "$BACKING/hidden/kept/keep"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check "a file is created under a composed name" echo_to composed "$MNT/$a_composed"
 	check "it is found under the decomposed name" test "$(cat "$MNT/$a_decomposed")" = composed
 	check "a file is created under a decomposed name" echo_to decomposed "$MNT/$o_decomposed"
 	check "it is found under the composed name" test "$(cat "$MNT/$o_composed")" = decomposed
 	check "the backing directory stores it composed" test "$(entries "$BACKING" | LC_ALL=C grep -c -x -F -e "$o_composed")" -eq 1
-	check "each is one file there" test "$(entries "$BACKING" | wc -l)" -eq 4
+	check "each is one file there" test "$(entries "$BACKING" | wc -l)" -eq 5
 	check "a name stored decomposed is listed" test "$(ls "$MNT" | LC_ALL=C grep -c -x -F -e "$u_decomposed")" -eq 1
 	check "it opens" test "$(cat "$MNT/$u_decomposed")" = fixture
 	check_fails "a name that differs in case is absent" "No such file or directory" cat "$MNT/file.txt"
+	check "ls -A leaves ._hidden and .DS_Store out" test "$(entries "$MNT/hidden" | LC_ALL=C sort)" = $'dst\nemptied\nkept\nsrc\nvisible'
+	check_fails "stat finds no ._hidden" "No such file or directory" stat "$MNT/hidden/._hidden"
+	check_fails "stat finds no .DS_Store" "No such file or directory" stat "$MNT/hidden/.DS_Store"
+	check_fails "touch cannot create ._new" "Operation not permitted" touch "$MNT/hidden/._new"
+	check_fails "mkdir cannot create ._new" "Operation not permitted" mkdir "$MNT/hidden/._new"
+	check_fails "ln -s cannot create ._new" "Operation not permitted" ln -s visible "$MNT/hidden/._new"
+	check_fails "mv cannot rename a file to ._moved" "Operation not permitted" mv "$MNT/hidden/visible" "$MNT/hidden/._moved"
+	check "the backing directory holds no new entry" test "$(entries "$BACKING/hidden" | LC_ALL=C sort)" = $'.DS_Store\n._hidden\ndst\nemptied\nkept\nsrc\nvisible'
+	check "rmdir removes a directory that holds only ._x and .DS_Store" rmdir "$MNT/hidden/emptied"
+	check "the backing directory holds it no longer" test ! -e "$BACKING/hidden/emptied"
+	check "rename(2) replaces a directory that holds only .DS_Store" rename_onto "$MNT/hidden/src" "$MNT/hidden/dst"
+	check "the backing directory holds the moved content in its place" test "$(entries "$BACKING/hidden/dst")" = content
+	check "and no source directory" test ! -e "$BACKING/hidden/src"
+	check_fails "rmdir of a directory that also holds a visible file fails" "Directory not empty" rmdir "$MNT/hidden/kept"
+	check "its hidden files remain in the backing directory" test "$(entries "$BACKING/hidden/kept" | LC_ALL=C sort)" = $'.DS_Store\n._x\nkeep'
 	unmount_volume "$SCENARIO" "$MNT"
 }
 

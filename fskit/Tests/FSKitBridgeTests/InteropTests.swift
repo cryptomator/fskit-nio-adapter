@@ -77,6 +77,18 @@ struct InteropTests {
 		#expect(target.attributes.nodeId == link.attributes.nodeId)
 		_ = try client.request(RemoveRequest(nodeId: link.attributes.nodeId, parentId: Self.root))
 
+		// more entries than one enumeration packs, in a directory of their own
+		let listing = try client.request(CreateRequest(parentId: Self.root, name: "listing", type: .directory, mode: 0o755)).attributes.nodeId
+		let children = try (0 ..< 10).map { try client.request(CreateRequest(parentId: listing, name: "\($0)", type: .directory, mode: 0o755)).attributes.nodeId }
+		let listed = try DirectoryLister(client: client).listAll(directory: listing, capacity: 4, counting: client)
+		#expect(listed.names.sorted() == ([".", ".."] + (0 ..< 10).map { "\($0)" }).sorted())
+		// the two calls that continue the first page are served from what the first call kept, and the last one finds the end
+		#expect(listed.requestsPerCall == [1, 0, 0, 1])
+		for child in children {
+			_ = try client.request(RemoveRequest(nodeId: child, parentId: listing))
+		}
+		_ = try client.request(RemoveRequest(nodeId: listing, parentId: Self.root))
+
 		#expect(try client.request(RemoveRequest(nodeId: file, parentId: Self.root)).attributes.size == 3)
 		_ = try client.request(RemoveRequest(nodeId: directory.attributes.nodeId, parentId: Self.root))
 		#expect(try client.request(ReaddirRequest(nodeId: Self.root, cookie: 0, verifier: 0, wantAttributes: true)).entries.isEmpty)
