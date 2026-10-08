@@ -51,6 +51,8 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$FSKIT_DIR/Bundle/FSKitNioHost-Info.plist" "$APP/Contents/Info.plist"
 cp "$BIN_DIR/FSKitNioHost" "$APP/Contents/MacOS/FSKitNioHost"
 SKIP_SWIFT=1 "$SCRIPT_DIR/build-appex.sh" "$APP/Contents/Extensions"
+BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APPEX/Contents/Info.plist")"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $BUNDLE_VERSION" -c "Add :CFBundleVersion string $BUNDLE_VERSION" "$APP/Contents/Info.plist"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID.extension" "$APPEX/Contents/Info.plist"

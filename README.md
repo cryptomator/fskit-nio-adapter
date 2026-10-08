@@ -68,7 +68,7 @@ codesign --verify --deep --strict /Applications/FSKitNioHost.app  # must pass
 open /Applications/FSKitNioHost.app
 ```
 
-Then enable "Cryptomator FSKit File System Extension" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m | grep -i fskit` lists the extension once it is registered. macOS switches the extension off again when a reinstalled build has a changed `Info.plist`.
+Then enable "Cryptomator FSKit File System Extension" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m | grep -i fskit` lists the extension once it is registered. macOS switches the extension off again when a reinstalled build has a changed `Info.plist`. A new bundle version alone, which the build takes from `pom.xml`, keeps it on.
 
 For a file system type that no extension provides, `mount` exits with status 69 and `mount: Unable to invoke task`. With the extension disabled, it additionally prints `Module <bundle identifier> is disabled!`.
 
