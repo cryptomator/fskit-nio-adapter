@@ -2,6 +2,7 @@ package org.cryptomator.frontend.fskit;
 
 import org.cryptomator.frontend.fskit.fs.Errno;
 import org.cryptomator.frontend.fskit.fs.HookedOperations;
+import org.cryptomator.frontend.fskit.fs.HookedOperations.ChannelCall;
 import org.cryptomator.frontend.fskit.protocol.Frame;
 import org.cryptomator.frontend.fskit.protocol.Messages;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseRequest;
@@ -11,6 +12,7 @@ import org.cryptomator.frontend.fskit.protocol.Messages.CreateResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.DirectoryEntry;
 import org.cryptomator.frontend.fskit.protocol.Messages.Failure;
 import org.cryptomator.frontend.fskit.protocol.Messages.GetattrRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.GetattrResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.HelloRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.HelloResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.LookupRequest;
@@ -54,9 +56,20 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.UnaryOperator;
+
+import static org.cryptomator.frontend.fskit.fs.HookedOperations.blockingOnce;
+import static org.cryptomator.frontend.fskit.fs.HookedOperations.hooked;
 
 @Timeout(30)
 public class BridgeSessionTest {
@@ -238,24 +251,189 @@ public class BridgeSessionTest {
 	}
 
 	@Test
-	@DisplayName("answers pipelined requests in order, echoing opcode and request id")
-	public void testPipelinedRequests() throws IOException {
+	@DisplayName("closes the connection when a request fails with an error, which leaves it unanswered")
+	public void testRequestFailingWithError() throws IOException {
 		try (TestBridgeClient client = connect()) {
-			long first = client.send(new CreateRequest(ROOT, "file.txt", NodeType.FILE, 0644));
-			long second = client.send(new LookupRequest(ROOT, "file.txt"));
-			long third = client.send(new StatfsRequest());
-			long fourth = client.send(new LookupRequest(ROOT, "missing.txt"));
+			operations.beforeReadingAttributes = _ -> {
+				throw new AssertionError("broken");
+			};
+			client.send(new GetattrRequest(ROOT));
 
-			Frame created = client.receive();
-			Frame found = client.receive();
-			Frame statfs = client.receive();
-			Frame missing = client.receive();
+			assertClosedByServer(client);
+		}
+	}
 
-			Assertions.assertEquals(List.of(first, second, third, fourth), List.of(created.requestId(), found.requestId(), statfs.requestId(), missing.requestId()));
-			Assertions.assertEquals(List.of(Opcode.CREATE, Opcode.LOOKUP, Opcode.STATFS, Opcode.LOOKUP), List.of(created.opcode(), found.opcode(), statfs.opcode(), missing.opcode()));
-			long createdId = ok(Messages.decodeResponse(created), CreateResponse.class).attributes().nodeId();
-			Assertions.assertEquals(createdId, ok(Messages.decodeResponse(found), LookupResponse.class).attributes().nodeId());
-			Assertions.assertEquals(new Failure(Errno.ENOENT), Messages.decodeResponse(missing));
+	@Test
+	@DisplayName("answers pipelined requests, each with its opcode and request id, in any order")
+	public void testPipelinedRequests() throws IOException {
+		Files.createFile(root.resolve("file.txt"));
+		try (TestBridgeClient client = connect()) {
+			long found = client.send(new LookupRequest(ROOT, "file.txt"));
+			long statfs = client.send(new StatfsRequest());
+			long missing = client.send(new LookupRequest(ROOT, "missing.txt"));
+
+			Map<Long, Frame> responses = new HashMap<>();
+			for (int i = 0; i < 3; i++) {
+				Frame frame = client.receive();
+				responses.put(frame.requestId(), frame);
+			}
+
+			Assertions.assertEquals(Set.of(found, statfs, missing), responses.keySet());
+			Assertions.assertEquals(List.of(Opcode.LOOKUP, Opcode.STATFS, Opcode.LOOKUP), List.of(responses.get(found).opcode(), responses.get(statfs).opcode(), responses.get(missing).opcode()));
+			Assertions.assertEquals("file.txt", ok(Messages.decodeResponse(responses.get(found)), LookupResponse.class).name());
+			ok(Messages.decodeResponse(responses.get(statfs)), StatfsResponse.class);
+			Assertions.assertEquals(new Failure(Errno.ENOENT), Messages.decodeResponse(responses.get(missing)));
+		}
+	}
+
+	/**
+	 * The tree of the tests that block one request: {@code /d/sub/a} and {@code /d/sub/b}, and {@code /e/x}.
+	 */
+	private record Tree(long d, long sub, long a, long b, long e, long x) {
+	}
+
+	private Tree tree(TestBridgeClient client) throws IOException {
+		Files.createDirectories(root.resolve("d/sub"));
+		Files.createDirectories(root.resolve("e"));
+		Files.writeString(root.resolve("d/sub/a"), "content of a");
+		Files.writeString(root.resolve("d/sub/b"), "content of b");
+		Files.writeString(root.resolve("e/x"), "content of x");
+		long d = lookup(client, ROOT, "d");
+		long sub = lookup(client, d, "sub");
+		long e = lookup(client, ROOT, "e");
+		return new Tree(d, sub, lookup(client, sub, "a"), lookup(client, sub, "b"), e, lookup(client, e, "x"));
+	}
+
+	private static long lookup(TestBridgeClient client, long parentId, String name) throws IOException {
+		return ok(client.request(new LookupRequest(parentId, name)), LookupResponse.class).attributes().nodeId();
+	}
+
+	/**
+	 * Sends requests whose locks do not conflict with a blocked request's, one at a time, and expects each to be answered meanwhile.
+	 */
+	private static void assertOthersAnswered(TestBridgeClient client, Tree tree, String suffix) throws IOException {
+		ok(client.request(new GetattrRequest(tree.b())), GetattrResponse.class);
+		ok(client.request(new ReadRequest(tree.b(), 0, 100)), ReadResponse.class);
+		ok(client.request(new WriteRequest(tree.b(), 0, StandardCharsets.UTF_8.encode("written"))), WriteResponse.class);
+		ok(client.request(new LookupRequest(tree.e(), "x")), LookupResponse.class);
+		long created = ok(client.request(new CreateRequest(tree.e(), "created" + suffix, NodeType.FILE, 0644)), CreateResponse.class).attributes().nodeId();
+		ok(client.request(new RenameRequest(created, tree.e(), "created" + suffix, tree.e(), "renamed" + suffix)), RenameResponse.class);
+		ok(client.request(new CreateRequest(ROOT, "in root" + suffix, NodeType.FILE, 0644)), CreateResponse.class);
+		ok(client.request(new CreateRequest(tree.sub(), "next to a" + suffix, NodeType.FILE, 0644)), CreateResponse.class);
+	}
+
+	@Test
+	@DisplayName("while a request on an entry is blocked in the backend, requests on entries outside its lock set are answered")
+	public void testBlockedRequestStallsNothingElse() throws IOException, InterruptedException {
+		try (TestBridgeClient client = connect()) {
+			Tree tree = tree(client);
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			Path a = root.resolve("d/sub/a");
+			Runnable blocking = blockingOnce(entered, release);
+			operations.beforeReadingAttributes = path -> {
+				if (path.equals(a)) {
+					blocking.run();
+				}
+			};
+			long read = client.send(new ReadRequest(tree.a(), 0, 100));
+			Assertions.assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+			assertOthersAnswered(client, tree, " 1");
+
+			release.countDown();
+			Frame answer = client.receive();
+			Assertions.assertEquals(read, answer.requestId());
+			Assertions.assertEquals("content of a", StandardCharsets.UTF_8.decode(ok(Messages.decodeResponse(answer), ReadResponse.class).data()).toString());
+		}
+	}
+
+	@Test
+	@DisplayName("while a write is blocked in its channel, lookups and listings of its entry are answered as well")
+	public void testBlockedWriteStallsNoSampling() throws IOException, InterruptedException {
+		try (TestBridgeClient client = connect()) {
+			Tree tree = tree(client);
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			operations.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.WRITE, blockingOnce(entered, release)));
+			long write = client.send(new WriteRequest(tree.a(), 0, StandardCharsets.UTF_8.encode("changed")));
+			Assertions.assertTrue(entered.await(5, TimeUnit.SECONDS));
+			operations.channelWrapper = UnaryOperator.identity();
+
+			assertOthersAnswered(client, tree, " 2");
+			ok(client.request(new LookupRequest(tree.sub(), "a")), LookupResponse.class);
+			ReaddirResponse listing = ok(client.request(new ReaddirRequest(tree.sub(), 0, 0, true)), ReaddirResponse.class);
+			Assertions.assertTrue(listing.entries().stream().anyMatch(entry -> entry.name().equals("a") && entry.attributes() != null));
+
+			release.countDown();
+			Frame answer = client.receive();
+			Assertions.assertEquals(write, answer.requestId());
+			ok(Messages.decodeResponse(answer), WriteResponse.class);
+		}
+	}
+
+	@Test
+	@DisplayName("while a request is blocked reading the usable space or closing a channel, requests on other entries are answered")
+	public void testBlockedUsableSpaceAndCloseStallNothingElse() throws IOException, InterruptedException {
+		try (TestBridgeClient client = connect()) {
+			Tree tree = tree(client);
+			CountDownLatch spaceEntered = new CountDownLatch(1);
+			CountDownLatch spaceRelease = new CountDownLatch(1);
+			Runnable blockingSpace = blockingOnce(spaceEntered, spaceRelease);
+			operations.beforeReadingUsableSpace = _ -> blockingSpace.run();
+			long write = client.send(new WriteRequest(tree.a(), 0, StandardCharsets.UTF_8.encode("changed")));
+			Assertions.assertTrue(spaceEntered.await(5, TimeUnit.SECONDS));
+
+			ok(client.request(new GetattrRequest(tree.b())), GetattrResponse.class);
+			ok(client.request(new ReadRequest(tree.b(), 0, 100)), ReadResponse.class);
+			ok(client.request(new LookupRequest(tree.e(), "x")), LookupResponse.class);
+
+			spaceRelease.countDown();
+			Assertions.assertEquals(write, client.receive().requestId());
+
+			CountDownLatch closeEntered = new CountDownLatch(1);
+			CountDownLatch closeRelease = new CountDownLatch(1);
+			operations.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.CLOSE, blockingOnce(closeEntered, closeRelease)));
+			ok(client.request(new OpenRequest(tree.x(), Messages.MODE_READ)), OpenResponse.class);
+			operations.channelWrapper = UnaryOperator.identity();
+			long close = client.send(new CloseRequest(tree.x(), 0));
+			Assertions.assertTrue(closeEntered.await(5, TimeUnit.SECONDS));
+
+			ok(client.request(new GetattrRequest(tree.b())), GetattrResponse.class);
+			ok(client.request(new ReadRequest(tree.a(), 0, 100)), ReadResponse.class);
+			ok(client.request(new LookupRequest(tree.sub(), "b")), LookupResponse.class);
+
+			closeRelease.countDown();
+			Assertions.assertEquals(close, client.receive().requestId());
+		}
+	}
+
+	@Test
+	@DisplayName("a rename of the directory of an entry whose read is blocked waits for the read")
+	public void testRenameWaitsForRequestBelow() throws Exception {
+		try (TestBridgeClient client = connect(); ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor()) {
+			Tree tree = tree(client);
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			Path a = root.resolve("d/sub/a");
+			Runnable blocking = blockingOnce(entered, release);
+			operations.beforeReadingAttributes = path -> {
+				if (path.equals(a)) {
+					blocking.run();
+				}
+			};
+			long read = client.send(new ReadRequest(tree.a(), 0, 100));
+			Assertions.assertTrue(entered.await(5, TimeUnit.SECONDS));
+			long rename = client.send(new RenameRequest(tree.sub(), tree.d(), "sub", tree.d(), "moved"));
+
+			Future<Frame> first = threads.submit(client::receive);
+			Assertions.assertThrows(TimeoutException.class, () -> first.get(300, TimeUnit.MILLISECONDS));
+			Assertions.assertTrue(Files.exists(root.resolve("d/sub/a")));
+
+			release.countDown();
+			Set<Long> answered = Set.of(first.get(10, TimeUnit.SECONDS).requestId(), client.receive().requestId());
+			Assertions.assertEquals(Set.of(read, rename), answered);
+			Assertions.assertTrue(Files.exists(root.resolve("d/moved/a")));
 		}
 	}
 
@@ -270,15 +448,15 @@ public class BridgeSessionTest {
 			ReadResponse read = ok(client.request(new ReadRequest(file, 6, 100)), ReadResponse.class);
 			Assertions.assertEquals("world", StandardCharsets.UTF_8.decode(read.data()).toString());
 			ok(client.request(new CloseRequest(file, 0)), CloseResponse.class);
-			Assertions.assertEquals("renamed.txt", ok(client.request(new RenameRequest(file, directory, ROOT, "renamed.txt")), RenameResponse.class).name());
+			Assertions.assertEquals("renamed.txt", ok(client.request(new RenameRequest(file, directory, "file.txt", ROOT, "renamed.txt")), RenameResponse.class).name());
 			ReaddirResponse listing = ok(client.request(new ReaddirRequest(ROOT, 0, 0, false)), ReaddirResponse.class);
 			Assertions.assertEquals(List.of(".", "..", "dir", "renamed.txt"), listing.entries().stream().map(DirectoryEntry::name).sorted().toList());
 			Assertions.assertEquals("hello world", Files.readString(root.resolve("renamed.txt")));
 			long link = ok(client.request(new SymlinkRequest(ROOT, "link", "renamed.txt")), SymlinkResponse.class).attributes().nodeId();
 			Assertions.assertEquals("renamed.txt", ok(client.request(new ReadlinkRequest(link)), ReadlinkResponse.class).target());
-			ok(client.request(new RemoveRequest(link, ROOT)), RemoveResponse.class);
-			ok(client.request(new RemoveRequest(file, ROOT)), RemoveResponse.class);
-			ok(client.request(new RemoveRequest(directory, ROOT)), RemoveResponse.class);
+			ok(client.request(new RemoveRequest(link, ROOT, "link")), RemoveResponse.class);
+			ok(client.request(new RemoveRequest(file, ROOT, "renamed.txt")), RemoveResponse.class);
+			ok(client.request(new RemoveRequest(directory, ROOT, "dir")), RemoveResponse.class);
 		}
 		try (var children = Files.list(root)) {
 			Assertions.assertEquals(0, children.count());

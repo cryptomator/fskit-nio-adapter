@@ -15,9 +15,6 @@ let package = Package(
 			dependencies: [
 				"FSKitBridge"
 			],
-			swiftSettings: [
-				.swiftLanguageMode(.v5)
-			],
 			linkerSettings: [
 				// ExtensionKit extensions must enter through NSExtensionMain (Xcode
 				// links appex targets with `-e _NSExtensionMain`). With the default

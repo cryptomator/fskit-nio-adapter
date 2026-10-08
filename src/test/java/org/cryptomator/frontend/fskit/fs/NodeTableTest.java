@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 
@@ -15,6 +16,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class NodeTableTest {
 
@@ -32,7 +38,7 @@ public class NodeTableTest {
 	@Test
 	@DisplayName("the root has id 2, parent 1 and cannot be forgotten")
 	public void testRoot() throws IOException {
-		nodes.forget(Messages.ROOT_NODE_ID);
+		nodes.forget(root, 1);
 
 		Assertions.assertSame(root, nodes.get(2));
 		Assertions.assertEquals(1, root.parentId);
@@ -59,12 +65,12 @@ public class NodeTableTest {
 	@DisplayName("a lookup marks a listed node held")
 	public void testLookupHoldsListedNode() {
 		Node listed = nodes.list(ROOT.resolve("a"), NodeType.FILE, root);
-		Assertions.assertFalse(listed.held);
+		Assertions.assertEquals(0, listed.lookups);
 
 		Node held = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 
 		Assertions.assertSame(listed, held);
-		Assertions.assertTrue(held.held);
+		Assertions.assertEquals(1, held.lookups);
 	}
 
 	@Test
@@ -73,7 +79,7 @@ public class NodeTableTest {
 		Node held = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 
 		Assertions.assertSame(held, nodes.list(ROOT.resolve("a"), NodeType.FILE, root));
-		Assertions.assertTrue(held.held);
+		Assertions.assertEquals(1, held.lookups);
 	}
 
 	@Test
@@ -83,7 +89,7 @@ public class NodeTableTest {
 		FileChannel channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
 		nodes.setChannel(node, channel, Messages.MODE_WRITE);
 
-		nodes.forget(node.id);
+		nodes.forget(node, 1);
 
 		Assertions.assertFalse(channel.isOpen());
 		Assertions.assertNull(nodes.find(ROOT.resolve("a")));
@@ -92,10 +98,69 @@ public class NodeTableTest {
 	}
 
 	@Test
+	@DisplayName("a node goes once every lookup is forgotten, so a forget that a later lookup overtook leaves it")
+	public void testLookupCounts() throws IOException {
+		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
+		nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
+
+		nodes.forget(node, 1);
+		Assertions.assertSame(node, nodes.get(node.id));
+		Assertions.assertSame(node, nodes.find(ROOT.resolve("a")));
+
+		nodes.forget(node, 1);
+		Assertions.assertThrows(StatusException.class, () -> nodes.get(node.id));
+		Assertions.assertTrue(node.forgotten);
+	}
+
+	@Test
+	@DisplayName("the nodes with a channel are handed out as a copy")
+	public void testWithChannelIsACopy() {
+		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
+		nodes.setChannel(node, Mockito.mock(FileChannel.class), Messages.MODE_READ);
+		List<Node> withChannel = nodes.withChannel();
+
+		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), Mockito.mock(FileChannel.class), Messages.MODE_READ);
+
+		Assertions.assertEquals(List.of(node), withChannel);
+	}
+
+	@Test
+	@Timeout(10)
+	@DisplayName("a channel close blocked in the backend keeps the node among those with a channel and blocks no other thread's use of the table")
+	public void testCloseOutsideTheMonitor() throws Exception {
+		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
+		FileChannel blocking = Mockito.mock(FileChannel.class);
+		CountDownLatch entered = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		Mockito.doAnswer(_ -> {
+			entered.countDown();
+			release.await();
+			return null;
+		}).when(blocking).close();
+		nodes.setChannel(node, blocking, Messages.MODE_WRITE);
+		try (ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor()) {
+			Future<?> closing = threads.submit(() -> {
+				nodes.closeChannel(node);
+				return null;
+			});
+			Assertions.assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+			Assertions.assertSame(node, nodes.find(ROOT.resolve("a")));
+			Assertions.assertNotNull(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root));
+			Assertions.assertEquals(List.of(node), nodes.withChannel());
+
+			release.countDown();
+			closing.get();
+		}
+		Assertions.assertNull(node.channel);
+		Assertions.assertEquals(List.of(), nodes.withChannel());
+	}
+
+	@Test
 	@DisplayName("a lookup after a forget gets a new id")
 	public void testLookupAfterForget() throws IOException {
 		Node forgotten = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
-		nodes.forget(forgotten.id);
+		nodes.forget(forgotten, 1);
 
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 
@@ -136,7 +201,7 @@ public class NodeTableTest {
 		Assertions.assertNull(nodes.find(ROOT.resolve("source")));
 		Assertions.assertSame(target, nodes.get(target.id));
 
-		nodes.forget(target.id);
+		nodes.forget(target, 1);
 
 		Assertions.assertSame(source, nodes.find(ROOT.resolve("target")));
 		Assertions.assertThrows(StatusException.class, () -> nodes.get(target.id));
@@ -149,7 +214,7 @@ public class NodeTableTest {
 		nodes.unlink(removed);
 		Node recreated = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 
-		nodes.forget(removed.id);
+		nodes.forget(removed, 1);
 
 		Assertions.assertNotSame(removed, recreated);
 		Assertions.assertSame(recreated, nodes.find(ROOT.resolve("a")));
@@ -175,16 +240,16 @@ public class NodeTableTest {
 		Node held = nodes.hold(ROOT.resolve("dir/held"), NodeType.FILE, directory);
 		Node listed = nodes.list(ROOT.resolve("dir/listed"), NodeType.FILE, directory);
 		Node listedElsewhere = nodes.list(ROOT.resolve("other/listed"), NodeType.FILE, other);
-		snapshots.add(directory.id, List.of());
-		snapshots.add(directory.id, List.of());
-		snapshots.add(other.id, List.of());
+		snapshots.unpin(snapshots.add(directory.id, List.of()));
+		snapshots.unpin(snapshots.add(directory.id, List.of()));
+		snapshots.unpin(snapshots.add(other.id, List.of()));
 
 		// 14 more listings evict the directory's first listing, the 15th its second
 		for (int i = 0; i < 14; i++) {
-			snapshots.add(root.id, List.of());
+			snapshots.unpin(snapshots.add(root.id, List.of()));
 		}
 		Assertions.assertSame(listed, nodes.get(listed.id));
-		snapshots.add(root.id, List.of());
+		snapshots.unpin(snapshots.add(root.id, List.of()));
 
 		Assertions.assertThrows(StatusException.class, () -> nodes.get(listed.id));
 		Assertions.assertNull(nodes.find(ROOT.resolve("dir/listed")));

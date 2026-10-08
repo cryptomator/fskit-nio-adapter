@@ -155,8 +155,10 @@ public struct Attributes: Equatable, Sendable {
 	public var modified: Timestamp
 	public var accessed: Timestamp
 	public var created: Timestamp
+	/// Orders the records of one item: of two, the one with the higher generation describes the later state. 0 for a record that never changes.
+	public var generation: UInt64
 
-	public init(type: NodeType, mode: UInt16, size: UInt64, nodeId: UInt64, parentId: UInt64, modified: Timestamp, accessed: Timestamp, created: Timestamp) {
+	public init(type: NodeType, mode: UInt16, size: UInt64, nodeId: UInt64, parentId: UInt64, modified: Timestamp, accessed: Timestamp, created: Timestamp, generation: UInt64) {
 		self.type = type
 		self.mode = mode
 		self.size = size
@@ -165,6 +167,7 @@ public struct Attributes: Equatable, Sendable {
 		self.modified = modified
 		self.accessed = accessed
 		self.created = created
+		self.generation = generation
 	}
 
 	init(control: inout ByteReader) throws {
@@ -176,6 +179,7 @@ public struct Attributes: Equatable, Sendable {
 		self.modified = try Timestamp(control: &control)
 		self.accessed = try Timestamp(control: &control)
 		self.created = try Timestamp(control: &control)
+		self.generation = try control.read()
 	}
 
 	func encode(control: inout ByteWriter) {
@@ -187,6 +191,29 @@ public struct Attributes: Equatable, Sendable {
 		modified.encode(control: &control)
 		accessed.encode(control: &control)
 		created.encode(control: &control)
+		control.write(generation)
+	}
+}
+
+public struct FreeSpace: Equatable, Sendable {
+	/// The space available in the backing store, or `Messages.unknownUsableBytes`.
+	public var usableBytes: UInt64
+	/// Orders the samples of one connection: of two, the one with the higher generation is not older.
+	public var generation: UInt64
+
+	public init(usableBytes: UInt64, generation: UInt64) {
+		self.usableBytes = usableBytes
+		self.generation = generation
+	}
+
+	init(control: inout ByteReader) throws {
+		self.usableBytes = try control.read()
+		self.generation = try control.read()
+	}
+
+	func encode(control: inout ByteWriter) {
+		control.write(usableBytes)
+		control.write(generation)
 	}
 }
 
@@ -272,21 +299,21 @@ public struct StatfsRequest: Request, Equatable {
 
 public struct StatfsResponse: Message, Equatable {
 	public var totalBytes: UInt64
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(totalBytes: UInt64, usableBytes: UInt64) {
+	public init(totalBytes: UInt64, freeSpace: FreeSpace) {
 		self.totalBytes = totalBytes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.totalBytes = try control.read()
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		control.write(totalBytes)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -342,33 +369,38 @@ public struct ForgetRequest: Request, Equatable {
 	public static let opcode = Opcode.forget
 
 	public var nodeId: UInt64
+	/// The number of successful `LOOKUP`, `CREATE` and `SYMLINK` responses for the node that the client received and forgets now.
+	public var lookups: UInt64
 
-	public init(nodeId: UInt64) {
+	public init(nodeId: UInt64, lookups: UInt64) {
 		self.nodeId = nodeId
+		self.lookups = lookups
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.nodeId = try control.read()
+		self.lookups = try control.read()
 	}
 
 	public func encode(control: inout ByteWriter) {
 		control.write(nodeId)
+		control.write(lookups)
 	}
 }
 
 public struct ForgetResponse: Message, Equatable {
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(usableBytes: UInt64) {
-		self.usableBytes = usableBytes
+	public init(freeSpace: FreeSpace) {
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -453,24 +485,24 @@ public struct SetattrRequest: Request, Equatable {
 public struct SetattrResponse: Message, Equatable {
 	public var applied: UInt8
 	public var attributes: Attributes
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(applied: UInt8, attributes: Attributes, usableBytes: UInt64) {
+	public init(applied: UInt8, attributes: Attributes, freeSpace: FreeSpace) {
 		self.applied = applied
 		self.attributes = attributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.applied = try control.read()
 		self.attributes = try Attributes(control: &control)
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		control.write(applied)
 		attributes.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -573,27 +605,27 @@ public struct CreateResponse: Message, Equatable {
 	public var attributes: Attributes
 	public var name: String
 	public var directoryAttributes: Attributes
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(attributes: Attributes, name: String, directoryAttributes: Attributes, usableBytes: UInt64) {
+	public init(attributes: Attributes, name: String, directoryAttributes: Attributes, freeSpace: FreeSpace) {
 		self.attributes = attributes
 		self.name = name
 		self.directoryAttributes = directoryAttributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.attributes = try Attributes(control: &control)
 		self.name = try control.readString()
 		self.directoryAttributes = try Attributes(control: &control)
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		attributes.encode(control: &control)
 		control.write(name)
 		directoryAttributes.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -605,44 +637,48 @@ public struct RemoveRequest: Request, Equatable {
 
 	public var nodeId: UInt64
 	public var parentId: UInt64
+	public var name: String
 
-	public init(nodeId: UInt64, parentId: UInt64) {
+	public init(nodeId: UInt64, parentId: UInt64, name: String) {
 		self.nodeId = nodeId
 		self.parentId = parentId
+		self.name = name
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.nodeId = try control.read()
 		self.parentId = try control.read()
+		self.name = try control.readString()
 	}
 
 	public func encode(control: inout ByteWriter) {
 		control.write(nodeId)
 		control.write(parentId)
+		control.write(name)
 	}
 }
 
 public struct RemoveResponse: Message, Equatable {
 	public var attributes: Attributes
 	public var directoryAttributes: Attributes
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(attributes: Attributes, directoryAttributes: Attributes, usableBytes: UInt64) {
+	public init(attributes: Attributes, directoryAttributes: Attributes, freeSpace: FreeSpace) {
 		self.attributes = attributes
 		self.directoryAttributes = directoryAttributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.attributes = try Attributes(control: &control)
 		self.directoryAttributes = try Attributes(control: &control)
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		attributes.encode(control: &control)
 		directoryAttributes.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -654,12 +690,14 @@ public struct RenameRequest: Request, Equatable {
 
 	public var nodeId: UInt64
 	public var sourceParentId: UInt64
+	public var sourceName: String
 	public var destinationParentId: UInt64
 	public var destinationName: String
 
-	public init(nodeId: UInt64, sourceParentId: UInt64, destinationParentId: UInt64, destinationName: String) {
+	public init(nodeId: UInt64, sourceParentId: UInt64, sourceName: String, destinationParentId: UInt64, destinationName: String) {
 		self.nodeId = nodeId
 		self.sourceParentId = sourceParentId
+		self.sourceName = sourceName
 		self.destinationParentId = destinationParentId
 		self.destinationName = destinationName
 	}
@@ -667,6 +705,7 @@ public struct RenameRequest: Request, Equatable {
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.nodeId = try control.read()
 		self.sourceParentId = try control.read()
+		self.sourceName = try control.readString()
 		self.destinationParentId = try control.read()
 		self.destinationName = try control.readString()
 	}
@@ -674,6 +713,7 @@ public struct RenameRequest: Request, Equatable {
 	public func encode(control: inout ByteWriter) {
 		control.write(nodeId)
 		control.write(sourceParentId)
+		control.write(sourceName)
 		control.write(destinationParentId)
 		control.write(destinationName)
 	}
@@ -685,15 +725,15 @@ public struct RenameResponse: Message, Equatable {
 	public var sourceDirectoryAttributes: Attributes
 	public var destinationDirectoryAttributes: Attributes
 	public var replacedAttributes: Attributes?
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(name: String, attributes: Attributes, sourceDirectoryAttributes: Attributes, destinationDirectoryAttributes: Attributes, replacedAttributes: Attributes?, usableBytes: UInt64) {
+	public init(name: String, attributes: Attributes, sourceDirectoryAttributes: Attributes, destinationDirectoryAttributes: Attributes, replacedAttributes: Attributes?, freeSpace: FreeSpace) {
 		self.name = name
 		self.attributes = attributes
 		self.sourceDirectoryAttributes = sourceDirectoryAttributes
 		self.destinationDirectoryAttributes = destinationDirectoryAttributes
 		self.replacedAttributes = replacedAttributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
@@ -702,7 +742,7 @@ public struct RenameResponse: Message, Equatable {
 		self.sourceDirectoryAttributes = try Attributes(control: &control)
 		self.destinationDirectoryAttributes = try Attributes(control: &control)
 		self.replacedAttributes = try control.readBool() ? Attributes(control: &control) : nil
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
@@ -712,7 +752,7 @@ public struct RenameResponse: Message, Equatable {
 		destinationDirectoryAttributes.encode(control: &control)
 		control.write(replacedAttributes != nil)
 		replacedAttributes?.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -773,18 +813,18 @@ public struct CloseRequest: Request, Equatable {
 }
 
 public struct CloseResponse: Message, Equatable {
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(usableBytes: UInt64) {
-		self.usableBytes = usableBytes
+	public init(freeSpace: FreeSpace) {
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -878,24 +918,24 @@ public struct WriteRequest: Request, Equatable {
 public struct WriteResponse: Message, Equatable {
 	public var written: UInt32
 	public var attributes: Attributes
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(written: UInt32, attributes: Attributes, usableBytes: UInt64) {
+	public init(written: UInt32, attributes: Attributes, freeSpace: FreeSpace) {
 		self.written = written
 		self.attributes = attributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.written = try control.read()
 		self.attributes = try Attributes(control: &control)
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		control.write(written)
 		attributes.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -911,18 +951,18 @@ public struct SyncRequest: Request, Equatable {
 }
 
 public struct SyncResponse: Message, Equatable {
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(usableBytes: UInt64) {
-		self.usableBytes = usableBytes
+	public init(freeSpace: FreeSpace) {
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }
 
@@ -1000,26 +1040,26 @@ public struct SymlinkResponse: Message, Equatable {
 	public var attributes: Attributes
 	public var name: String
 	public var directoryAttributes: Attributes
-	public var usableBytes: UInt64
+	public var freeSpace: FreeSpace
 
-	public init(attributes: Attributes, name: String, directoryAttributes: Attributes, usableBytes: UInt64) {
+	public init(attributes: Attributes, name: String, directoryAttributes: Attributes, freeSpace: FreeSpace) {
 		self.attributes = attributes
 		self.name = name
 		self.directoryAttributes = directoryAttributes
-		self.usableBytes = usableBytes
+		self.freeSpace = freeSpace
 	}
 
 	public init(control: inout ByteReader, payload: Data) throws {
 		self.attributes = try Attributes(control: &control)
 		self.name = try control.readString()
 		self.directoryAttributes = try Attributes(control: &control)
-		self.usableBytes = try control.read()
+		self.freeSpace = try FreeSpace(control: &control)
 	}
 
 	public func encode(control: inout ByteWriter) {
 		attributes.encode(control: &control)
 		control.write(name)
 		directoryAttributes.encode(control: &control)
-		control.write(usableBytes)
+		freeSpace.encode(control: &control)
 	}
 }

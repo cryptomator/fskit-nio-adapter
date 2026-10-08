@@ -4,6 +4,7 @@ import org.cryptomator.cryptofs.CryptoFileSystemProperties;
 import org.cryptomator.cryptofs.CryptoFileSystemProvider;
 import org.cryptomator.cryptolib.api.Masterkey;
 import org.cryptomator.cryptolib.api.MasterkeyLoader;
+import org.cryptomator.frontend.fskit.fs.HookedOperations.ChannelCall;
 import org.cryptomator.frontend.fskit.protocol.Frame;
 import org.cryptomator.frontend.fskit.protocol.FrameCodec;
 import org.cryptomator.frontend.fskit.protocol.FrameCodecTest;
@@ -56,6 +57,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -84,6 +86,7 @@ import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.ReadOnlyFileSystemException;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Instant;
@@ -91,9 +94,25 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
+
+import static org.cryptomator.frontend.fskit.fs.HookedOperations.hooked;
 
 @SuppressWarnings("OctalInteger")
 public class FileSystemOperationsTest {
@@ -151,6 +170,13 @@ public class FileSystemOperationsTest {
 
 	private ReaddirResponse readdir(long nodeId, long cookie, long verifier, boolean wantAttributes) {
 		return ok(new ReaddirRequest(nodeId, cookie, verifier, wantAttributes), ReaddirResponse.class);
+	}
+
+	/**
+	 * The attributes without their generation, which differs between two samples of the same state.
+	 */
+	private static Attributes state(Attributes attributes) {
+		return new Attributes(attributes.type(), attributes.mode(), attributes.size(), attributes.nodeId(), attributes.parentId(), attributes.modified(), attributes.accessed(), attributes.created(), 0);
 	}
 
 	private List<String> names(ReaddirResponse page) {
@@ -283,7 +309,10 @@ public class FileSystemOperationsTest {
 			assertStatus(Errno.EINVAL, new LookupRequest(ROOT, name));
 			assertStatus(Errno.EINVAL, new CreateRequest(ROOT, name, NodeType.FILE, 0644));
 			assertStatus(Errno.EINVAL, new SymlinkRequest(ROOT, name, "target"));
-			assertStatus(Errno.EINVAL, new RenameRequest(file, ROOT, ROOT, name));
+			assertStatus(Errno.EINVAL, new RenameRequest(file, ROOT, "file.txt", ROOT, name));
+			// a name that identifies an entry is only compared, and no entry has such a name
+			assertStatus(Errno.ENOENT, new RemoveRequest(file, ROOT, name));
+			assertStatus(Errno.ENOENT, new RenameRequest(file, ROOT, name, ROOT, "other.txt"));
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 		}
 
@@ -299,7 +328,7 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "");
 			long forgotten = lookup(ROOT, "file.txt").nodeId();
 
-			ok(new ForgetRequest(forgotten), ForgetResponse.class);
+			ok(new ForgetRequest(forgotten, 1), ForgetResponse.class);
 
 			assertStatus(Errno.ESTALE, new GetattrRequest(forgotten));
 			Assertions.assertNotEquals(forgotten, lookup(ROOT, "file.txt").nodeId());
@@ -311,7 +340,7 @@ public class FileSystemOperationsTest {
 			StatfsResponse response = ok(new StatfsRequest(), StatfsResponse.class);
 
 			Assertions.assertEquals(Files.getFileStore(root).getTotalSpace(), response.totalBytes());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 		}
 
 		@ParameterizedTest(name = "{0} -> {1}")
@@ -380,11 +409,37 @@ public class FileSystemOperationsTest {
 			backing("source", "new");
 			long source = lookup(ROOT, "source").nodeId();
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, DECOMPOSED), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source", ROOT, DECOMPOSED), RenameResponse.class);
 
 			Assertions.assertEquals(COMPOSED, response.name());
 			Assertions.assertEquals(List.of(COMPOSED), backingNames());
 			Assertions.assertEquals("new", Files.readString(root.resolve(COMPOSED)));
+		}
+
+		@ParameterizedTest(name = "stored composed: {0}")
+		@DisplayName("a remove naming an entry in the other Unicode normalization form than the stored one removes it")
+		@ValueSource(booleans = {true, false})
+		public void testRemoveByOtherSpelling(boolean storedComposed) throws IOException {
+			String stored = storedComposed ? COMPOSED : DECOMPOSED;
+			backing(stored, "content");
+			long file = lookup(ROOT, stored).nodeId();
+
+			ok(new RemoveRequest(file, ROOT, storedComposed ? DECOMPOSED : COMPOSED), RemoveResponse.class);
+
+			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@ParameterizedTest(name = "stored composed: {0}")
+		@DisplayName("a rename naming its source in the other Unicode normalization form than the stored one moves it")
+		@ValueSource(booleans = {true, false})
+		public void testRenameByOtherSpelling(boolean storedComposed) throws IOException {
+			String stored = storedComposed ? COMPOSED : DECOMPOSED;
+			backing(stored, "content");
+			long file = lookup(ROOT, stored).nodeId();
+
+			ok(new RenameRequest(file, ROOT, storedComposed ? DECOMPOSED : COMPOSED, ROOT, "renamed.txt"), RenameResponse.class);
+
+			Assertions.assertEquals(List.of("renamed.txt"), backingNames());
 		}
 	}
 
@@ -427,7 +482,7 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "content");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
-			ok(new RenameRequest(file, ROOT, user, "file.txt"), RenameResponse.class);
+			ok(new RenameRequest(file, ROOT, "file.txt", user, "file.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(file, lookup(user, "file.txt").nodeId());
 			Assertions.assertEquals("content", read(file, 0, 100));
@@ -467,7 +522,7 @@ public class FileSystemOperationsTest {
 		public void testRenameToOwnCaseVariant() throws IOException {
 			long file = lookup(ROOT, "File.txt").nodeId();
 
-			RenameResponse response = ok(new RenameRequest(file, ROOT, ROOT, "file.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(file, ROOT, "File.txt", ROOT, "file.txt"), RenameResponse.class);
 
 			Assertions.assertEquals("file.txt", response.name());
 			Assertions.assertEquals(backingNames(), List.of(response.name()));
@@ -480,7 +535,7 @@ public class FileSystemOperationsTest {
 			backing("other.txt", "other");
 			long other = lookup(ROOT, "other.txt").nodeId();
 
-			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, ROOT, "file.txt"));
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, "other.txt", ROOT, "file.txt"));
 
 			Assertions.assertEquals(List.of("File.txt", "other.txt"), backingNames());
 			Assertions.assertEquals("original", Files.readString(root.resolve("File.txt")));
@@ -503,7 +558,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("entry.txt", Assertions.assertInstanceOf(LookupResponse.class, whileUnreadable).name());
 
 			assertStatus(Errno.ENOENT, new LookupRequest(dirId, "entry.txt"));
-			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, dirId, "entry.txt"));
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, "other.txt", dirId, "entry.txt"));
 			Assertions.assertEquals("original", Files.readString(dir.resolve("Entry.txt")));
 		}
 	}
@@ -525,7 +580,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(0, response.attributes().size());
 			Assertions.assertEquals(ROOT, response.attributes().parentId());
 			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 			Assertions.assertEquals(response.attributes().nodeId(), lookup(ROOT, "new.txt").nodeId());
 		}
 
@@ -626,10 +681,10 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "12345");
 			Attributes before = lookup(ROOT, "file.txt");
 
-			RemoveResponse response = ok(new RemoveRequest(before.nodeId(), ROOT), RemoveResponse.class);
+			RemoveResponse response = ok(new RemoveRequest(before.nodeId(), ROOT, "file.txt"), RemoveResponse.class);
 
 			Assertions.assertEquals(List.of(), backingNames());
-			Assertions.assertEquals(before, response.attributes());
+			Assertions.assertEquals(state(before), state(response.attributes()));
 			Assertions.assertEquals(5, response.attributes().size());
 			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
 		}
@@ -641,18 +696,30 @@ public class FileSystemOperationsTest {
 			long file = lookup(ROOT, "file.txt").nodeId();
 			backing("file.txt", "123456789");
 
-			Assertions.assertEquals(9, ok(new RemoveRequest(file, ROOT), RemoveResponse.class).attributes().size());
+			Assertions.assertEquals(9, ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class).attributes().size());
 		}
 
+		@Test
+		@DisplayName("a remove or rename naming an entry by a name it no longer has yields ENOENT and changes nothing")
+		public void testNameNoLongerHeld() throws IOException {
+			backing("a.txt", "content");
+			long file = lookup(ROOT, "a.txt").nodeId();
+			ok(new RenameRequest(file, ROOT, "a.txt", ROOT, "b.txt"), RenameResponse.class);
+
+			assertStatus(Errno.ENOENT, new RemoveRequest(file, ROOT, "a.txt"));
+			assertStatus(Errno.ENOENT, new RenameRequest(file, ROOT, "a.txt", ROOT, "c.txt"));
+
+			Assertions.assertEquals(List.of("b.txt"), backingNames());
+		}
 		@Test
 		@DisplayName("removes an empty directory, but not one with entries")
 		public void testRemoveDirectory() throws IOException {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long child = create(directory, "child", NodeType.FILE).nodeId();
 
-			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
-			ok(new RemoveRequest(child, directory), RemoveResponse.class);
-			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT, "dir"));
+			ok(new RemoveRequest(child, directory, "child"), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT, "dir"), RemoveResponse.class);
 
 			Assertions.assertEquals(List.of(), backingNames());
 		}
@@ -662,7 +729,7 @@ public class FileSystemOperationsTest {
 		public void testRecreateRemovedName() throws IOException {
 			backing("file.txt", "old");
 			long removed = lookup(ROOT, "file.txt").nodeId();
-			ok(new RemoveRequest(removed, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(removed, ROOT, "file.txt"), RemoveResponse.class);
 
 			long recreated = create(ROOT, "file.txt", NodeType.FILE).nodeId();
 
@@ -676,7 +743,7 @@ public class FileSystemOperationsTest {
 			backing("old.txt", "content");
 			Attributes file = lookup(ROOT, "old.txt");
 
-			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, ROOT, "new.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, "old.txt", ROOT, "new.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of("new.txt"), backingNames());
 			Assertions.assertEquals("new.txt", response.name());
@@ -694,7 +761,7 @@ public class FileSystemOperationsTest {
 			long file = create(source, "file.txt", NodeType.FILE).nodeId();
 			write(file, 0, "before");
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, target, "moved"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source", target, "moved"), RenameResponse.class);
 			write(file, 6, " and after");
 			ok(new CloseRequest(file, 0), CloseResponse.class);
 
@@ -714,15 +781,15 @@ public class FileSystemOperationsTest {
 			long source = lookup(ROOT, "source.txt").nodeId();
 			Attributes target = lookup(ROOT, "target.txt");
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of("target.txt"), backingNames());
 			Assertions.assertEquals("new", Files.readString(root.resolve("target.txt")));
 			Assertions.assertEquals("target.txt", response.name());
-			Assertions.assertEquals(target, response.replacedAttributes());
+			Assertions.assertEquals(state(target), state(response.replacedAttributes()));
 			Assertions.assertEquals(8, response.replacedAttributes().size());
-			assertStatus(Errno.ESTALE, new RemoveRequest(target.nodeId(), ROOT));
-			Assertions.assertEquals(target, getattr(target.nodeId()));
+			assertStatus(Errno.ESTALE, new RemoveRequest(target.nodeId(), ROOT, "target.txt"));
+			Assertions.assertEquals(state(target), state(getattr(target.nodeId())));
 			Assertions.assertEquals(source, lookup(ROOT, "target.txt").nodeId());
 		}
 
@@ -735,7 +802,7 @@ public class FileSystemOperationsTest {
 			lookup(ROOT, "target.txt");
 			backing("target.txt", "replaced and grown");
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(18, response.replacedAttributes().size());
 		}
@@ -752,7 +819,7 @@ public class FileSystemOperationsTest {
 			try {
 				Assumptions.assumeFalse(Files.isWritable(root.resolve("locked")), "permissions do not apply to this user");
 
-				assertStatus(Errno.EACCES, new RenameRequest(source, locked, ROOT, "target.txt"));
+				assertStatus(Errno.EACCES, new RenameRequest(source, locked, "source.txt", ROOT, "target.txt"));
 
 				Assertions.assertEquals("replaced", Files.readString(root.resolve("target.txt")));
 				Assertions.assertEquals(target, lookup(ROOT, "target.txt").nodeId());
@@ -773,7 +840,7 @@ public class FileSystemOperationsTest {
 				throw new AtomicMoveNotSupportedException(path.toString(), "target.txt", "across file stores");
 			};
 
-			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, ROOT, "target.txt"));
+			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"));
 
 			Assertions.assertEquals(List.of(StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING), ops.moveOptions);
 			Assertions.assertEquals("replaced", Files.readString(root.resolve("target.txt")));
@@ -793,7 +860,7 @@ public class FileSystemOperationsTest {
 				throw new AtomicMoveNotSupportedException(path.toString(), "dir/moved.txt", "across file stores");
 			};
 
-			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, directory, "moved.txt"));
+			assertStatus(Errno.EXDEV, new RenameRequest(source, ROOT, "source.txt", directory, "moved.txt"));
 
 			Assertions.assertEquals(List.of(StandardCopyOption.ATOMIC_MOVE), ops.moveOptions);
 			Assertions.assertEquals(source, lookup(ROOT, "source.txt").nodeId());
@@ -809,7 +876,7 @@ public class FileSystemOperationsTest {
 			ok(new CloseRequest(child, 0), CloseResponse.class);
 			ok(new SetattrRequest(directory, Messages.ATTRIBUTE_MODE, 0, 0555, EPOCH, EPOCH), SetattrResponse.class);
 			try {
-				ok(new RenameRequest(directory, ROOT, ROOT, "renamed"), RenameResponse.class);
+				ok(new RenameRequest(directory, ROOT, "dir", ROOT, "renamed"), RenameResponse.class);
 
 				Assertions.assertEquals(List.of("renamed"), backingNames());
 				Assertions.assertEquals(child, lookup(directory, "child").nodeId());
@@ -824,13 +891,13 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "content");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
-			RenameResponse response = ok(new RenameRequest(file, ROOT, ROOT, "file.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(file, ROOT, "file.txt", ROOT, "file.txt"), RenameResponse.class);
 
 			Assertions.assertEquals("file.txt", response.name());
 			Assertions.assertNull(response.replacedAttributes());
 			Assertions.assertEquals("content", Files.readString(root.resolve("file.txt")));
 			Assertions.assertEquals(file, lookup(ROOT, "file.txt").nodeId());
-			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class);
 		}
 
 		@Test
@@ -840,7 +907,7 @@ public class FileSystemOperationsTest {
 			long child = create(source, "child", NodeType.FILE).nodeId();
 			Attributes target = create(ROOT, "target", NodeType.DIRECTORY);
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source", ROOT, "target"), RenameResponse.class);
 
 			Assertions.assertEquals(target.nodeId(), response.replacedAttributes().nodeId());
 			Assertions.assertEquals(source, lookup(ROOT, "target").nodeId());
@@ -855,13 +922,13 @@ public class FileSystemOperationsTest {
 			long inner = create(outer, "inner", NodeType.DIRECTORY).nodeId();
 			long innermost = create(inner, "innermost", NodeType.DIRECTORY).nodeId();
 
-			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, outer, "moved"));
-			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, innermost, "moved"));
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, "outer", outer, "moved"));
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, "outer", innermost, "moved"));
 
 			Assertions.assertEquals(List.of(), ops.moveOptions);
 			Assertions.assertEquals(List.of("outer"), backingNames());
 			Assertions.assertEquals(innermost, lookup(inner, "innermost").nodeId());
-			ok(new RenameRequest(innermost, inner, ROOT, "moved up"), RenameResponse.class);
+			ok(new RenameRequest(innermost, inner, "innermost", ROOT, "moved up"), RenameResponse.class);
 			Assertions.assertEquals(List.of("moved up", "outer"), backingNames());
 		}
 
@@ -872,7 +939,7 @@ public class FileSystemOperationsTest {
 			long target = create(ROOT, "target", NodeType.DIRECTORY).nodeId();
 			create(target, "child", NodeType.FILE);
 
-			assertStatus(Errno.ENOTEMPTY, new RenameRequest(source, ROOT, ROOT, "target"));
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(source, ROOT, "source", ROOT, "target"));
 
 			Assertions.assertTrue(Files.isDirectory(root.resolve("source")));
 			Assertions.assertEquals(target, lookup(ROOT, "target").nodeId());
@@ -890,7 +957,7 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "0123456789");
 			file = lookup(ROOT, "file.txt").nodeId();
 			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
-			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class);
 		}
 
 		@Test
@@ -906,6 +973,14 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(16, getattr(file).size());
 			Assertions.assertEquals(16, ok(new ReadRequest(file, 0, 1), ReadResponse.class).attributes().size());
 			Assertions.assertEquals(List.of(), backingNames());
+		}
+
+		@Test
+		@DisplayName("replies with a later generation after each change")
+		public void testGenerations() {
+			long before = getattr(file).generation();
+
+			Assertions.assertTrue(write(file, 10, "abcdef").attributes().generation() > before);
 		}
 
 		@Test
@@ -949,7 +1024,7 @@ public class FileSystemOperationsTest {
 			backing("other.txt", "");
 			long other = lookup(ROOT, "other.txt").nodeId();
 			ok(new OpenRequest(other, WRITE), OpenResponse.class);
-			ok(new RemoveRequest(other, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(other, ROOT, "other.txt"), RemoveResponse.class);
 
 			ok(new SyncRequest(), SyncResponse.class);
 
@@ -961,8 +1036,8 @@ public class FileSystemOperationsTest {
 		public void testNoPathOperations() throws IOException {
 			backing("file.txt", "recreated");
 
-			assertStatus(Errno.ESTALE, new RemoveRequest(file, ROOT));
-			assertStatus(Errno.ESTALE, new RenameRequest(file, ROOT, ROOT, "other.txt"));
+			assertStatus(Errno.ESTALE, new RemoveRequest(file, ROOT, "file.txt"));
+			assertStatus(Errno.ESTALE, new RenameRequest(file, ROOT, "file.txt", ROOT, "other.txt"));
 
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 			Assertions.assertNotEquals(file, lookup(ROOT, "file.txt").nodeId());
@@ -977,7 +1052,7 @@ public class FileSystemOperationsTest {
 			assertStatus(Errno.EIO, new ReadRequest(file, 0, 10));
 			assertStatus(Errno.EIO, new OpenRequest(file, READ));
 			Assertions.assertEquals(10, getattr(file).size());
-			ok(new ForgetRequest(file), ForgetResponse.class);
+			ok(new ForgetRequest(file, 1), ForgetResponse.class);
 			assertStatus(Errno.ESTALE, new GetattrRequest(file));
 		}
 	}
@@ -992,7 +1067,7 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "0123456789");
 			long file = lookup(ROOT, "file.txt").nodeId();
 			ok(new OpenRequest(file, READ), OpenResponse.class);
-			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class);
 
 			Assertions.assertEquals("0123456789", read(file, 0, 100));
 			assertStatus(Errno.EIO, new OpenRequest(file, READ | WRITE));
@@ -1006,7 +1081,7 @@ public class FileSystemOperationsTest {
 		public void testNeverOpened() throws IOException {
 			backing("file.txt", "0123456789");
 			long file = lookup(ROOT, "file.txt").nodeId();
-			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class);
 			backing("file.txt", "recreated");
 
 			assertStatus(Errno.EIO, new OpenRequest(file, READ));
@@ -1020,7 +1095,7 @@ public class FileSystemOperationsTest {
 		@DisplayName("a removed directory answers nothing but getattr")
 		public void testRemovedDirectory() {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
-			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT, "dir"), RemoveResponse.class);
 			create(ROOT, "dir", NodeType.DIRECTORY);
 
 			assertStatus(Errno.ESTALE, new LookupRequest(directory, "child"));
@@ -1039,7 +1114,7 @@ public class FileSystemOperationsTest {
 			long source = lookup(ROOT, "source.txt").nodeId();
 			ok(new OpenRequest(target, READ | WRITE), OpenResponse.class);
 
-			ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+			ok(new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"), RenameResponse.class);
 			write(target, 0, "OLD");
 
 			Assertions.assertEquals("OLD content", read(target, 0, 100));
@@ -1084,7 +1159,7 @@ public class FileSystemOperationsTest {
 			long target = createFile("target.txt", "replaced");
 			ok(new CloseRequest(source, 0), CloseResponse.class);
 
-			assertStatus(Errno.EBUSY, new RenameRequest(source, ROOT, ROOT, "target.txt"));
+			assertStatus(Errno.EBUSY, new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"));
 
 			ReadResponse response = ok(new ReadRequest(target, 0, 100), ReadResponse.class);
 			Assertions.assertEquals("replaced", StandardCharsets.UTF_8.decode(response.data()).toString());
@@ -1099,7 +1174,7 @@ public class FileSystemOperationsTest {
 			ok(new CloseRequest(source, 0), CloseResponse.class);
 			ok(new CloseRequest(target, 0), CloseResponse.class);
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(target, response.replacedAttributes().nodeId());
 			Assertions.assertEquals("new", read(source, 0, 100));
@@ -1112,10 +1187,10 @@ public class FileSystemOperationsTest {
 			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
 			long child = createFile("child.txt", "content");
 			ok(new CloseRequest(child, 0), CloseResponse.class);
-			ok(new RenameRequest(child, ROOT, source, "child.txt"), RenameResponse.class);
+			ok(new RenameRequest(child, ROOT, "child.txt", source, "child.txt"), RenameResponse.class);
 			create(ROOT, "target", NodeType.DIRECTORY);
 
-			ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+			ok(new RenameRequest(source, ROOT, "source", ROOT, "target"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals("content", read(lookup(source, "child.txt").nodeId(), 0, 100));
@@ -1129,7 +1204,7 @@ public class FileSystemOperationsTest {
 			create(ROOT, "target", NodeType.DIRECTORY);
 			Files.writeString(vault.getPath("/target/._a"), "");
 
-			ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+			ok(new RenameRequest(source, ROOT, "source", ROOT, "target"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals(List.of("content.txt"), backingNames(vault.getPath("/target")));
@@ -1142,7 +1217,7 @@ public class FileSystemOperationsTest {
 			Files.writeString(vault.getPath("/dir/._a"), "");
 			Files.writeString(vault.getPath("/dir/.DS_Store"), "");
 
-			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT, "dir"), RemoveResponse.class);
 
 			Assertions.assertEquals(List.of(), backingNames(vault.getPath("/")));
 		}
@@ -1154,7 +1229,7 @@ public class FileSystemOperationsTest {
 			Files.writeString(vault.getPath("/dir/._a"), "");
 			Files.writeString(vault.getPath("/dir/visible.txt"), "");
 
-			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT, "dir"));
 
 			Assertions.assertEquals(List.of("._a", "visible.txt"), backingNames(vault.getPath("/dir")));
 		}
@@ -1166,7 +1241,7 @@ public class FileSystemOperationsTest {
 			Files.writeString(vault.getPath("/dir/.DS_Store"), "");
 			Files.createDirectory(vault.getPath("/dir/._d"));
 
-			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT, "dir"));
 
 			Assertions.assertEquals(List.of(".DS_Store", "._d"), backingNames(vault.getPath("/dir")));
 		}
@@ -1179,7 +1254,7 @@ public class FileSystemOperationsTest {
 			create(ROOT, "target", NodeType.DIRECTORY);
 			Files.writeString(vault.getPath("/target/.DS_Store"), "");
 
-			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, ROOT, "target"));
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, "file.txt", ROOT, "target"));
 
 			Assertions.assertEquals(List.of(".", "..", "file.txt", "target"), names(readdir(ROOT, 0, 0, false)).stream().sorted().toList());
 			Assertions.assertEquals(List.of(".DS_Store"), backingNames(vault.getPath("/target")));
@@ -1195,7 +1270,7 @@ public class FileSystemOperationsTest {
 			write(file, 0, "content");
 			ok(new CloseRequest(file, 0), CloseResponse.class);
 
-			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, innermost, "moved"));
+			assertStatus(Errno.EINVAL, new RenameRequest(outer, ROOT, "outer", innermost, "moved"));
 
 			Assertions.assertEquals(List.of(".", "..", "outer"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertTrue(Files.isDirectory(vault.getPath("/outer/inner/innermost")));
@@ -1208,9 +1283,9 @@ public class FileSystemOperationsTest {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long file = createFile("file.txt", "one");
 
-			ok(new RenameRequest(file, ROOT, ROOT, "renamed.txt"), RenameResponse.class);
+			ok(new RenameRequest(file, ROOT, "file.txt", ROOT, "renamed.txt"), RenameResponse.class);
 			write(file, 3, " two");
-			ok(new RenameRequest(file, ROOT, directory, "moved.txt"), RenameResponse.class);
+			ok(new RenameRequest(file, ROOT, "renamed.txt", directory, "moved.txt"), RenameResponse.class);
 			write(file, 7, " three");
 			ok(new CloseRequest(file, 0), CloseResponse.class);
 
@@ -1226,8 +1301,8 @@ public class FileSystemOperationsTest {
 			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
 			long link = lookup(ROOT, "link").nodeId();
 
-			ok(new RenameRequest(directory, ROOT, target, "moved"), RenameResponse.class);
-			ok(new RenameRequest(link, ROOT, target, "moved link"), RenameResponse.class);
+			ok(new RenameRequest(directory, ROOT, "dir", target, "moved"), RenameResponse.class);
+			ok(new RenameRequest(link, ROOT, "link", target, "moved link"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of(".", "..", "target"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals(directory, lookup(target, "moved").nodeId());
@@ -1242,7 +1317,7 @@ public class FileSystemOperationsTest {
 			Files.createSymbolicLink(vault.getPath("/link"), vault.getPath("/elsewhere"));
 			long link = lookup(ROOT, "link").nodeId();
 
-			ok(new RenameRequest(link, ROOT, ROOT, "file.txt"), RenameResponse.class);
+			ok(new RenameRequest(link, ROOT, "link", ROOT, "file.txt"), RenameResponse.class);
 
 			Assertions.assertTrue(Files.isSymbolicLink(vault.getPath("/file.txt")));
 			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(ROOT, 0, 0, false)));
@@ -1253,7 +1328,7 @@ public class FileSystemOperationsTest {
 		public void testRemovedButOpen() {
 			long file = createFile("file.txt", "0123456789");
 
-			ok(new RemoveRequest(file, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(file, ROOT, "file.txt"), RemoveResponse.class);
 
 			Assertions.assertEquals(List.of(".", ".."), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals("0123456789", read(file, 0, 100));
@@ -1262,7 +1337,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("0123", read(file, 0, 100));
 			Assertions.assertEquals(4, getattr(file).size());
 			ok(new CloseRequest(file, 0), CloseResponse.class);
-			ok(new ForgetRequest(file), ForgetResponse.class);
+			ok(new ForgetRequest(file, 1), ForgetResponse.class);
 			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "file.txt"));
 		}
 
@@ -1270,7 +1345,7 @@ public class FileSystemOperationsTest {
 		@DisplayName("a file re-created under the name of a removed file that is still open is a file of its own")
 		public void testRecreateWhileRemovedFileIsOpen() {
 			long removed = createFile("file.txt", "removed");
-			ok(new RemoveRequest(removed, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(removed, ROOT, "file.txt"), RemoveResponse.class);
 
 			long recreated = createFile("file.txt", "recreated");
 			write(removed, 7, " and still open");
@@ -1489,7 +1564,7 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(6, response.written());
 			Assertions.assertEquals(14, response.attributes().size());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 			Assertions.assertEquals("01234567abcdef", Files.readString(root.resolve("file.txt")));
 		}
 
@@ -1537,7 +1612,7 @@ public class FileSystemOperationsTest {
 
 			CloseResponse response = ok(new CloseRequest(file, 0), CloseResponse.class);
 			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 		}
 
 		@Test
@@ -1545,7 +1620,7 @@ public class FileSystemOperationsTest {
 		public void testForgetClosesChannel() {
 			ok(new OpenRequest(file, READ), OpenResponse.class);
 
-			ok(new ForgetRequest(file), ForgetResponse.class);
+			ok(new ForgetRequest(file, 1), ForgetResponse.class);
 
 			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
 		}
@@ -1579,7 +1654,7 @@ public class FileSystemOperationsTest {
 			Mockito.verify(working).force(false);
 
 			Mockito.doNothing().when(failing).force(false);
-			Assertions.assertTrue(ok(new SyncRequest(), SyncResponse.class).usableBytes() > 0);
+			Assertions.assertTrue(ok(new SyncRequest(), SyncResponse.class).freeSpace().usableBytes() > 0);
 		}
 
 		@Test
@@ -1595,7 +1670,7 @@ public class FileSystemOperationsTest {
 			ok(new OpenRequest(other, WRITE), OpenResponse.class);
 
 			ok(new CloseRequest(file, 0), CloseResponse.class);
-			ok(new ForgetRequest(other), ForgetResponse.class);
+			ok(new ForgetRequest(other, 1), ForgetResponse.class);
 			ok(new SyncRequest(), SyncResponse.class);
 
 			Mockito.verify(closed, Mockito.never()).force(false);
@@ -1616,7 +1691,7 @@ public class FileSystemOperationsTest {
 			ops.channelWrapper = UnaryOperator.identity();
 
 			assertStatus(Errno.EIO, new CloseRequest(file, 0));
-			assertStatus(Errno.EIO, new ForgetRequest(other));
+			assertStatus(Errno.EIO, new ForgetRequest(other, 1));
 
 			ok(new SyncRequest(), SyncResponse.class);
 			Mockito.verify(failing, Mockito.never()).force(false);
@@ -1666,7 +1741,7 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(Messages.ATTRIBUTE_SIZE, response.applied());
 			Assertions.assertEquals(4, response.attributes().size());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 			Assertions.assertEquals("0123", Files.readString(root.resolve("file.txt")));
 			Assertions.assertEquals(List.of(), ops.openedChannels.stream().filter(FileChannel::isOpen).toList());
 		}
@@ -2037,7 +2112,7 @@ public class FileSystemOperationsTest {
 			ReaddirResponse page = readdir(ROOT, 0, 0, false);
 			long listed = page.entries().get(2).nodeId();
 			Assertions.assertEquals(listed, lookup(ROOT, "file.txt").nodeId());
-			ok(new ForgetRequest(listed), ForgetResponse.class);
+			ok(new ForgetRequest(listed, 1), ForgetResponse.class);
 
 			long relisted = readdir(ROOT, 2, page.verifier(), false).entries().getFirst().nodeId();
 
@@ -2076,7 +2151,7 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("create, symlink and remove invalidate the listings of their directory, rename those of all directories")
+		@DisplayName("create, symlink and remove invalidate the listings of their directory, rename those of its two directories")
 		public void testInvalidation() {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long file = create(directory, "file.txt", NodeType.FILE).nodeId();
@@ -2093,12 +2168,18 @@ public class FileSystemOperationsTest {
 			readdir(ROOT, 1, rootVerifier, false);
 
 			verifier = readdir(directory, 0, 0, false).verifier();
-			ok(new RemoveRequest(file, directory), RemoveResponse.class);
+			ok(new RemoveRequest(file, directory, "file.txt"), RemoveResponse.class);
 			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
 			readdir(ROOT, 1, rootVerifier, false);
 
-			ok(new RenameRequest(lookup(directory, "created.txt").nodeId(), directory, directory, "renamed.txt"), RenameResponse.class);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, rootVerifier, false));
+			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
+			rootVerifier = readdir(ROOT, 0, 0, false).verifier();
+			verifier = readdir(directory, 0, 0, false).verifier();
+			long otherVerifier = readdir(other, 0, 0, false).verifier();
+			ok(new RenameRequest(lookup(directory, "created.txt").nodeId(), directory, "created.txt", other, "renamed.txt"), RenameResponse.class);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(other, 1, otherVerifier, false));
+			readdir(ROOT, 1, rootVerifier, false);
 		}
 
 		@Test
@@ -2262,6 +2343,12 @@ public class FileSystemOperationsTest {
 			assertStatus(Errno.ENOTDIR, new ReaddirRequest(link, 0, 0, false));
 			assertStatus(Errno.ENOTDIR, new CreateRequest(link, "new.txt", NodeType.FILE, 0644));
 			assertStatus(Errno.ENOTDIR, new SymlinkRequest(link, "new", "target"));
+			assertStatus(Errno.ENOTDIR, new RemoveRequest(link, link, "link"));
+			assertStatus(Errno.ENOTDIR, new RenameRequest(link, link, "link", ROOT, "moved"));
+			assertStatus(Errno.ENOTDIR, new RenameRequest(link, ROOT, "link", link, "moved"));
+			// the parent is checked before the name
+			assertStatus(Errno.ENOTDIR, new CreateRequest(link, "._new", NodeType.FILE, 0644));
+			assertStatus(Errno.ENOTDIR, new SymlinkRequest(link, "a/b", "target"));
 			assertStatus(Errno.ENOTSUP, new ReadRequest(link, 0, 10));
 			assertStatus(Errno.ENOTSUP, new WriteRequest(link, 0, ByteBuffer.allocate(1)));
 		}
@@ -2296,7 +2383,7 @@ public class FileSystemOperationsTest {
 		@Test
 		@DisplayName("reading a link that was removed yields ESTALE")
 		public void testReadlinkOfRemovedLink() {
-			ok(new RemoveRequest(link, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(link, ROOT, "link"), RemoveResponse.class);
 
 			assertStatus(Errno.ESTALE, new ReadlinkRequest(link));
 		}
@@ -2312,7 +2399,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
 			Assertions.assertEquals(ROOT, response.attributes().parentId());
 			Assertions.assertEquals(ROOT, response.directoryAttributes().nodeId());
-			Assertions.assertTrue(response.usableBytes() > 0);
+			Assertions.assertTrue(response.freeSpace().usableBytes() > 0);
 			Assertions.assertEquals(response.attributes().nodeId(), lookup(ROOT, "new").nodeId());
 			Assertions.assertEquals(target, ok(new ReadlinkRequest(response.attributes().nodeId()), ReadlinkResponse.class).target());
 			Assertions.assertEquals(List.of("link", "new"), backingNames());
@@ -2357,7 +2444,7 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "content");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
-			RenameResponse response = ok(new RenameRequest(link, ROOT, ROOT, "file.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(link, ROOT, "link", ROOT, "file.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(file, response.replacedAttributes().nodeId());
 			Assertions.assertTrue(Files.isSymbolicLink(root.resolve("file.txt")));
@@ -2422,7 +2509,7 @@ public class FileSystemOperationsTest {
 		@Test
 		@DisplayName("removing a link deletes only the link")
 		public void testRemove() throws IOException {
-			ok(new RemoveRequest(link, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(link, ROOT, "link"), RemoveResponse.class);
 
 			Assertions.assertFalse(Files.exists(root.resolve("link"), LinkOption.NOFOLLOW_LINKS));
 			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
@@ -2431,7 +2518,7 @@ public class FileSystemOperationsTest {
 		@Test
 		@DisplayName("renaming a link moves the link itself")
 		public void testRename() throws IOException {
-			ok(new RenameRequest(link, ROOT, ROOT, "moved"), RenameResponse.class);
+			ok(new RenameRequest(link, ROOT, "link", ROOT, "moved"), RenameResponse.class);
 
 			Assertions.assertTrue(Files.isSymbolicLink(root.resolve("moved")));
 			Assertions.assertEquals("secret", Files.readString(outside.resolve("secret.txt")));
@@ -2461,7 +2548,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(14, response.attributes().size());
 			Assertions.assertEquals(last.nodeId(), response.attributes().nodeId());
 			Assertions.assertEquals(last.mode(), response.attributes().mode());
-			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.freeSpace().usableBytes());
 			Assertions.assertEquals("01234567abcdef", Files.readString(root.resolve("file.txt")));
 		}
 
@@ -2503,8 +2590,10 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(0640, response.attributes().mode());
 			Assertions.assertEquals(0, response.attributes().size());
 			Assertions.assertEquals(ROOT, response.attributes().parentId());
-			Assertions.assertEquals(directory, response.directoryAttributes());
-			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+			Assertions.assertEquals(state(directory), state(response.directoryAttributes()));
+			// derived from what the change established, which is newer than any sample taken before
+			Assertions.assertTrue(response.directoryAttributes().generation() > directory.generation());
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.freeSpace().usableBytes());
 		}
 
 		@Test
@@ -2526,8 +2615,8 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(0644, response.attributes().mode());
 			Assertions.assertEquals(7, response.attributes().size());
 			Assertions.assertEquals(ROOT, response.attributes().parentId());
-			Assertions.assertEquals(directory, response.directoryAttributes());
-			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.usableBytes());
+			Assertions.assertEquals(state(directory), state(response.directoryAttributes()));
+			Assertions.assertEquals(Messages.UNKNOWN_USABLE_BYTES, response.freeSpace().usableBytes());
 		}
 
 		@Test
@@ -2542,13 +2631,13 @@ public class FileSystemOperationsTest {
 				}
 			};
 
-			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, ROOT, "new.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, "old.txt", ROOT, "new.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(List.of("new.txt"), backingNames());
 			Assertions.assertEquals("new.txt", response.name());
-			Assertions.assertEquals(file, response.attributes());
-			Assertions.assertEquals(directory, response.sourceDirectoryAttributes());
-			Assertions.assertEquals(directory, response.destinationDirectoryAttributes());
+			Assertions.assertEquals(state(file), state(response.attributes()));
+			Assertions.assertEquals(state(directory), state(response.sourceDirectoryAttributes()));
+			Assertions.assertEquals(state(directory), state(response.destinationDirectoryAttributes()));
 		}
 
 		@Test
@@ -2556,11 +2645,16 @@ public class FileSystemOperationsTest {
 		public void testStoredNameUnreadable() throws IOException {
 			backing("old.txt", "content");
 			long file = lookup(ROOT, "old.txt").nodeId();
-			ops.beforeResolvingRealPath = failing;
+			// once the entry is there: a rename looks for an entry under its new name before it moves
+			ops.beforeResolvingRealPath = path -> {
+				if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+					throw failure;
+				}
+			};
 
 			Assertions.assertEquals("created.txt", ok(new CreateRequest(ROOT, "created.txt", NodeType.FILE, 0644), CreateResponse.class).name());
 			Assertions.assertEquals("link", ok(new SymlinkRequest(ROOT, "link", "target"), SymlinkResponse.class).name());
-			Assertions.assertEquals("new.txt", ok(new RenameRequest(file, ROOT, ROOT, "new.txt"), RenameResponse.class).name());
+			Assertions.assertEquals("new.txt", ok(new RenameRequest(file, ROOT, "old.txt", ROOT, "new.txt"), RenameResponse.class).name());
 
 			Assertions.assertEquals(List.of("created.txt", "link", "new.txt"), backingNames());
 		}
@@ -2577,7 +2671,7 @@ public class FileSystemOperationsTest {
 				}
 			};
 
-			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, directory, "file.txt"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(file.nodeId(), ROOT, "file.txt", directory, "file.txt"), RenameResponse.class);
 
 			Assertions.assertEquals(directory, response.attributes().parentId());
 			Assertions.assertEquals(file.nodeId(), response.attributes().nodeId());
@@ -2635,10 +2729,10 @@ public class FileSystemOperationsTest {
 				}
 			};
 
-			RemoveResponse response = ok(new RemoveRequest(file.nodeId(), ROOT), RemoveResponse.class);
+			RemoveResponse response = ok(new RemoveRequest(file.nodeId(), ROOT, "file.txt"), RemoveResponse.class);
 
-			Assertions.assertEquals(file, response.attributes());
-			Assertions.assertEquals(directory, response.directoryAttributes());
+			Assertions.assertEquals(state(file), state(response.attributes()));
+			Assertions.assertEquals(state(directory), state(response.directoryAttributes()));
 		}
 	}
 
@@ -2708,8 +2802,8 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("", read(file.nodeId(), 0, 100));
 			ok(new CloseRequest(file.nodeId(), 0), CloseResponse.class);
 			ok(new CloseRequest(directory.nodeId(), 0), CloseResponse.class);
-			ok(new ForgetRequest(file.nodeId()), ForgetResponse.class);
-			ok(new ForgetRequest(directory.nodeId()), ForgetResponse.class);
+			ok(new ForgetRequest(file.nodeId(), 1), ForgetResponse.class);
+			ok(new ForgetRequest(directory.nodeId(), 1), ForgetResponse.class);
 			Assertions.assertEquals(file, lookup(directory.nodeId(), "no_log"));
 		}
 
@@ -2732,12 +2826,12 @@ public class FileSystemOperationsTest {
 					new WriteRequest(file.nodeId(), 0, ByteBuffer.allocate(1)), //
 					new SetattrRequest(file.nodeId(), Messages.ATTRIBUTE_SIZE, 1, 0, EPOCH, EPOCH), //
 					new SetattrRequest(directory.nodeId(), Messages.ATTRIBUTE_MODE, 0, 0700, EPOCH, EPOCH), //
-					new RemoveRequest(file.nodeId(), directory.nodeId()), //
-					new RemoveRequest(directory.nodeId(), ROOT), //
-					new RenameRequest(file.nodeId(), directory.nodeId(), ROOT, "moved"), //
-					new RenameRequest(directory.nodeId(), ROOT, ROOT, "moved"), //
-					new RenameRequest(stored, ROOT, directory.nodeId(), "file.txt"), //
-					new RenameRequest(stored, ROOT, ROOT, ".fseventsd"));
+					new RemoveRequest(file.nodeId(), directory.nodeId(), "no_log"), //
+					new RemoveRequest(directory.nodeId(), ROOT, ".fseventsd"), //
+					new RenameRequest(file.nodeId(), directory.nodeId(), "no_log", ROOT, "moved"), //
+					new RenameRequest(directory.nodeId(), ROOT, ".fseventsd", ROOT, "moved"), //
+					new RenameRequest(stored, ROOT, "file.txt", directory.nodeId(), "file.txt"), //
+					new RenameRequest(stored, ROOT, "file.txt", ROOT, ".fseventsd"));
 
 			assertStatus(Errno.EEXIST, new CreateRequest(ROOT, ".fseventsd", NodeType.DIRECTORY, 0700));
 			assertStatus(Errno.EEXIST, new SymlinkRequest(ROOT, ".fseventsd", "file.txt"));
@@ -2769,7 +2863,7 @@ public class FileSystemOperationsTest {
 		@DisplayName("lookup of a hidden name in a removed directory or in a file yields ENOENT")
 		public void testLookupWhereNoEntryCanBe() throws IOException {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
-			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT, "dir"), RemoveResponse.class);
 			backing("file.txt", "");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
@@ -2816,8 +2910,8 @@ public class FileSystemOperationsTest {
 			backing("file.txt", "content");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
-			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, ROOT, "._file.txt"));
-			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, ROOT, ".DS_Store"));
+			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, "file.txt", ROOT, "._file.txt"));
+			assertStatus(Errno.EPERM, new RenameRequest(file, ROOT, "file.txt", ROOT, ".DS_Store"));
 
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 		}
@@ -2829,7 +2923,7 @@ public class FileSystemOperationsTest {
 			backing("dir/._a", "");
 			backing("dir/.DS_Store", "");
 
-			ok(new RemoveRequest(directory, ROOT), RemoveResponse.class);
+			ok(new RemoveRequest(directory, ROOT, "dir"), RemoveResponse.class);
 
 			Assertions.assertEquals(List.of(), backingNames());
 		}
@@ -2841,7 +2935,7 @@ public class FileSystemOperationsTest {
 			backing("dir/._a", "");
 			backing("dir/visible.txt", "");
 
-			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT, "dir"));
 
 			Assertions.assertEquals(List.of("._a", "visible.txt"), backingNames(root.resolve("dir")));
 		}
@@ -2854,7 +2948,7 @@ public class FileSystemOperationsTest {
 			backing("dir/.DS_Store", "");
 			Files.createDirectory(root.resolve("dir/._d"));
 
-			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT));
+			assertStatus(Errno.ENOTEMPTY, new RemoveRequest(directory, ROOT, "dir"));
 
 			Assertions.assertEquals(List.of(".DS_Store", "._d"), backingNames(root.resolve("dir")));
 		}
@@ -2868,7 +2962,7 @@ public class FileSystemOperationsTest {
 			// not a ._ file, which macOS's rmdir would delete by itself
 			backing("target/.DS_Store", "");
 
-			RenameResponse response = ok(new RenameRequest(source, ROOT, ROOT, "target"), RenameResponse.class);
+			RenameResponse response = ok(new RenameRequest(source, ROOT, "source", ROOT, "target"), RenameResponse.class);
 
 			Assertions.assertEquals(target.nodeId(), response.replacedAttributes().nodeId());
 			Assertions.assertEquals(List.of("target"), backingNames());
@@ -2884,10 +2978,519 @@ public class FileSystemOperationsTest {
 			// not a ._ file, which macOS's rmdir would delete by itself
 			backing("target/.DS_Store", "");
 
-			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, ROOT, "target"));
+			assertStatus(Errno.ENOTEMPTY, new RenameRequest(file, ROOT, "file.txt", ROOT, "target"));
 
 			Assertions.assertEquals(List.of("file.txt", "target"), backingNames());
 			Assertions.assertEquals(List.of(".DS_Store"), backingNames(root.resolve("target")));
+		}
+	}
+
+	@Nested
+	@DisplayName("concurrently")
+	@Timeout(60)
+	public class Concurrently {
+
+		/**
+		 * How long a request that is meant to wait is given to show that it does.
+		 */
+		private static final long BLOCKED_MILLIS = 300;
+
+		private final ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor();
+
+		@AfterEach
+		public void stopThreads() {
+			threads.shutdownNow();
+		}
+
+		private Future<Response> async(Request request) {
+			return threads.submit(() -> ops.handle(request));
+		}
+
+		private static void assertWaits(Future<?> future) {
+			Assertions.assertThrows(TimeoutException.class, () -> future.get(BLOCKED_MILLIS, TimeUnit.MILLISECONDS));
+		}
+
+		private static <T extends Response> T done(Future<Response> future, Class<T> type) throws Exception {
+			return Assertions.assertInstanceOf(type, future.get(10, TimeUnit.SECONDS));
+		}
+
+		/**
+		 * @return A hook that blocks the first time it runs for the given path, and does nothing otherwise
+		 */
+		private static HookedOperations.Hook blockingOnce(Path path, CountDownLatch entered, CountDownLatch release) {
+			return onlyAt(path, HookedOperations.blocking(entered, release));
+		}
+
+		/**
+		 * @return A hook that runs the given one the first time it runs for the given path, and does nothing otherwise
+		 */
+		private static HookedOperations.Hook onlyAt(Path path, HookedOperations.Hook hook) {
+			AtomicBoolean ran = new AtomicBoolean();
+			return candidate -> {
+				if (candidate.equals(path) && ran.compareAndSet(false, true)) {
+					hook.run(candidate);
+				}
+			};
+		}
+		@Test
+		@DisplayName("an operation whose node a rename moved before it took its locks takes them anew for the new path")
+		public void testRevalidation() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			long file = create(directory, "f", NodeType.FILE).nodeId();
+
+			Future<Response> getattr = movedBeforeLocking(new GetattrRequest(file), root.resolve("d/f"), hook -> ops.beforeReadingAttributes = onlyAt(root.resolve("e/f"), hook));
+
+			done(getattr, GetattrResponse.class);
+			Assertions.assertTrue(Files.exists(root.resolve("g/f")));
+		}
+
+		@Test
+		@DisplayName("a read that changes the access time while a getattr samples the file replies with the later generation")
+		public void testGenerationOfRead() throws Exception {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			CountDownLatch sampling = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.afterReadingAttributes = blockingOnce(root.resolve("file.txt"), sampling, release);
+
+			Future<Response> getattr = async(new GetattrRequest(file));
+			Assertions.assertTrue(sampling.await(5, TimeUnit.SECONDS));
+			Future<Response> read = async(new ReadRequest(file, 0, 10));
+
+			assertWaits(read);
+			release.countDown();
+			long sampled = done(getattr, GetattrResponse.class).attributes().generation();
+			Assertions.assertTrue(done(read, ReadResponse.class).attributes().generation() > sampled);
+		}
+
+		@Test
+		@DisplayName("a create in a directory that a listing samples replies with a later generation of the directory than the listing")
+		public void testGenerationOfListedDirectory() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			long sub = create(directory, "sub", NodeType.DIRECTORY).nodeId();
+			CountDownLatch sampling = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.afterReadingAttributes = blockingOnce(root.resolve("d/sub"), sampling, release);
+
+			Future<Response> listing = async(new ReaddirRequest(directory, 0, 0, true));
+			Assertions.assertTrue(sampling.await(5, TimeUnit.SECONDS));
+			Future<Response> created = async(new CreateRequest(sub, "file.txt", NodeType.FILE, 0644));
+
+			assertWaits(created);
+			release.countDown();
+			long listed = done(listing, ReaddirResponse.class).entries().getFirst().attributes().generation();
+			Assertions.assertTrue(done(created, CreateResponse.class).directoryAttributes().generation() > listed);
+		}
+
+		@Test
+		@DisplayName("a lookup that overlaps the forget of its node replies with a node that stays known")
+		public void testLookupOverlappingForget() throws Exception {
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch held = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.afterHold = blockingOnce(root.resolve("file.txt"), held, release);
+
+			Future<Response> lookup = async(new LookupRequest(ROOT, "file.txt"));
+			Assertions.assertTrue(held.await(5, TimeUnit.SECONDS));
+			ok(new ForgetRequest(file, 1), ForgetResponse.class);
+			release.countDown();
+
+			long found = done(lookup, LookupResponse.class).attributes().nodeId();
+			Assertions.assertEquals(found, getattr(found).nodeId());
+		}
+		/**
+		 * Blocks a request on the entry {@code a/f} before it takes its locks, moves the entry to {@code b/f} meanwhile, and expects ENOENT with the entry left in {@code b}.
+		 *
+		 * @param request Makes the request from the node id of the entry and of {@code a}
+		 */
+		private void assertMovedMeanwhile(BiFunction<Long, Long, Request> request) throws Exception {
+			long a = create(ROOT, "a", NodeType.DIRECTORY).nodeId();
+			long b = create(ROOT, "b", NodeType.DIRECTORY).nodeId();
+			long file = create(a, "f", NodeType.FILE).nodeId();
+			CountDownLatch locking = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = blockingOnce(root.resolve("a/f"), locking, release);
+
+			Future<Response> pending = async(request.apply(file, a));
+			Assertions.assertTrue(locking.await(5, TimeUnit.SECONDS));
+			ok(new RenameRequest(file, a, "f", b, "f"), RenameResponse.class);
+			release.countDown();
+
+			Assertions.assertEquals(new Failure(Errno.ENOENT), pending.get(10, TimeUnit.SECONDS));
+			Assertions.assertTrue(Files.exists(root.resolve("b/f")));
+		}
+
+		@Test
+		@DisplayName("a remove of an entry that a rename moved to another directory meanwhile yields ENOENT and removes nothing")
+		public void testRemoveAfterMove() throws Exception {
+			assertMovedMeanwhile((file, a) -> new RemoveRequest(file, a, "f"));
+		}
+
+		@Test
+		@DisplayName("a rename of an entry that another rename moved to another directory meanwhile yields ENOENT and moves nothing")
+		public void testRenameAfterMove() throws Exception {
+			assertMovedMeanwhile((file, a) -> new RenameRequest(file, a, "f", ROOT, "g"));
+		}
+		/**
+		 * Blocks a request before it takes its locks for the directory {@code d}, renames {@code d} to {@code e}, and lets the request go on until it reaches a path below {@code e}. A rename of {@code e} to {@code g} has to wait for it there, which it would not if the request had kept the locks for {@code d}.
+		 *
+		 * @param locked  The path whose lock the request is blocked before
+		 * @param reached Installs the given hook where the request reaches the path below {@code e}
+		 * @return The request, which has completed, as has the rename to {@code g} after it
+		 */
+		private Future<Response> movedBeforeLocking(Request request, Path locked, Consumer<HookedOperations.Hook> reached) throws Exception {
+			long directory = lookup(ROOT, "d").nodeId();
+			CountDownLatch locking = new CountDownLatch(1);
+			CountDownLatch continueLocking = new CountDownLatch(1);
+			CountDownLatch blocked = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = blockingOnce(locked, locking, continueLocking);
+			reached.accept(HookedOperations.blocking(blocked, release));
+
+			Future<Response> pending = async(request);
+			Assertions.assertTrue(locking.await(5, TimeUnit.SECONDS));
+			ok(new RenameRequest(directory, ROOT, "d", ROOT, "e"), RenameResponse.class);
+			continueLocking.countDown();
+			Assertions.assertTrue(blocked.await(5, TimeUnit.SECONDS));
+			Future<Response> rename = async(new RenameRequest(directory, ROOT, "e", ROOT, "g"));
+			assertWaits(rename);
+			release.countDown();
+			done(rename, RenameResponse.class);
+			return pending;
+		}
+
+		@Test
+		@DisplayName("a lookup in a directory that a rename moved before the lookup took its locks takes them anew for the new path")
+		public void testRevalidationOfLookup() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			create(directory, "f", NodeType.FILE);
+
+			Future<Response> lookup = movedBeforeLocking(new LookupRequest(directory, "f"), root.resolve("d"), hook -> ops.beforeReadingAttributes = onlyAt(root.resolve("e/f"), hook));
+
+			done(lookup, LookupResponse.class);
+		}
+
+		@Test
+		@DisplayName("a remove of an entry whose directory a rename moved before the remove took its locks takes them anew for the new path")
+		public void testRevalidationOfRemove() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			long file = create(directory, "f", NodeType.FILE).nodeId();
+
+			Future<Response> remove = movedBeforeLocking(new RemoveRequest(file, directory, "f"), root.resolve("d"), hook -> ops.beforeReadingAttributes = onlyAt(root.resolve("e/f"), hook));
+
+			done(remove, RemoveResponse.class);
+			Assertions.assertFalse(Files.exists(root.resolve("g/f")));
+		}
+
+		@Test
+		@DisplayName("a rename of an entry whose directory a rename moved before it took its locks takes them anew for the new path")
+		public void testRevalidationOfRename() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			long file = create(directory, "f", NodeType.FILE).nodeId();
+
+			Future<Response> rename = movedBeforeLocking(new RenameRequest(file, directory, "f", directory, "h"), root.resolve("d"), hook -> ops.beforeMoving = onlyAt(root.resolve("e/f"), hook));
+
+			done(rename, RenameResponse.class);
+			Assertions.assertTrue(Files.exists(root.resolve("g/h")));
+		}
+
+		@Test
+		@DisplayName("a create in a directory that a rename moved before the create took its locks creates the entry at the new path")
+		public void testRevalidationOfCreate() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			CountDownLatch locking = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = blockingOnce(root.resolve("d"), locking, release);
+
+			Future<Response> created = async(new CreateRequest(directory, "f", NodeType.FILE, 0644));
+			Assertions.assertTrue(locking.await(5, TimeUnit.SECONDS));
+			ok(new RenameRequest(directory, ROOT, "d", ROOT, "e"), RenameResponse.class);
+			release.countDown();
+
+			done(created, CreateResponse.class);
+			Assertions.assertTrue(Files.exists(root.resolve("e/f")));
+		}
+
+		@Test
+		@DisplayName("a write to a file whose lookup is sampling it waits for the sample and replies with a later generation")
+		public void testGenerationOfLookup() throws Exception {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+			CountDownLatch sampling = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.afterReadingAttributes = blockingOnce(root.resolve("file.txt"), sampling, release);
+
+			Future<Response> lookup = async(new LookupRequest(ROOT, "file.txt"));
+			Assertions.assertTrue(sampling.await(5, TimeUnit.SECONDS));
+			Future<Response> written = async(new WriteRequest(file, 0, StandardCharsets.UTF_8.encode("more content")));
+
+			assertWaits(written);
+			release.countDown();
+			long sampled = done(lookup, LookupResponse.class).attributes().generation();
+			Assertions.assertTrue(done(written, WriteResponse.class).attributes().generation() > sampled);
+		}
+
+		@Test
+		@DisplayName("a sample of the free space that waits to read it is older than one a change takes meanwhile")
+		public void testGenerationOfFreeSpace() throws Exception {
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch reading = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			Runnable blocking = HookedOperations.blockingOnce(reading, release);
+			ops.beforeReadingUsableSpace = _ -> blocking.run();
+
+			Future<Response> statfs = async(new StatfsRequest());
+			Assertions.assertTrue(reading.await(5, TimeUnit.SECONDS));
+			long changed = write(file, 0, "data").freeSpace().generation();
+			release.countDown();
+
+			Assertions.assertTrue(done(statfs, StatfsResponse.class).freeSpace().generation() < changed);
+		}
+
+		@Test
+		@DisplayName("a write that waited while a forget removed its node yields ESTALE and leaves no channel open")
+		public void testWriteAfterForget() throws Exception {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch locking = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = blockingOnce(root.resolve("file.txt"), locking, release);
+
+			Future<Response> written = async(new WriteRequest(file, 0, StandardCharsets.UTF_8.encode("data")));
+			Assertions.assertTrue(locking.await(5, TimeUnit.SECONDS));
+			ok(new ForgetRequest(file, 1), ForgetResponse.class);
+			release.countDown();
+
+			Assertions.assertEquals(new Failure(Errno.ESTALE), written.get(10, TimeUnit.SECONDS));
+			Assertions.assertEquals(List.of(), ops.openedChannels);
+		}
+
+		@Test
+		@DisplayName("two reads of one file run at the same time")
+		public void testReadsShareTheFile() throws Exception {
+			backing("file.txt", "content");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch reading = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.READ, HookedOperations.blockingOnce(reading, release)));
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			Future<Response> first = async(new ReadRequest(file, 0, 10));
+			Assertions.assertTrue(reading.await(5, TimeUnit.SECONDS));
+			Future<Response> second = async(new ReadRequest(file, 0, 10));
+
+			done(second, ReadResponse.class);
+			release.countDown();
+			done(first, ReadResponse.class);
+		}
+
+		@Test
+		@DisplayName("a sync waits for a channel that is being closed")
+		public void testSyncWaitsForClose() throws Exception {
+			backing("file.txt", "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch closing = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.CLOSE, HookedOperations.blockingOnce(closing, release)));
+			write(file, 0, "data");
+
+			Future<Response> close = async(new CloseRequest(file, 0));
+			Assertions.assertTrue(closing.await(5, TimeUnit.SECONDS));
+			Future<Response> sync = async(new SyncRequest());
+
+			assertWaits(sync);
+			release.countDown();
+			done(close, CloseResponse.class);
+			done(sync, SyncResponse.class);
+		}
+
+		@Test
+		@DisplayName("a sync that is forcing one channel when another starts to close waits for that close")
+		public void testSyncStartedBeforeClose() throws Exception {
+			backing("f", "");
+			backing("g", "");
+			Map<String, Long> files = Map.of("f", lookup(ROOT, "f").nodeId(), "g", lookup(ROOT, "g").nodeId());
+			CountDownLatch forcing = new CountDownLatch(1);
+			CountDownLatch continueForcing = new CountDownLatch(1);
+			CountDownLatch closing = new CountDownLatch(1);
+			CountDownLatch continueClosing = new CountDownLatch(1);
+			Runnable blockingForce = HookedOperations.blockingOnce(forcing, continueForcing);
+			Runnable blockingClose = HookedOperations.blockingOnce(closing, continueClosing);
+			AtomicReference<String> forcedFirst = new AtomicReference<>();
+			Set<String> blockingCloses = ConcurrentHashMap.newKeySet();
+			for (String name : files.keySet()) {
+				ops.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.FORCE, () -> {
+					forcedFirst.compareAndSet(null, name);
+					blockingForce.run();
+				}, ChannelCall.CLOSE, () -> {
+					if (blockingCloses.contains(name)) {
+						blockingClose.run();
+					}
+				}));
+				write(files.get(name), 0, "data");
+			}
+
+			Future<Response> sync = async(new SyncRequest());
+			Assertions.assertTrue(forcing.await(5, TimeUnit.SECONDS));
+			String other = forcedFirst.get().equals("f") ? "g" : "f";
+			blockingCloses.add(other);
+			Future<Response> close = async(new CloseRequest(files.get(other), 0));
+			Assertions.assertTrue(closing.await(5, TimeUnit.SECONDS));
+			continueForcing.countDown();
+
+			assertWaits(sync);
+			continueClosing.countDown();
+			done(close, CloseResponse.class);
+			done(sync, SyncResponse.class);
+		}
+
+		@Test
+		@DisplayName("a rename in other directories leaves the listing of a directory and the ids it reported valid")
+		public void testListingAcrossRename() throws IOException {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			for (int i = 0; i < 250; i++) {
+				backing("d/" + "x".repeat(200) + i, "");
+			}
+			long source = create(ROOT, "e", NodeType.DIRECTORY).nodeId();
+			long destination = create(ROOT, "f", NodeType.DIRECTORY).nodeId();
+			long moved = create(source, "moved", NodeType.FILE).nodeId();
+			ReaddirResponse first = readdir(directory, 0, 0, false);
+			Assertions.assertTrue(first.more());
+
+			ok(new RenameRequest(moved, source, "moved", destination, "moved"), RenameResponse.class);
+
+			Assertions.assertFalse(readdir(directory, first.entries().getLast().nextCookie(), first.verifier(), false).entries().isEmpty());
+			for (DirectoryEntry entry : first.entries()) {
+				Assertions.assertEquals(entry.nodeId(), getattr(entry.nodeId()).nodeId());
+			}
+		}
+
+		@Test
+		@DisplayName("a listing whose page is being built is not dropped to make room for others, and the ids on the page stay valid")
+		public void testPinnedListing() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			for (String name : List.of("a", "b", "c")) {
+				backing("d/" + name, "");
+			}
+			CountDownLatch sampling = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			AtomicInteger reads = new AtomicInteger();
+			HookedOperations.Hook blocking = HookedOperations.blocking(sampling, release);
+			// the second entry, so that one was reported before
+			ops.afterReadingAttributes = path -> {
+				if (path.getParent().equals(root.resolve("d")) && reads.incrementAndGet() == 2) {
+					blocking.run(path);
+				}
+			};
+
+			Future<Response> listing = async(new ReaddirRequest(directory, 0, 0, true));
+			Assertions.assertTrue(sampling.await(5, TimeUnit.SECONDS));
+			for (int i = 0; i < 16; i++) {
+				readdir(ROOT, 0, 0, false);
+			}
+			release.countDown();
+
+			ReaddirResponse page = done(listing, ReaddirResponse.class);
+			Assertions.assertEquals(3, page.entries().size());
+			for (DirectoryEntry entry : page.entries()) {
+				Assertions.assertEquals(entry.nodeId(), getattr(entry.nodeId()).nodeId());
+			}
+		}
+
+		@Test
+		@DisplayName("a create over a node whose entry was deleted outside the volume closes that node's channel before it sets the new one")
+		public void testCreateOverLeftoverNode() throws IOException {
+			long first = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+			Files.delete(root.resolve("file.txt"));
+
+			long second = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+
+			Assertions.assertEquals(first, second);
+			Assertions.assertFalse(ops.openedChannels.get(0).isOpen());
+			Assertions.assertTrue(ops.openedChannels.get(1).isOpen());
+			write(second, 0, "new");
+			Assertions.assertEquals("new", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a create over a node whose leftover channel fails to close still succeeds, and the new channel serves the node")
+		public void testCreateOverLeftoverNodeWithFailingClose() throws IOException {
+			ops.channelWrapper = channel -> hooked(channel, Map.of(ChannelCall.CLOSE, () -> {
+				throw new UncheckedIOException(new IOException("disk on fire"));
+			}));
+			long first = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+			Files.delete(root.resolve("file.txt"));
+			ops.channelWrapper = UnaryOperator.identity();
+
+			long second = create(ROOT, "file.txt", NodeType.FILE).nodeId();
+
+			Assertions.assertEquals(first, second);
+			write(second, 0, "new");
+			Assertions.assertEquals("new", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals("new", read(second, 0, 10));
+		}
+
+		@Test
+		@DisplayName("random operations from many threads neither deadlock nor fail unexpectedly, and leave every linked node at an entry of its type")
+		public void testStress() throws Exception {
+			long[] directories = {create(ROOT, "d0", NodeType.DIRECTORY).nodeId(), create(ROOT, "d1", NodeType.DIRECTORY).nodeId()};
+			create(directories[0], "sub", NodeType.DIRECTORY);
+			List<String> names = List.of("a", "b", "c", "sub");
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+			List<Future<?>> workers = new ArrayList<>();
+			for (int i = 0; i < 16; i++) {
+				Random random = new Random(i);
+				workers.add(threads.submit(() -> {
+					while (System.nanoTime() < deadline) {
+						step(random, directories, names);
+					}
+					return null;
+				}));
+			}
+			for (Future<?> worker : workers) {
+				worker.get(30, TimeUnit.SECONDS);
+			}
+
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+			for (Node node : ops.heldNodes) {
+				if (!node.unlinked && !node.forgotten) {
+					BasicFileAttributes attributes = Files.readAttributes(node.path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+					Assertions.assertEquals(node.type, attributes.isDirectory() ? NodeType.DIRECTORY : NodeType.FILE, node.path.toString());
+				}
+			}
+		}
+
+		private void step(Random random, long[] directories, List<String> names) {
+			long directory = directories[random.nextInt(directories.length)];
+			String name = names.get(random.nextInt(names.size()));
+			switch (random.nextInt(4)) {
+				case 0 -> ops.handle(new LookupRequest(directory, name));
+				case 1 -> listAll(directory);
+				case 2 -> ops.handle(new CreateRequest(directory, name, random.nextBoolean() ? NodeType.FILE : NodeType.DIRECTORY, 0755));
+				default -> {
+					if (ops.handle(new LookupRequest(directory, name)) instanceof LookupResponse found) {
+						long node = found.attributes().nodeId();
+						long other = directories[random.nextInt(directories.length)];
+						switch (random.nextInt(4)) {
+							case 0 -> ops.handle(new WriteRequest(node, random.nextInt(100), StandardCharsets.UTF_8.encode("data")));
+							case 1 -> ops.handle(new ReadRequest(node, 0, 100));
+							case 2 -> ops.handle(new RenameRequest(node, directory, name, other, names.get(random.nextInt(names.size()))));
+							default -> ops.handle(new RemoveRequest(node, directory, name));
+						}
+					}
+				}
+			}
+		}
+
+		private void listAll(long directory) {
+			Response response = ops.handle(new ReaddirRequest(directory, 0, 0, true));
+			while (response instanceof ReaddirResponse page && page.more()) {
+				response = ops.handle(new ReaddirRequest(directory, page.entries().getLast().nextCookie(), page.verifier(), true));
+			}
 		}
 	}
 
@@ -2915,8 +3518,8 @@ public class FileSystemOperationsTest {
 					new CreateRequest(ROOT, "new.txt", NodeType.FILE, 0644), //
 					new CreateRequest(ROOT, "dir", NodeType.DIRECTORY, 0755), //
 					new SymlinkRequest(ROOT, "link", "file.txt"), //
-					new RemoveRequest(file, ROOT), //
-					new RenameRequest(file, ROOT, ROOT, "renamed.txt"), //
+					new RemoveRequest(file, ROOT, "file.txt"), //
+					new RenameRequest(file, ROOT, "file.txt", ROOT, "renamed.txt"), //
 					new WriteRequest(file, 0, ByteBuffer.allocate(1)), //
 					new OpenRequest(file, WRITE), //
 					new OpenRequest(file, READ | WRITE));

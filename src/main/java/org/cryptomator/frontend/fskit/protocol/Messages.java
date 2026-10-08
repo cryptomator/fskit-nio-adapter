@@ -170,9 +170,12 @@ public final class Messages {
 		}
 	}
 
-	public record Attributes(NodeType type, int mode, long size, long nodeId, long parentId, Timestamp modified, Timestamp accessed, Timestamp created) {
+	/**
+	 * @param generation Orders the records of one item: of two, the one with the higher generation describes the later state. 0 for a record that never changes.
+	 */
+	public record Attributes(NodeType type, int mode, long size, long nodeId, long parentId, Timestamp modified, Timestamp accessed, Timestamp created, long generation) {
 
-		static final int ENCODED_LENGTH = 1 + 2 + 8 + 8 + 8 + 3 * (8 + 4);
+		static final int ENCODED_LENGTH = 1 + 2 + 8 + 8 + 8 + 3 * (8 + 4) + 8;
 
 		void encode(ByteBuffer buffer) {
 			type.encode(buffer);
@@ -180,10 +183,26 @@ public final class Messages {
 			modified.encode(buffer);
 			accessed.encode(buffer);
 			created.encode(buffer);
+			buffer.putLong(generation);
 		}
 
 		static Attributes decode(ByteBuffer buffer) throws ProtocolException {
-			return new Attributes(NodeType.decode(buffer), Short.toUnsignedInt(buffer.getShort()), buffer.getLong(), buffer.getLong(), buffer.getLong(), Timestamp.decode(buffer), Timestamp.decode(buffer), Timestamp.decode(buffer));
+			return new Attributes(NodeType.decode(buffer), Short.toUnsignedInt(buffer.getShort()), buffer.getLong(), buffer.getLong(), buffer.getLong(), Timestamp.decode(buffer), Timestamp.decode(buffer), Timestamp.decode(buffer), buffer.getLong());
+		}
+	}
+
+	/**
+	 * @param usableBytes The space available in the backing store, or {@link #UNKNOWN_USABLE_BYTES}
+	 * @param generation  Orders the samples of one connection: of two, the one with the higher generation is not older
+	 */
+	public record FreeSpace(long usableBytes, long generation) {
+
+		void encode(ByteBuffer buffer) {
+			buffer.putLong(usableBytes).putLong(generation);
+		}
+
+		static FreeSpace decode(ByteBuffer buffer) {
+			return new FreeSpace(buffer.getLong(), buffer.getLong());
 		}
 	}
 
@@ -273,7 +292,10 @@ public final class Messages {
 		}
 	}
 
-	public record ForgetRequest(long nodeId) implements Request {
+	/**
+	 * @param lookups The number of successful {@code LOOKUP}, {@code CREATE} and {@code SYMLINK} responses for the node that the client received and forgets now
+	 */
+	public record ForgetRequest(long nodeId, long lookups) implements Request {
 
 		@Override
 		public Opcode opcode() {
@@ -282,11 +304,11 @@ public final class Messages {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(nodeId);
+			control.putLong(nodeId).putLong(lookups);
 		}
 
 		static ForgetRequest decode(ByteBuffer control) {
-			return new ForgetRequest(control.getLong());
+			return new ForgetRequest(control.getLong(), control.getLong());
 		}
 	}
 
@@ -364,7 +386,7 @@ public final class Messages {
 		}
 	}
 
-	public record RemoveRequest(long nodeId, long parentId) implements Request {
+	public record RemoveRequest(long nodeId, long parentId, String name) implements Request {
 
 		@Override
 		public Opcode opcode() {
@@ -374,14 +396,15 @@ public final class Messages {
 		@Override
 		public void encode(ByteBuffer control) {
 			control.putLong(nodeId).putLong(parentId);
+			Wire.putString(control, name);
 		}
 
-		static RemoveRequest decode(ByteBuffer control) {
-			return new RemoveRequest(control.getLong(), control.getLong());
+		static RemoveRequest decode(ByteBuffer control) throws ProtocolException {
+			return new RemoveRequest(control.getLong(), control.getLong(), Wire.getString(control));
 		}
 	}
 
-	public record RenameRequest(long nodeId, long sourceParentId, long destinationParentId, String destinationName) implements Request {
+	public record RenameRequest(long nodeId, long sourceParentId, String sourceName, long destinationParentId, String destinationName) implements Request {
 
 		@Override
 		public Opcode opcode() {
@@ -390,12 +413,14 @@ public final class Messages {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(nodeId).putLong(sourceParentId).putLong(destinationParentId);
+			control.putLong(nodeId).putLong(sourceParentId);
+			Wire.putString(control, sourceName);
+			control.putLong(destinationParentId);
 			Wire.putString(control, destinationName);
 		}
 
 		static RenameRequest decode(ByteBuffer control) throws ProtocolException {
-			return new RenameRequest(control.getLong(), control.getLong(), control.getLong(), Wire.getString(control));
+			return new RenameRequest(control.getLong(), control.getLong(), Wire.getString(control), control.getLong(), Wire.getString(control));
 		}
 	}
 
@@ -556,15 +581,16 @@ public final class Messages {
 	public record HelloResponse() implements Response {
 	}
 
-	public record StatfsResponse(long totalBytes, long usableBytes) implements Response {
+	public record StatfsResponse(long totalBytes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(totalBytes).putLong(usableBytes);
+			control.putLong(totalBytes);
+			freeSpace.encode(control);
 		}
 
 		static StatfsResponse decode(ByteBuffer control) {
-			return new StatfsResponse(control.getLong(), control.getLong());
+			return new StatfsResponse(control.getLong(), FreeSpace.decode(control));
 		}
 	}
 
@@ -581,15 +607,15 @@ public final class Messages {
 		}
 	}
 
-	public record ForgetResponse(long usableBytes) implements Response {
+	public record ForgetResponse(FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static ForgetResponse decode(ByteBuffer control) {
-			return new ForgetResponse(control.getLong());
+			return new ForgetResponse(FreeSpace.decode(control));
 		}
 	}
 
@@ -605,17 +631,17 @@ public final class Messages {
 		}
 	}
 
-	public record SetattrResponse(int applied, Attributes attributes, long usableBytes) implements Response {
+	public record SetattrResponse(int applied, Attributes attributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
 			control.put((byte) applied);
 			attributes.encode(control);
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static SetattrResponse decode(ByteBuffer control) throws ProtocolException {
-			return new SetattrResponse(Byte.toUnsignedInt(control.get()), Attributes.decode(control), control.getLong());
+			return new SetattrResponse(Byte.toUnsignedInt(control.get()), Attributes.decode(control), FreeSpace.decode(control));
 		}
 	}
 
@@ -646,36 +672,36 @@ public final class Messages {
 		}
 	}
 
-	public record CreateResponse(Attributes attributes, String name, Attributes directoryAttributes, long usableBytes) implements Response {
+	public record CreateResponse(Attributes attributes, String name, Attributes directoryAttributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
 			attributes.encode(control);
 			Wire.putString(control, name);
 			directoryAttributes.encode(control);
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static CreateResponse decode(ByteBuffer control) throws ProtocolException {
-			return new CreateResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), control.getLong());
+			return new CreateResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), FreeSpace.decode(control));
 		}
 	}
 
-	public record RemoveResponse(Attributes attributes, Attributes directoryAttributes, long usableBytes) implements Response {
+	public record RemoveResponse(Attributes attributes, Attributes directoryAttributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
 			attributes.encode(control);
 			directoryAttributes.encode(control);
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static RemoveResponse decode(ByteBuffer control) throws ProtocolException {
-			return new RemoveResponse(Attributes.decode(control), Attributes.decode(control), control.getLong());
+			return new RemoveResponse(Attributes.decode(control), Attributes.decode(control), FreeSpace.decode(control));
 		}
 	}
 
-	public record RenameResponse(String name, Attributes attributes, Attributes sourceDirectoryAttributes, Attributes destinationDirectoryAttributes, @Nullable Attributes replacedAttributes, long usableBytes) implements Response {
+	public record RenameResponse(String name, Attributes attributes, Attributes sourceDirectoryAttributes, Attributes destinationDirectoryAttributes, @Nullable Attributes replacedAttributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
@@ -687,26 +713,26 @@ public final class Messages {
 			if (replacedAttributes != null) {
 				replacedAttributes.encode(control);
 			}
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static RenameResponse decode(ByteBuffer control) throws ProtocolException {
-			return new RenameResponse(Wire.getString(control), Attributes.decode(control), Attributes.decode(control), Attributes.decode(control), Wire.getBoolean(control) ? Attributes.decode(control) : null, control.getLong());
+			return new RenameResponse(Wire.getString(control), Attributes.decode(control), Attributes.decode(control), Attributes.decode(control), Wire.getBoolean(control) ? Attributes.decode(control) : null, FreeSpace.decode(control));
 		}
 	}
 
 	public record OpenResponse() implements Response {
 	}
 
-	public record CloseResponse(long usableBytes) implements Response {
+	public record CloseResponse(FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static CloseResponse decode(ByteBuffer control) {
-			return new CloseResponse(control.getLong());
+			return new CloseResponse(FreeSpace.decode(control));
 		}
 	}
 
@@ -727,29 +753,29 @@ public final class Messages {
 		}
 	}
 
-	public record WriteResponse(int written, Attributes attributes, long usableBytes) implements Response {
+	public record WriteResponse(int written, Attributes attributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
 			control.putInt(written);
 			attributes.encode(control);
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static WriteResponse decode(ByteBuffer control) throws ProtocolException {
-			return new WriteResponse(control.getInt(), Attributes.decode(control), control.getLong());
+			return new WriteResponse(control.getInt(), Attributes.decode(control), FreeSpace.decode(control));
 		}
 	}
 
-	public record SyncResponse(long usableBytes) implements Response {
+	public record SyncResponse(FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static SyncResponse decode(ByteBuffer control) {
-			return new SyncResponse(control.getLong());
+			return new SyncResponse(FreeSpace.decode(control));
 		}
 	}
 
@@ -766,18 +792,18 @@ public final class Messages {
 		}
 	}
 
-	public record SymlinkResponse(Attributes attributes, String name, Attributes directoryAttributes, long usableBytes) implements Response {
+	public record SymlinkResponse(Attributes attributes, String name, Attributes directoryAttributes, FreeSpace freeSpace) implements Response {
 
 		@Override
 		public void encode(ByteBuffer control) {
 			attributes.encode(control);
 			Wire.putString(control, name);
 			directoryAttributes.encode(control);
-			control.putLong(usableBytes);
+			freeSpace.encode(control);
 		}
 
 		static SymlinkResponse decode(ByteBuffer control) throws ProtocolException {
-			return new SymlinkResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), control.getLong());
+			return new SymlinkResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), FreeSpace.decode(control));
 		}
 	}
 }

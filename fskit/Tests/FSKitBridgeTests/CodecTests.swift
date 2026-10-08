@@ -134,10 +134,10 @@ struct MessagesTests {
 	}
 
 	@Test func keepsTheValueForUnknownUsableBytes() throws {
-		let frame = Messages.frame(for: ForgetResponse(usableBytes: Messages.unknownUsableBytes), opcode: .forget, requestId: 1)
+		let frame = Messages.frame(for: ForgetResponse(freeSpace: FreeSpace(usableBytes: Messages.unknownUsableBytes, generation: 7)), opcode: .forget, requestId: 1)
 
-		#expect(frame.control == Data(hex: "00000000 ffffffffffffffff"))
-		#expect(try Messages.decodeResponse(ForgetResponse.self, from: frame).usableBytes == UInt64.max)
+		#expect(frame.control == Data(hex: "00000000 ffffffffffffffff 0000000000000007"))
+		#expect(try Messages.decodeResponse(ForgetResponse.self, from: frame).freeSpace == FreeSpace(usableBytes: UInt64.max, generation: 7))
 	}
 
 	@Test func decodesAFailureWithoutInterpretingFurtherFields() {

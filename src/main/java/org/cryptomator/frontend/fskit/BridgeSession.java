@@ -31,12 +31,16 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Serves one mounted volume to the one extension process that presents this session's token.
  * <p>
- * A single thread reads a request, runs the operation and writes the response before it reads the next request. A slow backend call therefore stalls the volume, and no two operations ever interleave.
+ * One thread reads the requests and hands each to a virtual thread of its own, which runs the operation and writes the response. Requests therefore run concurrently and are answered in the order they complete; {@link FileSystemOperations} keeps them apart where they touch the same entries.
  */
 public class BridgeSession implements Closeable {
 
@@ -50,6 +54,8 @@ public class BridgeSession implements Closeable {
 	private final ServerSocketChannel listener;
 	private final CountDownLatch handshake = new CountDownLatch(1);
 	private final CountDownLatch finished = new CountDownLatch(1);
+	// held while a response is written, so that frames never interleave
+	private final Lock writing = new ReentrantLock();
 	private volatile @Nullable SocketChannel connection;
 
 	/**
@@ -82,11 +88,11 @@ public class BridgeSession implements Closeable {
 	}
 
 	/**
-	 * Ends this session: closes the listener and the connection and waits for the request thread to close all open channels.
+	 * Ends this session: closes the listener and the connection and waits for the requests in flight to return and the session thread to close all open channels.
 	 * <p>
-	 * The request thread is deliberately not interrupted: an interrupted thread cannot write, so it could not flush the channels it closes.
+	 * No thread is interrupted: an interrupted thread cannot write, so it could not flush the channels it closes.
 	 *
-	 * @throws IOException If an operation is still running in the backend after the wait. The request thread cleans up as soon as that operation returns; calling this method again then succeeds.
+	 * @throws IOException If an operation is still running in the backend after the wait. The session thread cleans up as soon as every operation has returned; calling this method again then succeeds.
 	 */
 	@Override
 	public void close() throws IOException {
@@ -106,8 +112,9 @@ public class BridgeSession implements Closeable {
 	}
 
 	private void run() {
-		try (operations; listener; SocketChannel authenticated = accept()) {
-			serve(authenticated);
+		// the executor's close waits for the requests in flight, so the operations close after the last of them
+		try (operations; listener; ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor(); SocketChannel authenticated = accept()) {
+			serve(authenticated, requests);
 		} catch (EOFException | ClosedChannelException e) {
 			LOG.debug("Session ended.");
 		} catch (IOException | RuntimeException e) {
@@ -172,13 +179,46 @@ public class BridgeSession implements Closeable {
 		}
 	}
 
-	private void serve(SocketChannel channel) throws IOException {
+	private void serve(SocketChannel channel, ExecutorService requests) throws IOException {
 		while (true) {
 			Frame frame = FrameCodec.read(channel);
 			Request request = Messages.decodeRequest(frame);
+			requests.execute(() -> answer(channel, frame, request));
+		}
+	}
+
+	private void answer(SocketChannel channel, Frame frame, Request request) {
+		try {
 			Response response = operations.handle(request);
 			LOG.trace("{} -> {}", request, response);
+			write(channel, frame, response);
+		} catch (Error e) {
+			// a request left unanswered would keep the client waiting for good
+			LOG.error("Failed to answer request {}. Closing the connection.", frame.requestId(), e);
+			closeQuietly(channel);
+			throw e;
+		}
+	}
+
+	private void write(SocketChannel channel, Frame frame, Response response) {
+		writing.lock();
+		try {
 			FrameCodec.write(channel, response.toFrame(frame.opcode(), frame.requestId()));
+		} catch (ProtocolException | RuntimeException e) {
+			LOG.warn("Unable to encode the response to request {}. Closing the connection.", frame.requestId(), e);
+			closeQuietly(channel);
+		} catch (IOException e) {
+			LOG.debug("Dropped the response to request {}, since the connection is gone.", frame.requestId(), e);
+		} finally {
+			writing.unlock();
+		}
+	}
+
+	private static void closeQuietly(SocketChannel channel) {
+		try {
+			channel.close();
+		} catch (IOException e) {
+			LOG.debug("Failed to close the connection.", e);
 		}
 	}
 }

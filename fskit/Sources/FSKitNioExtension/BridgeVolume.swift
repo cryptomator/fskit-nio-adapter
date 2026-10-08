@@ -5,20 +5,30 @@ import os
 
 /// Forwards the operations it supports to the server of the mount.
 ///
-/// Each of their handlers dispatches one block to the volume's serial queue. The block makes the blocking client call, populates the attributes, builds the result and replies, so requests are served one at a time, end to end. This keeps attribute population in order per item and keeps lookups from overlapping a reclaim.
-final class BridgeVolume: FSVolume {
+/// Handlers run concurrently, each awaiting its own requests. One lock guards the volume's state: the items handed to FSKit with their lookups, the newest attributes and free space seen, and the volume's statistics. No request is sent while it is held.
+///
+/// - Attributes and free space are populated under it, from the newest record by the server's generation, so that FSKit never takes an older record for the newest.
+/// - The handlers that hand out an item reply under it, and a reclaim tries the item under it, so that a reclaim never comes between handing out an item and FSKit counting it.
+/// - Every handler that sends a request holds a ticket of the attribute ledger from its start until it has populated, which keeps the records it may still populate.
+final class BridgeVolume: FSVolume, @unchecked Sendable {
 	private struct Statistics {
 		var totalBytes: UInt64 = 0
 		var usableBytes: UInt64 = 0
+	}
+
+	private struct State {
+		var items = ItemTable(make: BridgeItem.init(nodeId:))
+		var ledger = AttributeLedger()
+		var statistics = Statistics()
+		/// Replies to an unmount, made once no handler holds a ticket.
+		var awaitingIdle: [@Sendable () -> Void] = []
 	}
 
 	private static let blockSize = 4096
 
 	private let client: BridgeClient
 	private let lister: DirectoryLister
-	private let queue = DispatchQueue(label: "org.cryptomator.fskit.volume")
-	private let registry = ItemRegistry()
-	private let statistics = OSAllocatedUnfairLock(initialState: Statistics())
+	private let state = OSAllocatedUnfairLock(uncheckedState: State())
 	private let fileSystemTypeName: String
 
 	init(uuid: UUID, name: String, client: BridgeClient) {
@@ -29,39 +39,74 @@ final class BridgeVolume: FSVolume {
 		super.init(volumeID: FSVolume.Identifier(uuid: uuid), volumeName: FSFileName(string: name))
 	}
 
-	/// Ends the connection once the requests already queued have been served.
+	/// Ends the connection. Requests in flight fail.
 	func disconnect() {
-		queue.async {
-			self.client.disconnect()
-		}
+		client.disconnect()
 	}
 
 	// MARK: - Serving requests
 
-	/// Runs `operation` on the volume's queue and replies with its result or the error it throws.
-	private func serve<Result>(_ reply: @escaping (Result?, (any Error)?) -> Void, _ operation: @escaping () throws -> Result?) {
-		queue.async {
+	private func begin() -> AttributeLedger.Ticket {
+		state.withLockUnchecked { $0.ledger.begin() }
+	}
+
+	private func finish(_ ticket: AttributeLedger.Ticket) {
+		let awaitingIdle = state.withLockUnchecked { state in
+			state.ledger.finish(ticket)
+			guard state.ledger.isIdle else {
+				return [@Sendable () -> Void]()
+			}
+			defer { state.awaitingIdle = [] }
+			return state.awaitingIdle
+		}
+		awaitingIdle.forEach { $0() }
+	}
+
+	/// Runs an operation under a ticket of the ledger and maps what it throws to the error FSKit expects.
+	private func serve<Result>(_ operation: () async throws -> Result) async throws -> Result {
+		let ticket = begin()
+		defer { finish(ticket) }
+		do {
+			return try await operation()
+		} catch {
+			throw fsError(error)
+		}
+	}
+
+	/// Serves a handler that hands out an item. It replies under the state lock, which only the reply-handler form allows. FSKit counts a returned item once the reply is made, so neither a reclaim of the item nor a lookup of it may come between.
+	///
+	/// - Parameters:
+	///   - prepare: Runs at once, under the handler's ticket: checks what needs no request and returns what the request needs, since the handler's arguments cannot go to the task that sends it.
+	///   - operation: Sends the request and returns how to build the result from the state.
+	private func serveItem<Prepared: Sendable, Result>(_ reply: @escaping @Sendable (Result?, (any Error)?) -> Void, prepare: () throws -> Prepared, _ operation: @escaping @Sendable (Prepared) async throws -> (inout State) throws -> Result?) {
+		let ticket = begin()
+		let prepared: Prepared
+		do {
+			prepared = try prepare()
+		} catch {
+			reply(nil, fsError(error))
+			finish(ticket)
+			return
+		}
+		Task {
+			defer { self.finish(ticket) }
 			do {
-				guard let result = try operation() else {
-					// a result initializer refused the values it was given
-					throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
+				let build = try await operation(prepared)
+				try self.state.withLockUnchecked { state in
+					try reply(self.required(build(&state)), nil)
 				}
-				reply(result, nil)
 			} catch {
 				reply(nil, self.fsError(error))
 			}
 		}
 	}
 
-	private func serve(_ reply: @escaping ((any Error)?) -> Void, _ operation: @escaping () throws -> Void) {
-		queue.async {
-			do {
-				try operation()
-				reply(nil)
-			} catch {
-				reply(self.fsError(error))
-			}
+	/// - Throws: `EIO` for `nil`, which a result initializer returns when it refuses the values it was given.
+	private func required<Result>(_ result: Result?) throws -> Result {
+		guard let result else {
+			throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
 		}
+		return result
 	}
 
 	private func fsError(_ error: any Error) -> any Error {
@@ -95,7 +140,9 @@ final class BridgeVolume: FSVolume {
 
 	// MARK: - Projections
 
-	private func fsAttributes(_ attributes: Attributes) -> FSItem.Attributes {
+	/// Populates FSKit's attributes from the newest record of the item. Called under the state lock.
+	private func fsAttributes(_ received: Attributes, _ state: inout State) -> FSItem.Attributes {
+		let attributes = state.ledger.newest(received)
 		let result = FSItem.Attributes()
 		result.fileID = FSItem.Identifier(attributes.nodeId)
 		result.parentID = FSItem.Identifier(attributes.parentId)
@@ -143,21 +190,29 @@ final class BridgeVolume: FSVolume {
 		return Timestamp(seconds: Int64(time.tv_sec), nanos: nanos)
 	}
 
-	private func record(usableBytes: UInt64) {
-		if usableBytes != Messages.unknownUsableBytes {
-			statistics.withLock { $0.usableBytes = usableBytes }
+	/// Records a sample of the usable space if it is the newest.
+	private func record(_ freeSpace: FreeSpace) {
+		state.withLockUnchecked { state in
+			_ = self.newestUsableBytes(freeSpace, &state)
 		}
 	}
 
-	/// Records the usable space a reply carried and hands it on to FSKit. Called on the queue, which is the isolation context of the volume's free space.
-	private func freeSpace(_ usableBytes: UInt64) -> FSFreeSpace {
-		guard usableBytes != Messages.unknownUsableBytes else {
+	private func newestUsableBytes(_ freeSpace: FreeSpace, _ state: inout State) -> UInt64? {
+		guard let usableBytes = state.ledger.newest(freeSpace) else {
+			return nil
+		}
+		state.statistics.usableBytes = usableBytes
+		return usableBytes
+	}
+
+	/// Records a sample of the usable space and hands it on to FSKit if it is the newest. Called under the state lock, which is the isolation context of the volume's free space.
+	private func fsFreeSpace(_ freeSpace: FreeSpace, _ state: inout State) -> FSFreeSpace {
+		guard let usableBytes = newestUsableBytes(freeSpace, &state) else {
 			return FSFreeSpace.noUpdate
 		}
-		record(usableBytes: usableBytes)
-		let freeSpace = FSFreeSpace()
-		freeSpace.populate(bytes: usableBytes)
-		return freeSpace
+		let result = FSFreeSpace()
+		result.populate(bytes: usableBytes)
+		return result
 	}
 }
 
@@ -203,7 +258,7 @@ extension BridgeVolume: FSVolume.Handler {
 
 	var volumeStatistics: FSStatFSResult {
 		// read from a snapshot, since this property must not wait for a request in flight
-		let snapshot = statistics.withLock { $0 }
+		let snapshot = state.withLockUnchecked { $0.statistics }
 		let result = FSStatFSResult(fileSystemTypeName: fileSystemTypeName)
 		result.blockSize = Self.blockSize
 		result.ioSize = FrameCodec.maxPayloadLength
@@ -214,76 +269,85 @@ extension BridgeVolume: FSVolume.Handler {
 		return result
 	}
 
-	func activateVolume(options: FSTaskOptions, replyHandler reply: @escaping (FSActivateResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			let response = try self.client.request(StatfsRequest())
-			self.statistics.withLock { $0 = Statistics(totalBytes: response.totalBytes, usableBytes: response.usableBytes) }
-			return FSActivateResult(rootItem: self.registry.item(for: Messages.rootNodeId))
+	func activateVolume(options: FSTaskOptions) async throws -> FSActivateResult {
+		try await serve {
+			let response = try await client.request(StatfsRequest())
+			return try state.withLockUnchecked { state in
+				state.statistics.totalBytes = response.totalBytes
+				_ = newestUsableBytes(response.freeSpace, &state)
+				return try required(FSActivateResult(rootItem: state.items.item(for: Messages.rootNodeId)))
+			}
 		}
 	}
 
-	func deactivateVolume(options: FSDeactivateOptions = [], replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {}
-	}
+	func deactivateVolume(options: FSDeactivateOptions = []) async throws {}
 
-	func mount(options: FSTaskOptions, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {}
-	}
+	func mount(options: FSTaskOptions) async throws {}
 
-	func unmount(replyHandler reply: @escaping () -> Void) {
-		queue.async {
+	func unmount(replyHandler reply: @escaping @Sendable () -> Void) {
+		// once the handlers in flight are done
+		let idle = state.withLockUnchecked { state in
+			if !state.ledger.isIdle {
+				state.awaitingIdle.append(reply)
+			}
+			return state.ledger.isIdle
+		}
+		if idle {
 			reply()
 		}
 	}
 
-	func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
+	func synchronize(flags: FSSyncFlags) async throws {
+		try await serve {
 			// FSKit asks before every reclaim, mostly with nothing to force
-			guard self.client.hasUnsyncedChanges else {
+			guard !client.canAnswerSyncItself else {
 				return
 			}
-			try self.record(usableBytes: self.client.request(SyncRequest()).usableBytes)
+			try await record(client.request(SyncRequest()).freeSpace)
 		}
 	}
 
-	func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSLookupItemResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let string = try self.string(name)
+	func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping @Sendable (FSLookupItemResult?, (any Error)?) -> Void) {
+		serveItem(reply) {
+			try authorize(context)
+			let string = try string(name)
 			// macOS looks up `._<name>` after every first lookup of an entry. The server answers a hidden name with ENOENT as well, so the request is not sent.
 			if HiddenNames.contains(string) {
 				throw fs_errorForPOSIXError(POSIXError.ENOENT.rawValue)
 			}
-			let response = try self.client.request(LookupRequest(parentId: self.nodeId(directory), name: string))
-			return FSLookupItemResult(foundItem: self.registry.item(for: response.attributes.nodeId), itemName: FSFileName(string: response.name), itemAttributes: self.fsAttributes(response.attributes))
+			return try LookupRequest(parentId: nodeId(directory), name: string)
+		} _: { request in
+			let response = try await self.client.request(request)
+			return { state in
+				let item = state.items.item(for: response.attributes.nodeId)
+				return FSLookupItemResult(foundItem: item, itemName: FSFileName(string: response.name), itemAttributes: self.fsAttributes(response.attributes, &state))
+			}
 		}
 	}
 
-	func reclaimItem(_ item: FSItem, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
+	func reclaimItem(_ item: FSItem) async throws {
+		try await serve {
 			guard let item = item as? BridgeItem else {
 				return
 			}
-			var failure: (any Error)?
-			// FORGET is sent only from inside a reclaim FSKit agreed to, so no lookup of the item can be outstanding
-			_ = item.tryReclaim {
-				self.registry.remove(item)
-				do {
-					try self.record(usableBytes: self.client.request(ForgetRequest(nodeId: item.nodeId)).usableBytes)
-				} catch {
-					failure = error
+			let lookups = state.withLockUnchecked { state -> UInt64? in
+				// FSKit runs the block only if no lookup has returned the item since it asked for the reclaim, and none can while the lock is held
+				guard item.tryReclaim({}) else {
+					return nil
 				}
+				return state.items.removeIfCurrent(item, nodeId: item.nodeId)
 			}
-			if let failure {
-				throw failure
+			guard let lookups else {
+				return
 			}
+			try await record(client.request(ForgetRequest(nodeId: item.nodeId, lookups: lookups)).freeSpace)
 		}
 	}
 
 	// swiftlint:disable:next function_parameter_count
-	func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler reply: @escaping (FSCreateItemResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
+	func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext, replyHandler reply: @escaping @Sendable (FSCreateItemResult?, (any Error)?) -> Void) {
+		serveItem(reply) {
+			try authorize(context)
 			let nodeType: NodeType
 			switch type {
 			case .file: nodeType = .file
@@ -291,122 +355,145 @@ extension BridgeVolume: FSVolume.Handler {
 			default: throw fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue)
 			}
 			let mode = newAttributes.isValid(.mode) ? UInt16(newAttributes.mode & 0o777) : (nodeType == .directory ? 0o755 : 0o644)
-			let response = try self.client.request(CreateRequest(parentId: self.nodeId(directory), name: self.string(name), type: nodeType, mode: mode))
+			let request = try CreateRequest(parentId: nodeId(directory), name: string(name), type: nodeType, mode: mode)
+			// marked before the request is sent, since the arguments cannot go to the task that sends it. A create that fails replies with no result.
 			if newAttributes.isValid(.mode) {
 				newAttributes.consumedAttributes.insert(.mode)
 			}
-			let item = self.registry.item(for: response.attributes.nodeId)
-			if nodeType == .file {
-				item.openedByCreate = true
+			return request
+		} _: { request in
+			let response = try await self.client.request(request)
+			return { state in
+				let item = state.items.item(for: response.attributes.nodeId)
+				if request.type == .file {
+					item.openedByCreate = true
+				}
+				return FSCreateItemResult(
+					newItem: item,
+					newItemName: FSFileName(string: response.name),
+					newItemAttributes: self.fsAttributes(response.attributes, &state),
+					directoryAttributes: self.fsAttributes(response.directoryAttributes, &state),
+					freeSpace: self.fsFreeSpace(response.freeSpace, &state)
+				)
 			}
-			return FSCreateItemResult(
-				newItem: item,
-				newItemName: FSFileName(string: response.name),
-				newItemAttributes: self.fsAttributes(response.attributes),
-				directoryAttributes: self.fsAttributes(response.directoryAttributes),
-				freeSpace: self.freeSpace(response.usableBytes)
-			)
 		}
 	}
 
 	// swiftlint:disable:next function_parameter_count
-	func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, linkContents contents: FSFileName, context: FSContext, replyHandler reply: @escaping (FSCreateSymlinkResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
+	func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, linkContents contents: FSFileName, context: FSContext, replyHandler reply: @escaping @Sendable (FSCreateSymlinkResult?, (any Error)?) -> Void) {
+		serveItem(reply) {
+			try authorize(context)
 			// the mode is not marked as consumed, since the server applies none to a link
-			let response = try self.client.request(SymlinkRequest(parentId: self.nodeId(directory), name: self.string(name), target: self.string(contents)))
-			return FSCreateSymlinkResult(
-				newItem: self.registry.item(for: response.attributes.nodeId),
-				newItemName: FSFileName(string: response.name),
-				newItemAttributes: self.fsAttributes(response.attributes),
-				directoryAttributes: self.fsAttributes(response.directoryAttributes),
-				freeSpace: self.freeSpace(response.usableBytes)
-			)
+			return try SymlinkRequest(parentId: nodeId(directory), name: string(name), target: string(contents))
+		} _: { request in
+			let response = try await self.client.request(request)
+			return { state in
+				FSCreateSymlinkResult(
+					newItem: state.items.item(for: response.attributes.nodeId),
+					newItemName: FSFileName(string: response.name),
+					newItemAttributes: self.fsAttributes(response.attributes, &state),
+					directoryAttributes: self.fsAttributes(response.directoryAttributes, &state),
+					freeSpace: self.fsFreeSpace(response.freeSpace, &state)
+				)
+			}
 		}
 	}
 
-	func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSCreateLinkResult?, (any Error)?) -> Void) {
+	func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext, replyHandler reply: @escaping @Sendable (FSCreateLinkResult?, (any Error)?) -> Void) {
 		reply(nil, fs_errorForPOSIXError(POSIXError.ENOTSUP.rawValue))
 	}
 
 	// swiftlint:disable:next function_parameter_count
-	func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext, replyHandler reply: @escaping (FSRenameItemResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let response = try self.client.request(RenameRequest(nodeId: self.nodeId(item), sourceParentId: self.nodeId(sourceDirectory), destinationParentId: self.nodeId(destinationDirectory), destinationName: self.string(destinationName)))
-			return FSRenameItemResult(
-				newName: FSFileName(string: response.name),
-				renamedItemAttributes: self.fsAttributes(response.attributes),
-				sourceDirectoryAttributes: self.fsAttributes(response.sourceDirectoryAttributes),
-				destinationDirectoryAttributes: self.fsAttributes(response.destinationDirectoryAttributes),
-				overItemAttributes: overItem == nil ? nil : response.replacedAttributes.map { self.fsAttributes($0) },
-				freeSpace: self.freeSpace(response.usableBytes)
-			)
+	func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext) async throws -> FSRenameItemResult {
+		try await serve {
+			try authorize(context)
+			let response = try await client.request(RenameRequest(nodeId: nodeId(item), sourceParentId: nodeId(sourceDirectory), sourceName: string(sourceName), destinationParentId: nodeId(destinationDirectory), destinationName: string(destinationName)))
+			return try state.withLockUnchecked { state in
+				try required(FSRenameItemResult(
+					newName: FSFileName(string: response.name),
+					renamedItemAttributes: fsAttributes(response.attributes, &state),
+					sourceDirectoryAttributes: fsAttributes(response.sourceDirectoryAttributes, &state),
+					destinationDirectoryAttributes: fsAttributes(response.destinationDirectoryAttributes, &state),
+					overItemAttributes: overItem == nil ? nil : response.replacedAttributes.map { fsAttributes($0, &state) },
+					freeSpace: fsFreeSpace(response.freeSpace, &state)
+				))
+			}
 		}
 	}
 
-	func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext, replyHandler reply: @escaping (FSRemoveItemResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let response = try self.client.request(RemoveRequest(nodeId: self.nodeId(item), parentId: self.nodeId(directory)))
-			return FSRemoveItemResult(
-				itemAttributes: self.fsAttributes(response.attributes),
-				directoryAttributes: self.fsAttributes(response.directoryAttributes),
-				freeSpace: self.freeSpace(response.usableBytes)
-			)
+	func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext) async throws -> FSRemoveItemResult {
+		try await serve {
+			try authorize(context)
+			let response = try await client.request(RemoveRequest(nodeId: nodeId(item), parentId: nodeId(directory), name: string(name)))
+			return try state.withLockUnchecked { state in
+				try required(FSRemoveItemResult(
+					itemAttributes: fsAttributes(response.attributes, &state),
+					directoryAttributes: fsAttributes(response.directoryAttributes, &state),
+					freeSpace: fsFreeSpace(response.freeSpace, &state)
+				))
+			}
 		}
 	}
 
-	func getAttributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSGetAttributesResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let response = try self.client.request(GetattrRequest(nodeId: self.nodeId(item)))
-			return FSGetAttributesResult(attributes: self.fsAttributes(response.attributes))
+	func attributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext) async throws -> FSGetAttributesResult {
+		try await serve {
+			try authorize(context)
+			let response = try await client.request(GetattrRequest(nodeId: nodeId(item)))
+			return try state.withLockUnchecked { state in
+				try required(FSGetAttributesResult(attributes: fsAttributes(response.attributes, &state)))
+			}
 		}
 	}
 
-	func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext, replyHandler reply: @escaping (FSSetAttributesResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
+	func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext) async throws -> FSSetAttributesResult {
+		try await serve {
+			try authorize(context)
 			let settable: [(FSItem.Attribute, UInt8)] = [(.size, Messages.attributeSize), (.mode, Messages.attributeMode), (.accessTime, Messages.attributeAccessed), (.modifyTime, Messages.attributeModified)]
 			let valid = settable.filter { newAttributes.isValid($0.0) }.reduce(0) { $0 | $1.1 }
-			let response = try self.client.request(SetattrRequest(
-				nodeId: self.nodeId(item),
+			let response = try await client.request(SetattrRequest(
+				nodeId: nodeId(item),
 				valid: valid,
 				size: newAttributes.size,
 				mode: UInt16(newAttributes.mode & 0o777),
-				accessed: newAttributes.isValid(.accessTime) ? self.timestamp(newAttributes.accessTime) : Timestamp(seconds: 0, nanos: 0),
-				modified: newAttributes.isValid(.modifyTime) ? self.timestamp(newAttributes.modifyTime) : Timestamp(seconds: 0, nanos: 0)
+				accessed: newAttributes.isValid(.accessTime) ? timestamp(newAttributes.accessTime) : Timestamp(seconds: 0, nanos: 0),
+				modified: newAttributes.isValid(.modifyTime) ? timestamp(newAttributes.modifyTime) : Timestamp(seconds: 0, nanos: 0)
 			))
 			for (attribute, bit) in settable where response.applied & bit != 0 {
 				newAttributes.consumedAttributes.insert(attribute)
 			}
-			return FSSetAttributesResult(attributes: self.fsAttributes(response.attributes), freeSpace: self.freeSpace(response.usableBytes))
+			return try state.withLockUnchecked { state in
+				try required(FSSetAttributesResult(attributes: fsAttributes(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
+			}
 		}
 	}
 
 	// swiftlint:disable:next function_parameter_count
-	func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext, replyHandler reply: @escaping (FSEnumerateDirectoryResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let verifier = try self.lister.list(directory: self.nodeId(directory), cookie: cookie.rawValue, verifier: verifier.rawValue, wantAttributes: attributes != nil) { entry in
-				packer.packEntry(
+	func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext) async throws -> FSEnumerateDirectoryResult {
+		try await serve {
+			try authorize(context)
+			let verifier = try await lister.list(directory: nodeId(directory), cookie: cookie.rawValue, verifier: verifier.rawValue, wantAttributes: attributes != nil) { entry in
+				let attributes = entry.attributes.map { received in
+					state.withLockUnchecked { fsAttributes(received, &$0) }
+				}
+				return packer.packEntry(
 					name: FSFileName(string: entry.name),
-					itemType: self.itemType(entry.type),
+					itemType: itemType(entry.type),
 					itemID: FSItem.Identifier(entry.nodeId),
 					nextCookie: FSDirectoryCookie(entry.nextCookie),
-					attributes: entry.attributes.map { self.fsAttributes($0) }
+					attributes: attributes
 				)
 			}
-			return FSEnumerateDirectoryResult(verifier: verifier)
+			return try required(FSEnumerateDirectoryResult(verifier: verifier))
 		}
 	}
 
-	func readSymbolicLink(_ item: FSItem, context: FSContext, replyHandler reply: @escaping (FSReadSymlinkResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			let response = try self.client.request(ReadlinkRequest(nodeId: self.nodeId(item)))
-			return FSReadSymlinkResult(contents: FSFileName(string: response.target), symlinkAttributes: self.fsAttributes(response.attributes))
+	func readSymbolicLink(_ item: FSItem, context: FSContext) async throws -> FSReadSymlinkResult {
+		try await serve {
+			try authorize(context)
+			let response = try await client.request(ReadlinkRequest(nodeId: nodeId(item)))
+			return try state.withLockUnchecked { state in
+				try required(FSReadSymlinkResult(contents: FSFileName(string: response.target), symlinkAttributes: fsAttributes(response.attributes, &state)))
+			}
 		}
 	}
 }
@@ -416,43 +503,49 @@ extension BridgeVolume: FSVolume.OpenCloseHandler {
 		(modes.contains(.read) ? Messages.modeRead : 0) | (modes.contains(.write) ? Messages.modeWrite : 0)
 	}
 
-	func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
-			try self.authorize(context)
-			if (item as? BridgeItem)?.openedByCreate == true {
+	func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext) async throws {
+		try await serve {
+			try authorize(context)
+			let openedByCreate = state.withLockUnchecked { _ in (item as? BridgeItem)?.openedByCreate == true }
+			if openedByCreate {
 				return
 			}
-			_ = try self.client.request(OpenRequest(nodeId: self.nodeId(item), modes: self.modes(modes)))
+			_ = try await client.request(OpenRequest(nodeId: nodeId(item), modes: self.modes(modes)))
 		}
 	}
 
-	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext, replyHandler reply: @escaping ((any Error)?) -> Void) {
-		serve(reply) {
+	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext) async throws {
+		try await serve {
 			// no caller is refused here: a close that does not reach the server leaves its channel open
 			let keptModes = self.modes(modes)
 			if keptModes == 0 {
-				(item as? BridgeItem)?.openedByCreate = false
+				// before the CLOSE is sent, so that an open from then on is forwarded and reopens the channel
+				state.withLockUnchecked { _ in (item as? BridgeItem)?.openedByCreate = false }
 			}
-			try self.record(usableBytes: self.client.request(CloseRequest(nodeId: self.nodeId(item), keptModes: keptModes)).usableBytes)
+			try await record(client.request(CloseRequest(nodeId: nodeId(item), keptModes: keptModes)).freeSpace)
 		}
 	}
 }
 
 extension BridgeVolume: FSVolume.ReadWriteHandler {
-	func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer, replyHandler reply: @escaping (FSReadFileResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			let response = try self.client.read(nodeId: self.nodeId(item), offset: UInt64(offset), length: min(length, buffer.length))
+	func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> FSReadFileResult {
+		try await serve {
+			let response = try await client.read(nodeId: nodeId(item), offset: UInt64(offset), length: min(length, buffer.length))
 			_ = buffer.withUnsafeMutableBytes { destination in
 				response.data.copyBytes(to: destination)
 			}
-			return FSReadFileResult(bytesRead: response.data.count, itemAttributes: self.fsAttributes(response.attributes))
+			return try state.withLockUnchecked { state in
+				try required(FSReadFileResult(bytesRead: response.data.count, itemAttributes: fsAttributes(response.attributes, &state)))
+			}
 		}
 	}
 
-	func write(contents: Data, to item: FSItem, at offset: off_t, replyHandler reply: @escaping (FSWriteFileResult?, (any Error)?) -> Void) {
-		serve(reply) {
-			let response = try self.client.write(nodeId: self.nodeId(item), offset: UInt64(offset), data: contents)
-			return FSWriteFileResult(bytesWritten: Int(response.written), itemAttributes: self.fsAttributes(response.attributes), freeSpace: self.freeSpace(response.usableBytes))
+	func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
+		try await serve {
+			let response = try await client.write(nodeId: nodeId(item), offset: UInt64(offset), data: contents)
+			return try state.withLockUnchecked { state in
+				try required(FSWriteFileResult(bytesWritten: Int(response.written), itemAttributes: fsAttributes(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
+			}
 		}
 	}
 }
@@ -463,12 +556,12 @@ extension BridgeVolume: FSVolume.ReadWriteHandler {
 ///
 /// The handlers cannot tell callers apart, since FSKit calls them with uid 0 for every caller.
 extension BridgeVolume: FSVolume.XattrHandler {
-	func getXattr(named name: FSFileName, of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSGetXattrResult?, (any Error)?) -> Void) {
+	func getXattr(named name: FSFileName, of item: FSItem, context: FSContext, replyHandler reply: @escaping @Sendable (FSGetXattrResult?, (any Error)?) -> Void) {
 		reply(nil, fs_errorForPOSIXError(POSIXError.ENOATTR.rawValue))
 	}
 
 	// swiftlint:disable:next function_parameter_count
-	func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler reply: @escaping (FSSetXattrResult?, (any Error)?) -> Void) {
+	func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext, replyHandler reply: @escaping @Sendable (FSSetXattrResult?, (any Error)?) -> Void) {
 		// nothing is stored, so there is never an attribute to replace or to remove
 		if policy == .mustReplace || policy == .delete {
 			reply(nil, fs_errorForPOSIXError(POSIXError.ENOATTR.rawValue))
@@ -477,7 +570,7 @@ extension BridgeVolume: FSVolume.XattrHandler {
 		reply(FSSetXattrResult(freeSpace: FSFreeSpace.noUpdate), nil)
 	}
 
-	func listXattrs(of item: FSItem, context: FSContext, replyHandler reply: @escaping (FSListXattrsResult?, (any Error)?) -> Void) {
+	func listXattrs(of item: FSItem, context: FSContext, replyHandler reply: @escaping @Sendable (FSListXattrsResult?, (any Error)?) -> Void) {
 		reply(FSListXattrsResult(xattrNames: []), nil)
 	}
 }

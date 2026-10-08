@@ -564,30 +564,81 @@ touch_extreme() {
 	fi
 }
 
-# parallel_writes <directory> <first source> <second source>: two loops write files while a third lists the directory
-parallel_writes() {
-	local directory="$1" first="$2" second="$3" i
-	integer first_writer second_writer lister failed=0
-	mkdir "$directory" || return 1
+# read_while_renamed <directory> <expected content>: opens moving/held.bin, then 20 times renames moving to moved, reads the file through the open descriptor and renames it back
+read_while_renamed() {
+	/usr/bin/perl -e '
+		my ($directory, $expected) = @ARGV;
+		open(my $source, "<", $expected) or die "open: $!\n";
+		my $want = do { local $/; <$source> };
+		open(my $held, "<", "$directory/moving/held.bin") or die "open: $!\n";
+		for (1 .. 20) {
+			rename("$directory/moving", "$directory/moved") or die "rename: $!\n";
+			sysseek($held, 0, 0);
+			my ($read, $chunk) = ("", "");
+			$read .= $chunk while sysread($held, $chunk, 65536);
+			$read eq $want or die "the held file reads differently\n";
+			rename("$directory/moved", "$directory/moving") or die "rename back: $!\n";
+		}
+	' "$1" "$2"
+}
+
+# any_alive <pid> ...: whether one of the processes is still running
+any_alive() {
+	local pid
+	for pid in "$@"; do
+		kill -0 $pid 2> /dev/null && return 0
+	done
+	return 1
+}
+
+# seed_parallel <directory>: writes the two source files of check_parallel into the scenario's directory and copies them to the files below <directory> that parallel_work reads
+seed_parallel() {
+	local first="$SCENARIO_DIR/first.bin" second="$SCENARIO_DIR/second.bin"
+	head -c 262144 /dev/urandom > "$first" && head -c 262144 /dev/urandom > "$second" || return 1
+	# one level down, since a listing that finds a name and then reads its attributes may miss it while it is renamed
+	mkdir -p "$1/renaming/moving" && cp "$first" "$1/read-first.bin" && cp "$second" "$1/read-second.bin" && cp "$first" "$1/renaming/moving/held.bin"
+}
+
+# parallel_work <directory> <first source> <second source>: two loops write files while a third lists the directory, three more read the files of seed_parallel, and one renames a subdirectory back and forth while a file in it is read through a descriptor that stays open
+parallel_work() {
+	local directory="$1" first="$2" second="$3" i worker
+	integer lister failed=0
+	typeset -a workers
 	(for i in {1..20}; do cp "$first" "$directory/first-$i.bin" || exit 1; done) &
-	first_writer=$!
+	workers+=($!)
 	(for i in {1..20}; do cp "$second" "$directory/second-$i.bin" || exit 1; done) &
-	second_writer=$!
-	# ends by itself once the writers have, so that it does not outlive an interrupted run
-	(while kill -0 $first_writer 2> /dev/null || kill -0 $second_writer 2> /dev/null; do ls -l "$directory" > /dev/null || exit 1; done) &
+	workers+=($!)
+	(for i in {1..20}; do cmp "$first" "$directory/read-first.bin" || exit 1; done) &
+	workers+=($!)
+	(for i in {1..20}; do cmp "$first" "$directory/read-first.bin" || exit 1; done) &
+	workers+=($!)
+	(for i in {1..20}; do cmp "$second" "$directory/read-second.bin" || exit 1; done) &
+	workers+=($!)
+	read_while_renamed "$directory/renaming" "$first" &
+	workers+=($!)
+	# ends by itself once the others have, so that it does not outlive an interrupted run
+	(while any_alive $workers; do ls -l "$directory" > /dev/null || exit 1; done) &
 	lister=$!
-	wait $first_writer || failed=1
-	wait $second_writer || failed=1
+	for worker in $workers; do
+		wait $worker || failed=1
+	done
 	wait $lister || failed=1
 	return $failed
 }
 
-# parallel_writes_intact <directory> <first source> <second source>: every file holds what its loop wrote
+# parallel_writes_intact <directory> <first source> <second source>: every file holds what its loop wrote, read by two readers at once
 parallel_writes_intact() {
 	local i
+	integer reader
+	(for i in {1..20}; do cmp -s "$2" "$1/first-$i.bin" || exit 1; done) &
+	reader=$!
 	for i in {1..20}; do
-		cmp -s "$2" "$1/first-$i.bin" && cmp -s "$3" "$1/second-$i.bin" || return 1
+		if ! cmp -s "$3" "$1/second-$i.bin"; then
+			wait $reader
+			return 1
+		fi
 	done
+	wait $reader
 }
 
 # remove_while_open <file> <content> <directory> ...: removes a file while it is open and prints an "ok" or "not ok" line per expectation. None of the directories may list the file while it is open or afterwards, nor an .nfs.* entry, which FSKit's own emulation of such files would leave.
@@ -653,13 +704,12 @@ check_basics() {
 	check "both are gone" test ! -e "$confirm/moved"
 }
 
-# check_parallel <mount point> <directory to confirm in>
+# check_parallel <mount point> <directory to confirm in>: needs seed_parallel run for the directory parallel
 check_parallel() {
 	local first="$SCENARIO_DIR/first.bin" second="$SCENARIO_DIR/second.bin"
-	head -c 262144 /dev/urandom > "$first"
-	head -c 262144 /dev/urandom > "$second"
-	check "two loops write files while a third lists the directory" parallel_writes "$1/parallel" "$first" "$second"
+	check "two loops write files while one lists the directory, three read files, and one renames a directory with a file open in it" parallel_work "$1/parallel" "$first" "$second"
 	check "every file holds what was written" parallel_writes_intact "$2/parallel" "$first" "$second"
+	check "the file read through the renamed directory is intact" cmp "$first" "$2/parallel/renaming/moving/held.bin"
 }
 
 # --- scenarios ---
@@ -903,6 +953,7 @@ backend-failure() {
 }
 
 parallel() {
+	seed_parallel "$BACKING/parallel"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
 	check_parallel "$MNT" "$BACKING"
 	unmount_volume "$SCENARIO" "$MNT"
@@ -991,6 +1042,8 @@ vault() {
 	head -c $(( 11 * 1024 * 1024 )) /dev/urandom > "$large"
 	mount_volume "$SCENARIO-1" vault rw "$BACKING" "$MNT" || return 0
 	check_basics "$MNT" "$MNT"
+	# the kernel may answer the reads of these files from its cache, since they are written through the mount. The reopened vault below reads the files written in parallel uncached.
+	check "the files to read in parallel are written" seed_parallel "$MNT/parallel"
 	check_parallel "$MNT" "$MNT"
 	check "a directory is created" mkdir "$MNT/dir"
 	check "a file is created in it" echo_to 0123456789 "$MNT/dir/unlinked.txt"

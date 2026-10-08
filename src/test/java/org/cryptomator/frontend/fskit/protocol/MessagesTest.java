@@ -2,6 +2,7 @@ package org.cryptomator.frontend.fskit.protocol;
 
 import org.cryptomator.frontend.fskit.protocol.Messages.Failure;
 import org.cryptomator.frontend.fskit.protocol.Messages.ForgetResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.FreeSpace;
 import org.cryptomator.frontend.fskit.protocol.Messages.LookupRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.Response;
 import org.junit.jupiter.api.Assertions;
@@ -83,10 +84,10 @@ public class MessagesTest {
 	@Test
 	@DisplayName("keeps the value for unknown usable bytes")
 	public void testUnknownUsableBytes() throws ProtocolException {
-		Frame frame = new ForgetResponse(Messages.UNKNOWN_USABLE_BYTES).toFrame(Opcode.FORGET, 1);
+		Frame frame = new ForgetResponse(new FreeSpace(Messages.UNKNOWN_USABLE_BYTES, 7)).toFrame(Opcode.FORGET, 1);
 
-		Assertions.assertEquals("00000000ffffffffffffffff", HexFormat.of().formatHex(frame.control().array(), 0, frame.control().remaining()));
-		Assertions.assertEquals(new ForgetResponse(Messages.UNKNOWN_USABLE_BYTES), Messages.decodeResponse(frame));
+		Assertions.assertEquals("00000000ffffffffffffffff0000000000000007", HexFormat.of().formatHex(frame.control().array(), 0, frame.control().remaining()));
+		Assertions.assertEquals(new ForgetResponse(new FreeSpace(Messages.UNKNOWN_USABLE_BYTES, 7)), Messages.decodeResponse(frame));
 	}
 
 	@Test

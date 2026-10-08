@@ -11,8 +11,10 @@ final class ScriptedServer: Sendable {
 	let manifest: Manifest
 	private let listener: Int32
 
-	/// - Parameter respond: Returns the response to a request, or `nil` to close the connection instead of answering.
-	init(respond: @escaping @Sendable (Frame) throws -> Frame?) throws {
+	/// - Parameters:
+	///   - batches: One number per batch: how many requests the server reads before it answers them, which it does in reverse order. Requests after the last batch are answered one at a time.
+	///   - respond: Returns the response to a request, or `nil` to close the connection instead of answering.
+	init(batches: [Int] = [], respond: @escaping @Sendable (Frame) throws -> Frame?) throws {
 		let listener = socket(AF_INET, SOCK_STREAM, 0)
 		var address = sockaddr_in()
 		address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -34,13 +36,20 @@ final class ScriptedServer: Sendable {
 			}
 			defer { close(connection) }
 			do {
-				for _ in 0 ... Self.maxRequests {
-					let request = try FrameCodec.decode { try Self.receive(connection, $0) }
-					let response = request.opcode == .hello ? Messages.frame(for: HelloResponse(), opcode: .hello, requestId: request.requestId) : try respond(request)
-					guard let response else {
-						return
+				let hello = try FrameCodec.decode { try Self.receive(connection, $0) }
+				try Self.send(connection, FrameCodec.encode(Messages.frame(for: HelloResponse(), opcode: .hello, requestId: hello.requestId)))
+				var batches = batches[...]
+				var answered = 0
+				while answered < Self.maxRequests {
+					let size = batches.popFirst() ?? 1
+					let requests = try (0 ..< size).map { _ in try FrameCodec.decode { try Self.receive(connection, $0) } }
+					for request in requests.reversed() {
+						guard let response = try respond(request) else {
+							return
+						}
+						try Self.send(connection, FrameCodec.encode(response))
 					}
-					try Self.send(connection, FrameCodec.encode(response))
+					answered += size
 				}
 			} catch {
 				// the client is gone
@@ -87,12 +96,20 @@ final class ScriptedServer: Sendable {
 	}
 }
 
+/// Waits until a client has sent the given number of requests.
+func waitUntil(_ client: BridgeClient, hasSent count: UInt64) async throws {
+	while client.requestCounts.sent < count {
+		try await Task.sleep(for: .milliseconds(1))
+	}
+}
+
 struct BridgeClientTests {
 	private static let file: UInt64 = 64
 	private static let time = Timestamp(seconds: 1_700_000_000, nanos: 0)
+	private static let freeSpace = FreeSpace(usableBytes: 1, generation: 1)
 
-	private static func attributes(size: Int) -> Attributes {
-		Attributes(type: .file, mode: 0o644, size: UInt64(size), nodeId: file, parentId: Messages.rootNodeId, modified: time, accessed: time, created: time)
+	private static func attributes(size: Int, nodeId: UInt64 = file) -> Attributes {
+		Attributes(type: .file, mode: 0o644, size: UInt64(size), nodeId: nodeId, parentId: Messages.rootNodeId, modified: time, accessed: time, created: time, generation: 1)
 	}
 
 	/// A server that stores what it is sent at the given offsets and accepts at most `limit` bytes per request.
@@ -109,7 +126,7 @@ struct BridgeClientTests {
 				stored.replaceSubrange(offset ..< (offset + accepted.count), with: accepted)
 				return stored.count
 			}
-			return Messages.frame(for: WriteResponse(written: UInt32(accepted.count), attributes: attributes(size: size), usableBytes: 1), opcode: .write, requestId: frame.requestId)
+			return Messages.frame(for: WriteResponse(written: UInt32(accepted.count), attributes: attributes(size: size), freeSpace: freeSpace), opcode: .write, requestId: frame.requestId)
 		}
 	}
 
@@ -128,56 +145,59 @@ struct BridgeClientTests {
 	private static func success(for frame: Frame) -> Frame {
 		let attributes = attributes(size: 0)
 		return switch frame.opcode {
-		case .write: Messages.frame(for: WriteResponse(written: 1, attributes: attributes, usableBytes: 1), opcode: .write, requestId: frame.requestId)
-		case .setattr: Messages.frame(for: SetattrResponse(applied: Messages.attributeSize, attributes: attributes, usableBytes: 1), opcode: .setattr, requestId: frame.requestId)
-		case .create: Messages.frame(for: CreateResponse(attributes: attributes, name: "new", directoryAttributes: attributes, usableBytes: 1), opcode: .create, requestId: frame.requestId)
+		case .write: Messages.frame(for: WriteResponse(written: 1, attributes: attributes, freeSpace: freeSpace), opcode: .write, requestId: frame.requestId)
+		case .setattr: Messages.frame(for: SetattrResponse(applied: Messages.attributeSize, attributes: attributes, freeSpace: freeSpace), opcode: .setattr, requestId: frame.requestId)
+		case .create: Messages.frame(for: CreateResponse(attributes: attributes, name: "new", directoryAttributes: attributes, freeSpace: freeSpace), opcode: .create, requestId: frame.requestId)
 		case .getattr: Messages.frame(for: GetattrResponse(attributes: attributes), opcode: .getattr, requestId: frame.requestId)
-		case .remove: Messages.frame(for: RemoveResponse(attributes: attributes, directoryAttributes: attributes, usableBytes: 1), opcode: .remove, requestId: frame.requestId)
-		default: Messages.frame(for: SyncResponse(usableBytes: 1), opcode: frame.opcode, requestId: frame.requestId)
+		case .remove: Messages.frame(for: RemoveResponse(attributes: attributes, directoryAttributes: attributes, freeSpace: freeSpace), opcode: .remove, requestId: frame.requestId)
+		default: Messages.frame(for: SyncResponse(freeSpace: freeSpace), opcode: frame.opcode, requestId: frame.requestId)
 		}
 	}
 
-	private static func send(_ opcode: Opcode, through client: BridgeClient) throws {
+	private static func send(_ opcode: Opcode, through client: BridgeClient) async throws {
 		switch opcode {
-		case .write: _ = try client.request(WriteRequest(nodeId: file, offset: 0, data: Data([1])))
-		case .setattr: _ = try client.request(SetattrRequest(nodeId: file, valid: Messages.attributeSize, size: 0, mode: 0, accessed: time, modified: time))
-		case .create: _ = try client.request(CreateRequest(parentId: Messages.rootNodeId, name: "new", type: .file, mode: 0o644))
-		case .getattr: _ = try client.request(GetattrRequest(nodeId: file))
-		case .remove: _ = try client.request(RemoveRequest(nodeId: file, parentId: Messages.rootNodeId))
-		default: _ = try client.request(SyncRequest())
+		case .write: _ = try await client.request(WriteRequest(nodeId: file, offset: 0, data: Data([1])))
+		case .setattr: _ = try await client.request(SetattrRequest(nodeId: file, valid: Messages.attributeSize, size: 0, mode: 0, accessed: time, modified: time))
+		case .create: _ = try await client.request(CreateRequest(parentId: Messages.rootNodeId, name: "new", type: .file, mode: 0o644))
+		case .getattr: _ = try await client.request(GetattrRequest(nodeId: file))
+		case .remove: _ = try await client.request(RemoveRequest(nodeId: file, parentId: Messages.rootNodeId, name: "file"))
+		default: _ = try await client.request(SyncRequest())
 		}
 	}
 
-	@Test func aNewClientHasNoUnsyncedChanges() throws {
+	@Test func aNewClientCanAnswerASyncItself() throws {
 		let server = try ScriptedServer { Self.success(for: $0) }
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		#expect(!client.hasUnsyncedChanges)
+		#expect(client.canAnswerSyncItself)
 	}
 
 	@Test(arguments: [Opcode.write, .setattr, .create], [true, false])
-	func aRequestThatMayLeaveDataInAChannelLeavesUnsyncedChangesWhateverItsOutcome(opcode: Opcode, succeeds: Bool) throws {
+	func aRequestThatMayLeaveDataInAChannelKeepsTheClientFromAnsweringASyncItselfWhateverItsOutcome(opcode: Opcode, succeeds: Bool) async throws {
 		let server = try ScriptedServer { frame in
 			succeeds ? Self.success(for: frame) : Messages.frame(forFailure: ENOSPC, opcode: frame.opcode, requestId: frame.requestId)
 		}
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		_ = try? Self.send(opcode, through: client)
+		_ = try? await Self.send(opcode, through: client)
 
-		#expect(client.hasUnsyncedChanges)
+		#expect(!client.canAnswerSyncItself)
 	}
 
 	@Test(arguments: [Opcode.getattr, .remove])
-	func anotherRequestLeavesNone(opcode: Opcode) throws {
+	func anotherRequestLeavesItAbleTo(opcode: Opcode) async throws {
 		let server = try ScriptedServer { Self.success(for: $0) }
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		try Self.send(opcode, through: client)
+		try await Self.send(opcode, through: client)
 
-		#expect(!client.hasUnsyncedChanges)
+		#expect(client.canAnswerSyncItself)
 	}
 
-	@Test func aSuccessfulSyncClearsUnsyncedChangesAndAFailedOneDoesNot() throws {
+	@Test func aSuccessfulSyncLetsTheClientAnswerSyncsItselfAndAFailedOneDoesNot() async throws {
 		let syncs = OSAllocatedUnfairLock(initialState: 0)
 		let server = try ScriptedServer { frame in
 			guard frame.opcode == .sync, syncs.withLock({ $0 += 1; return $0 }) == 1 else {
@@ -186,24 +206,90 @@ struct BridgeClientTests {
 			return Messages.frame(forFailure: EIO, opcode: .sync, requestId: frame.requestId)
 		}
 		let client = try BridgeClient(manifest: server.manifest)
-		try Self.send(.write, through: client)
+		defer { client.disconnect() }
+		try await Self.send(.write, through: client)
 
-		#expect(throws: StatusError(status: EIO)) {
-			try client.request(SyncRequest())
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
 		}
-		#expect(client.hasUnsyncedChanges)
-		_ = try client.request(SyncRequest())
-		#expect(!client.hasUnsyncedChanges)
+		#expect(!client.canAnswerSyncItself)
+		_ = try await client.request(SyncRequest())
+		#expect(client.canAnswerSyncItself)
 	}
 
-	@Test func splitsAWriteByThePayloadLimit() throws {
+	@Test func aSyncSentWhileAWriteIsInFlightDoesNotCoverIt() async throws {
+		// the write and the sync are read together and answered in reverse order, so the sync succeeds while the write is in flight
+		let server = try ScriptedServer(batches: [2]) { Self.success(for: $0) }
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+
+		async let write: Void = Self.send(.write, through: client)
+		try await waitUntil(client, hasSent: 1)
+		_ = try await client.request(SyncRequest())
+		try await write
+
+		#expect(!client.canAnswerSyncItself)
+		_ = try await client.request(SyncRequest())
+		#expect(client.canAnswerSyncItself)
+	}
+
+	@Test func concurrentRequestsEachGetTheirOwnResponse() async throws {
+		let server = try ScriptedServer(batches: [3]) { frame in
+			let request = try Messages.decodeRequest(GetattrRequest.self, from: frame)
+			return Messages.frame(for: GetattrResponse(attributes: Self.attributes(size: 0, nodeId: request.nodeId)), opcode: .getattr, requestId: frame.requestId)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+
+		let answered = try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
+			for nodeId: UInt64 in [64, 65, 66] {
+				group.addTask {
+					try await (nodeId, client.request(GetattrRequest(nodeId: nodeId)).attributes.nodeId)
+				}
+			}
+			return try await group.reduce(into: [(UInt64, UInt64)]()) { $0.append($1) }
+		}
+
+		#expect(answered.count == 3)
+		#expect(answered.allSatisfy { $0.0 == $0.1 })
+	}
+
+	@Test(arguments: ["unknown requestId", "closed connection"])
+	func aLostOrMismatchedConnectionFailsEveryWaitingCall(failure: String) async throws {
+		let server = try ScriptedServer(batches: [2]) { frame in
+			guard failure == "unknown requestId" else {
+				return nil
+			}
+			return Messages.frame(for: SyncResponse(freeSpace: Self.freeSpace), opcode: .sync, requestId: frame.requestId + 100)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+
+		async let waiting = Result { try await client.request(SyncRequest()) }
+		try await waitUntil(client, hasSent: 1)
+		let second = await Result { try await client.request(SyncRequest()) }
+		let first = await waiting
+
+		#expect(throws: StatusError(status: EIO)) {
+			try first.get()
+		}
+		#expect(throws: StatusError(status: EIO)) {
+			try second.get()
+		}
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
+		}
+	}
+
+	@Test func splitsAWriteByThePayloadLimit() async throws {
 		let content = Data(testContentOfLength: 2 * FrameCodec.maxPayloadLength + 5)
 		let stored = OSAllocatedUnfairLock(initialState: Data())
 		let requests = OSAllocatedUnfairLock(initialState: [Int]())
 		let server = try Self.writableServer(stored: stored, requests: requests, limit: .max)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.write(nodeId: Self.file, offset: 100, data: content)
+		let response = try await client.write(nodeId: Self.file, offset: 100, data: content)
 
 		#expect(Int(response.written) == content.count)
 		#expect(Int(response.attributes.size) == 100 + content.count)
@@ -211,39 +297,42 @@ struct BridgeClientTests {
 		#expect(stored.withLock { $0 } == Data(count: 100) + content)
 	}
 
-	@Test func continuesAWriteTheServerAcceptedInPart() throws {
+	@Test func continuesAWriteTheServerAcceptedInPart() async throws {
 		let content = Data(testContentOfLength: 2500)
 		let stored = OSAllocatedUnfairLock(initialState: Data())
 		let requests = OSAllocatedUnfairLock(initialState: [Int]())
 		let server = try Self.writableServer(stored: stored, requests: requests, limit: 1000)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.write(nodeId: Self.file, offset: 0, data: content)
+		let response = try await client.write(nodeId: Self.file, offset: 0, data: content)
 
 		#expect(response.written == 2500)
 		#expect(requests.withLock { $0 } == [2500, 1500, 500])
 		#expect(stored.withLock { $0 } == content)
 	}
 
-	@Test func endsAWriteTheServerAcceptsNothingOf() throws {
+	@Test func endsAWriteTheServerAcceptsNothingOf() async throws {
 		let stored = OSAllocatedUnfairLock(initialState: Data())
 		let requests = OSAllocatedUnfairLock(initialState: [Int]())
 		let server = try Self.writableServer(stored: stored, requests: requests, limit: 0)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.write(nodeId: Self.file, offset: 0, data: Data(testContentOfLength: 10))
+		let response = try await client.write(nodeId: Self.file, offset: 0, data: Data(testContentOfLength: 10))
 
 		#expect(response.written == 0)
 		#expect(requests.withLock { $0 } == [10])
 	}
 
-	@Test func splitsAReadByThePayloadLimit() throws {
+	@Test func splitsAReadByThePayloadLimit() async throws {
 		let content = Data(testContentOfLength: 2 * FrameCodec.maxPayloadLength + 5)
 		let requests = OSAllocatedUnfairLock(initialState: [ReadRequest]())
 		let server = try Self.readableServer(content: content, requests: requests, limit: .max)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.read(nodeId: Self.file, offset: 3, length: content.count + 100)
+		let response = try await client.read(nodeId: Self.file, offset: 3, length: content.count + 100)
 
 		#expect(response.data == content.dropFirst(3))
 		#expect(Int(response.attributes.size) == content.count)
@@ -255,48 +344,51 @@ struct BridgeClientTests {
 		])
 	}
 
-	@Test func readsNoMoreThanRequested() throws {
+	@Test func readsNoMoreThanRequested() async throws {
 		let content = Data(testContentOfLength: FrameCodec.maxPayloadLength + 500)
 		let requests = OSAllocatedUnfairLock(initialState: [ReadRequest]())
 		let server = try Self.readableServer(content: content, requests: requests, limit: .max)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.read(nodeId: Self.file, offset: 0, length: FrameCodec.maxPayloadLength + 10)
+		let response = try await client.read(nodeId: Self.file, offset: 0, length: FrameCodec.maxPayloadLength + 10)
 
 		#expect(response.data == content.prefix(FrameCodec.maxPayloadLength + 10))
 		#expect(requests.withLock { $0.map(\.length) } == [UInt32(FrameCodec.maxPayloadLength), 10])
 	}
 
-	@Test func endsAReadAtAShortResponse() throws {
+	@Test func endsAReadAtAShortResponse() async throws {
 		let content = Data(testContentOfLength: 5000)
 		let requests = OSAllocatedUnfairLock(initialState: [ReadRequest]())
 		let server = try Self.readableServer(content: content, requests: requests, limit: 1000)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		let response = try client.read(nodeId: Self.file, offset: 0, length: 4000)
+		let response = try await client.read(nodeId: Self.file, offset: 0, length: 4000)
 
 		#expect(response.data == content.prefix(1000))
 		#expect(requests.withLock { $0.count } == 1)
 	}
 
-	@Test func reportsAStatusAndKeepsTheConnection() throws {
+	@Test func reportsAStatusAndKeepsTheConnection() async throws {
 		let server = try ScriptedServer { frame in
-			frame.opcode == .lookup ? Messages.frame(forFailure: ENOENT, opcode: .lookup, requestId: frame.requestId) : Messages.frame(for: SyncResponse(usableBytes: 7), opcode: frame.opcode, requestId: frame.requestId)
+			frame.opcode == .lookup ? Messages.frame(forFailure: ENOENT, opcode: .lookup, requestId: frame.requestId) : Messages.frame(for: SyncResponse(freeSpace: FreeSpace(usableBytes: 7, generation: 1)), opcode: frame.opcode, requestId: frame.requestId)
 		}
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		#expect(throws: StatusError(status: ENOENT)) {
-			try client.request(LookupRequest(parentId: Messages.rootNodeId, name: "missing"))
+		await #expect(throws: StatusError(status: ENOENT)) {
+			try await client.request(LookupRequest(parentId: Messages.rootNodeId, name: "missing"))
 		}
-		#expect(try client.request(SyncRequest()).usableBytes == 7)
+		#expect(try await client.request(SyncRequest()).freeSpace.usableBytes == 7)
 	}
 
 	@Test(arguments: ["requestId", "opcode", "kind", "control"])
-	func dropsTheConnectionOnAResponseThatDoesNotMatch(mismatch: String) throws {
+	func dropsTheConnectionOnAResponseThatDoesNotMatch(mismatch: String) async throws {
 		let answered = OSAllocatedUnfairLock(initialState: 0)
 		let server = try ScriptedServer { frame in
 			answered.withLock { $0 += 1 }
-			var response = Messages.frame(for: SyncResponse(usableBytes: 7), opcode: .sync, requestId: frame.requestId)
+			var response = Messages.frame(for: SyncResponse(freeSpace: Self.freeSpace), opcode: .sync, requestId: frame.requestId)
 			switch mismatch {
 			case "requestId": response.requestId += 1
 			case "opcode": response.opcode = .forget
@@ -306,25 +398,79 @@ struct BridgeClientTests {
 			return response
 		}
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		#expect(throws: StatusError(status: EIO)) {
-			try client.request(SyncRequest())
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
 		}
-		#expect(throws: StatusError(status: EIO)) {
-			try client.request(SyncRequest())
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
 		}
 		#expect(answered.withLock { $0 } == 1)
 	}
 
-	@Test func failsWithEIOOnceTheServerClosedTheConnection() throws {
+	@Test func disconnectingFailsACallWhoseRequestWaitsForTheServerToRead() async throws {
+		let reading = DispatchSemaphore(value: 0)
+		let server = try ScriptedServer { _ in
+			reading.wait()
+			return nil
+		}
+		defer { reading.signal() }
+		let client = try BridgeClient(manifest: server.manifest)
+		// more than the connection's buffers hold, which grow while the server reads the first at full speed
+		let count = 16
+		let data = Data(count: FrameCodec.maxPayloadLength)
+		let armed = OSAllocatedUnfairLock(initialState: false)
+		// a thread of its own, since the calls that wait to send hold the threads tasks run on
+		Thread.detachNewThread {
+			// once a call waits in its send, it keeps the others from sending, and the number of sent requests stops growing
+			var sent = client.requestCounts.sent
+			let deadline = Date.now.addingTimeInterval(5)
+			while Date.now < deadline {
+				Thread.sleep(forTimeInterval: 0.2)
+				let now = client.requestCounts.sent
+				if now == sent, now >= 2 {
+					break
+				}
+				sent = now
+			}
+			let stalled = sent
+			armed.withLock { $0 = stalled >= 2 && stalled < UInt64(count) }
+			client.disconnect()
+		}
+
+		await withTaskGroup(of: Void.self) { group in
+			for offset in 0 ..< count {
+				group.addTask {
+					await #expect(throws: StatusError(status: EIO)) {
+						try await client.request(WriteRequest(nodeId: Self.file, offset: UInt64(offset), data: data))
+					}
+				}
+			}
+		}
+		#expect(armed.withLock { $0 })
+	}
+
+	@Test func failsWithEIOOnceTheServerClosedTheConnection() async throws {
 		let server = try ScriptedServer { _ in nil }
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 
-		#expect(throws: StatusError(status: EIO)) {
-			try client.request(SyncRequest())
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
 		}
-		#expect(throws: StatusError(status: EIO)) {
-			try client.request(SyncRequest())
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(SyncRequest())
+		}
+	}
+}
+
+extension Result where Failure == any Error {
+	init(catching body: () async throws -> Success) async {
+		do {
+			self = try await .success(body())
+		} catch {
+			self = .failure(error)
 		}
 	}
 }

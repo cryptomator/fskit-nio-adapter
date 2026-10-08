@@ -15,9 +15,9 @@ struct Listed {
 
 extension DirectoryLister {
 	/// Lists as FSKit does, with a packer that takes `capacity` entries and refuses the next.
-	func list(directory: UInt64, cookie: UInt64, verifier: UInt64, wantAttributes: Bool = false, capacity: Int) throws -> Listed {
+	func list(directory: UInt64, cookie: UInt64, verifier: UInt64, wantAttributes: Bool = false, capacity: Int) async throws -> Listed {
 		var entries: [DirectoryEntry] = []
-		let returned = try list(directory: directory, cookie: cookie, verifier: verifier, wantAttributes: wantAttributes) { entry in
+		let returned = try await list(directory: directory, cookie: cookie, verifier: verifier, wantAttributes: wantAttributes) { entry in
 			guard entries.count < capacity else {
 				return false
 			}
@@ -30,16 +30,16 @@ extension DirectoryLister {
 	/// Lists a whole directory: each call continues after the last entry packed, with the verifier the call before returned, until a call packs nothing.
 	///
 	/// - Returns: The names packed over all calls, and the requests `client` sent for each call.
-	func listAll(directory: UInt64, capacity: Int, counting client: BridgeClient) throws -> (names: [String], requestsPerCall: [UInt64]) {
+	func listAll(directory: UInt64, capacity: Int, counting client: BridgeClient) async throws -> (names: [String], requestsPerCall: [UInt64]) {
 		var names: [String] = []
 		var requestsPerCall: [UInt64] = []
 		var cookie: UInt64 = 0
 		var verifier: UInt64 = 0
 		// bounded, so that a lister that serves entries again fails the test instead of hanging it
 		for _ in 0 ..< 10 {
-			let requestsBefore = client.nextRequestId
-			let listed = try list(directory: directory, cookie: cookie, verifier: verifier, capacity: capacity)
-			requestsPerCall.append(client.nextRequestId - requestsBefore)
+			let requestsBefore = client.requestCounts.sent
+			let listed = try await list(directory: directory, cookie: cookie, verifier: verifier, capacity: capacity)
+			requestsPerCall.append(client.requestCounts.sent - requestsBefore)
 			guard let last = listed.entries.last else {
 				break
 			}
@@ -55,12 +55,12 @@ struct DirectoryListerTests {
 	private static let directory: UInt64 = 64
 	private static let verifier: UInt64 = 7
 
-	/// A server whose directory holds `count` entries named by their index and answers a `READDIR` with at most `pageSize` of them. It records every `READDIR` and answers `GETATTR` as well.
-	private static func server(count: Int, pageSize: Int, requests: OSAllocatedUnfairLock<[ReaddirRequest]>) throws -> ScriptedServer {
-		try ScriptedServer { frame in
+	/// A server whose directory holds `count` entries named by their index and answers a `READDIR` with at most `pageSize` of them. It records every `READDIR` and answers `GETATTR` as well. `batches` are those of `ScriptedServer`.
+	private static func server(count: Int, pageSize: Int, requests: OSAllocatedUnfairLock<[ReaddirRequest]>, batches: [Int] = []) throws -> ScriptedServer {
+		try ScriptedServer(batches: batches) { frame in
 			if frame.opcode == .getattr {
 				let time = Timestamp(seconds: 0, nanos: 0)
-				return Messages.frame(for: GetattrResponse(attributes: Attributes(type: .directory, mode: 0o755, size: 0, nodeId: directory, parentId: Messages.rootNodeId, modified: time, accessed: time, created: time)), opcode: .getattr, requestId: frame.requestId)
+				return Messages.frame(for: GetattrResponse(attributes: Attributes(type: .directory, mode: 0o755, size: 0, nodeId: directory, parentId: Messages.rootNodeId, modified: time, accessed: time, created: time, generation: 1)), opcode: .getattr, requestId: frame.requestId)
 			}
 			let request = try Messages.decodeRequest(ReaddirRequest.self, from: frame)
 			requests.withLock { $0.append(request) }
@@ -75,14 +75,15 @@ struct DirectoryListerTests {
 		range.map { "\($0)" }
 	}
 
-	@Test func continuingAtTheRefusedEntrySendsNoRequest() throws {
+	@Test func continuingAtTheRefusedEntrySendsNoRequest() async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
 
-		let first = try lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
-		let second = try lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 3)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		let second = try await lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 3)
 
 		#expect(first.names == Self.names(0 ..< 3))
 		#expect(second.names == Self.names(3 ..< 6))
@@ -90,40 +91,43 @@ struct DirectoryListerTests {
 	}
 
 	/// FSKit does so in an enumeration without attributes: it continues at an entry its packer already took, not at the one it refused.
-	@Test func continuingAtAnEntryThePackerTookSendsNoRequest() throws {
+	@Test func continuingAtAnEntryThePackerTookSendsNoRequest() async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
 
-		let first = try lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
-		let second = try lister.list(directory: Self.directory, cookie: 2, verifier: first.verifier, capacity: 3)
-		let third = try lister.list(directory: Self.directory, cookie: 2, verifier: second.verifier, capacity: 2)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		let second = try await lister.list(directory: Self.directory, cookie: 2, verifier: first.verifier, capacity: 3)
+		let third = try await lister.list(directory: Self.directory, cookie: 2, verifier: second.verifier, capacity: 2)
 
 		#expect(second.names == Self.names(2 ..< 5))
 		#expect(third.names == Self.names(2 ..< 4))
 		#expect(requests.withLock { $0.map(\.cookie) } == [0])
 	}
 
-	@Test func everyEntryIsPackedOnceOverAllCalls() throws {
+	@Test func everyEntryIsPackedOnceOverAllCalls() async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
 
-		let listing = try lister.listAll(directory: Self.directory, capacity: 3, counting: client)
+		let listing = try await lister.listAll(directory: Self.directory, capacity: 3, counting: client)
 
 		#expect(listing.names == Self.names(0 ..< 12))
 	}
 
-	@Test func aCallContinuesWithTheNextPageAfterTheKeptEntries() throws {
+	@Test func aCallContinuesWithTheNextPageAfterTheKeptEntries() async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
 
-		let first = try lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
-		let second = try lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 100)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		let second = try await lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 100)
 
 		#expect(first.verifier == Self.verifier)
 		#expect(second.verifier == Self.verifier)
@@ -131,17 +135,18 @@ struct DirectoryListerTests {
 	}
 
 	@Test(arguments: ["another request", "another verifier", "attributes", "another directory"])
-	func aCallThatContinuesSomethingElseAsksTheServer(difference: String) throws {
+	func aCallThatContinuesSomethingElseAsksTheServer(difference: String) async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
-		let first = try lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
 		if difference == "another request" {
-			_ = try client.request(GetattrRequest(nodeId: Self.directory))
+			_ = try await client.request(GetattrRequest(nodeId: Self.directory))
 		}
 
-		let second = try lister.list(
+		let second = try await lister.list(
 			directory: difference == "another directory" ? Self.directory + 1 : Self.directory,
 			cookie: 3,
 			verifier: difference == "another verifier" ? first.verifier + 1 : first.verifier,
@@ -153,16 +158,71 @@ struct DirectoryListerTests {
 		#expect(requests.withLock { $0.map(\.cookie) } == [0, 3])
 	}
 
-	@Test func aCallAtCookieZeroAsksTheServerAlthoughTheEntryAtCookieZeroWasRefused() throws {
+	@Test func aCallAtCookieZeroAsksTheServerAlthoughTheEntryAtCookieZeroWasRefused() async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
 		let server = try Self.server(count: 12, pageSize: 8, requests: requests)
 		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
 		let lister = DirectoryLister(client: client)
 
-		let first = try lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 0)
-		let second = try lister.list(directory: Self.directory, cookie: 0, verifier: first.verifier, capacity: 3)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 0)
+		let second = try await lister.list(directory: Self.directory, cookie: 0, verifier: first.verifier, capacity: 3)
 
 		#expect(second.names == Self.names(0 ..< 3))
 		#expect(requests.withLock { $0.map(\.cookie) } == [0, 0])
+	}
+
+	@Test func aPageIsNotKeptWhenAnotherRequestWasInFlightWhenItsReaddirWasSent() async throws {
+		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
+		// the GETATTR and the first READDIR are read together and answered in reverse order
+		let server = try Self.server(count: 12, pageSize: 8, requests: requests, batches: [2])
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+		let lister = DirectoryLister(client: client)
+
+		async let getattr = client.request(GetattrRequest(nodeId: Self.directory))
+		try await waitUntil(client, hasSent: 1)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		_ = try await getattr
+		let second = try await lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 3)
+
+		#expect(second.names == Self.names(3 ..< 6))
+		#expect(requests.withLock { $0.map(\.cookie) } == [0, 3])
+	}
+
+	@Test func aPageIsNotKeptWhenAnotherRequestWasSentBeforeItArrived() async throws {
+		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
+		// the first READDIR and the GETATTR are read together and answered in reverse order
+		let server = try Self.server(count: 12, pageSize: 8, requests: requests, batches: [2])
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+		let lister = DirectoryLister(client: client)
+
+		async let listed = lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		try await waitUntil(client, hasSent: 1)
+		_ = try await client.request(GetattrRequest(nodeId: Self.directory))
+		let first = try await listed
+		let second = try await lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 3)
+
+		#expect(second.names == Self.names(3 ..< 6))
+		#expect(requests.withLock { $0.map(\.cookie) } == [0, 3])
+	}
+
+	@Test func aKeptPageIsNotUsedWhileAnotherRequestIsInFlight() async throws {
+		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())
+		// the GETATTR and the second READDIR are read together and answered in reverse order
+		let server = try Self.server(count: 12, pageSize: 8, requests: requests, batches: [1, 2])
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+		let lister = DirectoryLister(client: client)
+		let first = try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+
+		async let getattr = client.request(GetattrRequest(nodeId: Self.directory))
+		try await waitUntil(client, hasSent: 2)
+		let second = try await lister.list(directory: Self.directory, cookie: 3, verifier: first.verifier, capacity: 3)
+		_ = try await getattr
+
+		#expect(second.names == Self.names(3 ..< 6))
+		#expect(requests.withLock { $0.map(\.cookie) } == [0, 3])
 	}
 }

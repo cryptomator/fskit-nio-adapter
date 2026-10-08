@@ -8,6 +8,7 @@ import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.DirectoryEntry;
 import org.cryptomator.frontend.fskit.protocol.Messages.ForgetRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.ForgetResponse;
+import org.cryptomator.frontend.fskit.protocol.Messages.FreeSpace;
 import org.cryptomator.frontend.fskit.protocol.Messages.GetattrRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.GetattrResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.LookupRequest;
@@ -49,13 +50,14 @@ final class EventLogOptOut {
 	private static final long DIRECTORY_ID = 3;
 	private static final long FILE_ID = 4;
 	private static final long VERIFIER = 1;
+	private static final FreeSpace UNKNOWN_FREE_SPACE = new FreeSpace(Messages.UNKNOWN_USABLE_BYTES, 0);
 
 	private final Attributes directory;
 	private final Attributes file;
 
 	EventLogOptOut(Timestamp created) {
-		this.directory = new Attributes(NodeType.DIRECTORY, 0555, 0, DIRECTORY_ID, Messages.ROOT_NODE_ID, created, created, created);
-		this.file = new Attributes(NodeType.FILE, 0444, 0, FILE_ID, DIRECTORY_ID, created, created, created);
+		this.directory = new Attributes(NodeType.DIRECTORY, 0555, 0, DIRECTORY_ID, Messages.ROOT_NODE_ID, created, created, created, 0);
+		this.file = new Attributes(NodeType.FILE, 0444, 0, FILE_ID, DIRECTORY_ID, created, created, created, 0);
 	}
 
 	/**
@@ -91,8 +93,8 @@ final class EventLogOptOut {
 			}
 			case ReadRequest r when r.nodeId() == FILE_ID -> new ReadResponse(file, ByteBuffer.allocate(0));
 			case ReadlinkRequest r when shows(r.nodeId()) -> throw new StatusException(Errno.EINVAL);
-			case CloseRequest r when shows(r.nodeId()) -> new CloseResponse(Messages.UNKNOWN_USABLE_BYTES);
-			case ForgetRequest r when shows(r.nodeId()) -> new ForgetResponse(Messages.UNKNOWN_USABLE_BYTES);
+			case CloseRequest r when shows(r.nodeId()) -> new CloseResponse(UNKNOWN_FREE_SPACE);
+			case ForgetRequest r when shows(r.nodeId()) -> new ForgetResponse(UNKNOWN_FREE_SPACE);
 			case CreateRequest r when takes(r.parentId(), r.name()) -> throw new StatusException(Errno.EEXIST);
 			case CreateRequest r when shows(r.parentId()) -> throw new StatusException(Errno.EPERM);
 			case SymlinkRequest r when takes(r.parentId(), r.name()) -> throw new StatusException(Errno.EEXIST);
