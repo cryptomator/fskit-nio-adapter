@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>org.cryptomator</groupId>
     <artifactId>fskit-nio-adapter</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.2.0-SNAPSHOT</version>
     <name>FSKit-NIO-Adapter</name>
     <description>Access resources at a given NIO path via FSKit.</description>
     <url>https://github.com/cryptomator/fskit-nio-adapter</url>
