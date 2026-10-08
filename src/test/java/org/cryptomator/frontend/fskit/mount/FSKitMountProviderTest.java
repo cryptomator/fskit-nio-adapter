@@ -4,6 +4,7 @@ import org.cryptomator.frontend.fskit.BridgeSession;
 import org.cryptomator.frontend.fskit.TestBridgeClient;
 import org.cryptomator.frontend.fskit.fs.Errno;
 import org.cryptomator.frontend.fskit.fs.HookedOperations;
+import org.cryptomator.frontend.fskit.mount.ExtensionCheck.Status;
 import org.cryptomator.frontend.fskit.protocol.Manifest;
 import org.cryptomator.frontend.fskit.protocol.Messages;
 import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.Mockito;
 
 import java.io.BufferedReader;
@@ -71,6 +73,10 @@ public class FSKitMountProviderTest {
 	private volatile CommandHandler<ProcessBuilder> mountTableHandler = _ -> exited(0, String.join("\n", mountTable), "");
 	private volatile MountCommand lastMountCommand;
 	private volatile Duration sessionCloseTimeout = Duration.ofSeconds(10);
+	/**
+	 * Answers as for a JVM outside an app, unless a test says otherwise.
+	 */
+	private final ExtensionCheck extensionCheck = Mockito.mock(ExtensionCheck.class);
 
 	private FSKitMountProvider provider;
 
@@ -91,11 +97,13 @@ public class FSKitMountProviderTest {
 	public void setup(@TempDir Path tmpDir) throws IOException {
 		fileSystemRoot = Files.createDirectory(tmpDir.resolve("root"));
 		mountPoint = Files.createDirectory(tmpDir.resolve("mnt"));
+		Mockito.when(extensionCheck.embedded(Mockito.anyString())).thenReturn(Status.NOT_IN_APP);
+		Mockito.when(extensionCheck.status(Mockito.anyString())).thenReturn(Status.NOT_IN_APP);
 		provider = new FSKitMountProvider(this::start, (root, readOnly) -> {
 			HookedOperations ops = new HookedOperations(root, readOnly);
 			operations.add(ops);
 			return new BridgeSession(ops, sessionCloseTimeout);
-		});
+		}, extensionCheck);
 	}
 
 	@AfterEach
@@ -268,6 +276,40 @@ public class FSKitMountProviderTest {
 		Assertions.assertEquals(expected, FSKitMountProvider.isSupported(osVersion));
 	}
 
+	@ParameterizedTest(name = "os.version {0}, os.arch {1}")
+	@DisplayName("is not supported before macOS 27 or on another architecture than aarch64, which it tells without checking for the extension")
+	@CsvSource(value = {"26.4, aarch64", "27.0, x86_64", "27.0, amd64", "'', aarch64"})
+	public void testIsSupportedOnSystem(String osVersion, String osArch) {
+		Assertions.assertFalse(provider.isSupported(osVersion, osArch));
+
+		Mockito.verifyNoInteractions(extensionCheck);
+	}
+
+	@ParameterizedTest(name = "{0} -> {1}")
+	@DisplayName("on macOS 27 with aarch64, is supported unless the app embeds no extension for the file system type, which it tells without asking FSKit")
+	@CsvSource(value = {"NOT_EMBEDDED, false", "NOT_IN_APP, true", "EMBEDDED, true", "FAILED, true"})
+	public void testIsSupportedInApp(Status embedded, boolean expected) {
+		Mockito.when(extensionCheck.embedded("cryptomatorfs")).thenReturn(embedded);
+
+		Assertions.assertEquals(expected, provider.isSupported("27.0.1", "aarch64"));
+
+		Mockito.verify(extensionCheck).embedded("cryptomatorfs");
+		Mockito.verifyNoMoreInteractions(extensionCheck);
+	}
+
+	@Test
+	@DisplayName("looks for the extension of the file system type from the system property")
+	public void testIsSupportedForFsTypeProperty() {
+		Mockito.when(extensionCheck.embedded(Mockito.anyString())).thenReturn(Status.NOT_EMBEDDED);
+		Mockito.when(extensionCheck.embedded("testfs")).thenReturn(Status.EMBEDDED);
+		System.setProperty("org.cryptomator.frontend.fskit.fsType", "testfs");
+		try {
+			Assertions.assertTrue(provider.isSupported("27.0.1", "aarch64"));
+		} finally {
+			System.clearProperty("org.cryptomator.frontend.fskit.fsType");
+		}
+	}
+
 	@Nested
 	@DisplayName("discovery")
 	public class Discovery {
@@ -347,6 +389,69 @@ public class FSKitMountProviderTest {
 				Assertions.assertEquals(Mountpoint.forPath(mountPoint), mount.getMountpoint());
 				Assertions.assertTrue(Files.isDirectory(rendezvousDir));
 			}
+		}
+
+		@Test
+		@DisplayName("with the extension switched off, opens System Settings and fails without running a command")
+		public void testExtensionSwitchedOff() {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
+			Mockito.when(extensionCheck.openSettings()).thenReturn(true);
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertTrue(e.getMessage().contains("System Settings > General > Login Items & Extensions > File System Extensions, which has been opened"), e.getMessage());
+			Mockito.verify(extensionCheck).openSettings();
+			Assertions.assertEquals(List.of(), commands);
+			Assertions.assertEquals(List.of(), operations);
+		}
+
+		@Test
+		@DisplayName("with the extension switched off and System Settings failing to open, says so")
+		public void testExtensionSwitchedOffWithoutSettings() {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
+			Mockito.when(extensionCheck.openSettings()).thenReturn(false);
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertTrue(e.getMessage().contains("System Settings > General > Login Items & Extensions > File System Extensions, which could not be opened"), e.getMessage());
+			Assertions.assertEquals(List.of(), commands);
+		}
+
+		@Test
+		@DisplayName("asks whether the extension of the file system type from the system property is switched on")
+		public void testExtensionSwitchedOffForFsTypeProperty() {
+			Mockito.when(extensionCheck.status("testfs")).thenReturn(Status.DISABLED);
+			System.setProperty("org.cryptomator.frontend.fskit.fsType", "testfs");
+			try {
+				Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+				Assertions.assertEquals(List.of(), commands);
+			} finally {
+				System.clearProperty("org.cryptomator.frontend.fskit.fsType");
+			}
+		}
+
+		@Test
+		@DisplayName("mounts once the extension has been switched on")
+		public void testExtensionSwitchedOnAfterwards() throws MountFailedException, UnmountFailedException, IOException {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED, Status.ENABLED);
+
+			Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+			try (Mount _ = builder().mount()) {
+				Assertions.assertEquals(List.of("/sbin/mount", "-F", "-t", "cryptomatorfs"), lastMountCommand.command().command().subList(0, 4));
+			}
+		}
+
+		@ParameterizedTest
+		@DisplayName("mounts without opening System Settings when the extension is not known to be switched off")
+		@EnumSource(names = {"ENABLED", "NOT_REGISTERED", "NOT_IN_APP", "FAILED"})
+		public void testExtensionNotSwitchedOff(Status status) throws MountFailedException, UnmountFailedException, IOException {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(status);
+
+			try (Mount _ = builder().mount()) {
+				Assertions.assertEquals(List.of("/sbin/mount", "-F", "-t", "cryptomatorfs"), lastMountCommand.command().command().subList(0, 4));
+			}
+			Mockito.verify(extensionCheck, Mockito.never()).openSettings();
 		}
 
 		@Test

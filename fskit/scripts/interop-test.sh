@@ -16,7 +16,7 @@ SERVER_STDIN="$WORK_DIR/server.stdin"
 # The server runs until its standard input yields anything or ends, so this script holds a pipe open and writes to it to stop the server.
 mkfifo "$SERVER_STDIN"
 echo "==> Starting Java server"
-(cd "$REPO_ROOT" && ./mvnw -B -q test -Pmirror -Dmirror.mainClass=org.cryptomator.frontend.fskit.BridgeServerMain < "$SERVER_STDIN" > "$SERVER_LOG" 2>&1) &
+(cd "$REPO_ROOT" && ./mvnw -B -q test -Pmirror -P'!fskit-native' -Dmirror.mainClass=org.cryptomator.frontend.fskit.BridgeServerMain < "$SERVER_STDIN" > "$SERVER_LOG" 2>&1) &
 SERVER_PID=$!
 exec 3> "$SERVER_STDIN"
 

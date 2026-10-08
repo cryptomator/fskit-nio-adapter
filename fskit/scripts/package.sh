@@ -7,7 +7,7 @@
 #   FSKitNioHost.app/Contents/
 #     Info.plist
 #     MacOS/FSKitNioHost
-#     Extensions/FSKitNioExtension.appex/Contents/
+#     Extensions/FSKitNioExtension.appex/Contents/   (assembled by build-appex.sh)
 #       Info.plist
 #       MacOS/FSKitNioExtension
 #
@@ -31,25 +31,26 @@ BUILD_DIR="$FSKIT_DIR/build"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 HOST_BUNDLE_ID="${HOST_BUNDLE_ID:-org.cryptomator.fskit.host}"
 FS_TYPE_NAME="${FS_TYPE_NAME:-cryptomatorfs}"
+# the flags of build-appex.sh, so that the host and the extension come from one build
+BUILD_FLAGS=(-c release --arch arm64)
 
 # 1. Build the Swift targets
 if [[ "${SKIP_SWIFT:-0}" != "1" ]]; then
 	echo "==> Building Swift targets"
-	(cd "$FSKIT_DIR" && swift build -c release)
+	(cd "$FSKIT_DIR" && swift build $BUILD_FLAGS)
 fi
-BIN_DIR="$(cd "$FSKIT_DIR" && swift build -c release --show-bin-path)"
+BIN_DIR="$(cd "$FSKIT_DIR" && swift build $BUILD_FLAGS --show-bin-path)"
 
 # 2. Assemble the bundle tree
 echo "==> Assembling bundle"
 APP="$BUILD_DIR/FSKitNioHost.app"
 APPEX="$APP/Contents/Extensions/FSKitNioExtension.appex"
 rm -rf "$BUILD_DIR"
-mkdir -p "$APP/Contents/MacOS" "$APPEX/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS"
 
 cp "$FSKIT_DIR/Bundle/FSKitNioHost-Info.plist" "$APP/Contents/Info.plist"
 cp "$BIN_DIR/FSKitNioHost" "$APP/Contents/MacOS/FSKitNioHost"
-cp "$FSKIT_DIR/Bundle/FSKitNioExtension-Info.plist" "$APPEX/Contents/Info.plist"
-cp "$BIN_DIR/FSKitNioExtension" "$APPEX/Contents/MacOS/FSKitNioExtension"
+SKIP_SWIFT=1 "$SCRIPT_DIR/build-appex.sh" "$APP/Contents/Extensions"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID.extension" "$APPEX/Contents/Info.plist"

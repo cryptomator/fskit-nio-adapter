@@ -23,17 +23,17 @@ flowchart LR
 - Each volume serves its requests concurrently. Requests on the same entries wait for each other where they would conflict, as a rename waits for the requests in flight below what it moves. Separate mounts are independent.
 - The wire format is specified in [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
 
-This repository ships the Maven artifact `org.cryptomator:fskit-nio-adapter`, the extension sources in `fskit/`, and a stand-in host app for local testing. The mount only works while an app containing the extension is installed and the extension is enabled.
+This repository ships the Maven artifact `org.cryptomator:fskit-nio-adapter` with the built extension next to it (see "Embed the extension in an app"), the extension sources in `fskit/`, and a stand-in host app for local testing. The mount only works while an app containing the extension is installed and the extension is enabled.
 
 ## Build and test
 
-Java (JDK 25, on macOS or Linux, no Swift tooling needed):
+Java (JDK 25, on macOS or Linux):
 
 ```
 ./mvnw verify
 ```
 
-The build fails on a compiler warning.
+The build fails on a compiler warning. On macOS it also runs `swift build` (macOS 27 SDK). It puts `libFSKitNioSupport.dylib`, through which the provider checks the app, into the jar and zips the extension into `target/fskit-nio-adapter-<version>-appex.zip`. `-P'!fskit-native'` leaves both out and needs no Swift tooling, as on Linux.
 
 Swift (macOS 27 SDK, Swift 6.2 or later):
 
@@ -90,6 +90,25 @@ The extension carries the restricted `com.apple.developer.fskit.fsmodule` entitl
 
 A broken seal fails opaquely: `fskitd` does not launch a bundle whose signature is invalid, and the only symptom is `mount: Unable to invoke task`. After replacing the installed app, always check it with `codesign --verify --deep --strict`.
 
+## Embed the extension in an app
+
+An app that offers the provider embeds the extension. Next to the jar `org.cryptomator:fskit-nio-adapter`, each release publishes the extension as a zip with the classifier `appex` (`fskit-nio-adapter-<version>-appex.zip`). The jar holds `libFSKitNioSupport.dylib`. Both are built for Apple silicon and carry no signature but the linker's ad-hoc one.
+
+The app:
+
+1. Expands the zip.
+2. Places `FSKitNioExtension.appex` in its `Contents/Extensions`, with a `CFBundleIdentifier` that starts with its own and a dot. The extension's `FSShortName` must be the type the JVM mounts with. The zip declares `cryptomatorfs`, the default, and an app that sets `-Dorg.cryptomator.frontend.fskit.fsType` changes it to match.
+3. Embeds a provisioning profile for the extension's identifier that authorizes `com.apple.developer.fskit.fsmodule`, as `Contents/embedded.provisionprofile` of the extension.
+4. Signs the dylib in the jar, as notarization requires.
+5. Signs the extension with `fskit/Bundle/FSKitNioExtension.entitlements` plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` from the profile, then signs the app. `codesign --deep` on the app re-signs the extension without its own entitlements. So any `--deep` pass comes before the extension is signed, and the app's last signing is without `--deep`.
+6. Starts the JVM with the provider's module in `--enable-native-access`: `org.cryptomator.frontend.fskit` on the module path, `ALL-UNNAMED` on the class path.
+
+`fskit/scripts/package.sh` does steps 2, 3 and 5 for the test host app.
+
+`isSupported()` is true on macOS 27 or later with an `aarch64` JVM, unless the JVM runs from an app that embeds no extension whose `FSShortName` is the type to mount. Outside an app, as in tests or an IDE, it is true, and so it is when `libFSKitNioSupport.dylib` cannot be loaded. It looks into the app bundle only. Asking FSKit takes too long for this check, so an extension that macOS has not registered counts as well.
+
+macOS installs the extension switched off. A mount then opens System Settings at General > Login Items & Extensions > File System Extensions and fails with a message that asks to switch the extension on and try again. Once it is on, the next mount works, without restarting the app.
+
 ## Mirroring test
 
 With the extension installed and enabled, `MirroringFSKitMountTest` mounts directories or a vault interactively. In either mode the JVM logs every request with its response at trace level.
@@ -105,6 +124,8 @@ Mirror a vault (prompts for the vault, its passphrase, the mount point, and for 
 ```
 ./mvnw test -Pcrypto-mirror
 ```
+
+On a Mac without Swift tooling, add `-P'!fskit-native'` to either.
 
 ## Smoke test
 
@@ -163,7 +184,7 @@ Observed on macOS 27.0.1 with JDK 26.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.
 - A mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
 - A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". The mount point is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`.
-- The provider is offered on every Mac running macOS 27 or later, whether or not the extension is installed and enabled. If it is not, `mount()` fails with `MountFailedException`.
+- On macOS 27 or later with an `aarch64` JVM, the provider is offered whether or not macOS has registered an extension for its file system type. Inside an app, it is offered only if the app embeds such an extension. Where no extension serves the type, `mount()` fails with `MountFailedException`.
 
 ## License
 

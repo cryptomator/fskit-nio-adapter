@@ -41,13 +41,32 @@ public class SmokeMountMain {
 		LOG = LoggerFactory.getLogger(SmokeMountMain.class);
 	}
 
-	private final FSKitMountProvider provider = new FSKitMountProvider();
+	// smoke-test.sh builds without the native library. The provider would then warn on every mount, which the script's log scan reports. Outside an app, the library would answer NOT_IN_APP anyway.
+	private final FSKitMountProvider provider = new FSKitMountProvider(ProcessBuilder::start, FSKitMountProvider::createSession, new OutsideApp());
 	private final Map<String, Mounted> mounted = new LinkedHashMap<>();
 
 	/**
 	 * @param vault The vault whose root is mounted, or {@code null} if a plain directory is
 	 */
 	private record Mounted(Mount mount, @Nullable FileSystem vault) {
+	}
+
+	private static class OutsideApp implements ExtensionCheck {
+
+		@Override
+		public Status embedded(String fsType) {
+			return Status.NOT_IN_APP;
+		}
+
+		@Override
+		public Status status(String fsType) {
+			return Status.NOT_IN_APP;
+		}
+
+		@Override
+		public boolean openSettings() {
+			throw new AssertionError("only asked for a switched-off extension");
+		}
 	}
 
 	public static void main(String[] args) throws IOException {

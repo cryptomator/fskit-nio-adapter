@@ -6,6 +6,10 @@ let package = Package(
 	platforms: [
 		.macOS("27.0")
 	],
+	products: [
+		// loaded by the Java provider through FFM, to check the app it runs in for the extension
+		.library(name: "FSKitNioSupport", type: .dynamic, targets: ["FSKitNioSupport"])
+	],
 	targets: [
 		.target(
 			name: "FSKitBridge"
@@ -26,10 +30,19 @@ let package = Package(
 		.executableTarget(
 			name: "FSKitNioHost"
 		),
+		.target(
+			name: "FSKitNioSupport"
+		),
 		.testTarget(
 			name: "FSKitBridgeTests",
 			dependencies: [
 				"FSKitBridge"
+			]
+		),
+		.testTarget(
+			name: "FSKitNioSupportTests",
+			dependencies: [
+				"FSKitNioSupport"
 			]
 		)
 	]

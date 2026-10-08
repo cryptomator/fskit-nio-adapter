@@ -38,7 +38,10 @@ import static org.cryptomator.integrations.mount.MountCapability.VOLUME_NAME;
 /**
  * Mounts a file system on macOS using FSKit.
  * <p>
- * The file system is served by this JVM. An FSKit extension, which must be installed and enabled, forwards every operation to it.
+ * The file system is served by this JVM. An FSKit extension answers some operations itself and forwards the others to it.
+ * The provider is supported on macOS 27 or later with an {@code aarch64} JVM, unless the JVM runs from an app that embeds no extension for the file system type. A JVM outside an app, as in tests, or in an app that cannot be checked counts as supported.
+ * <p>
+ * An app installs its extension switched off. Mounting with the extension switched off opens System Settings at File System Extensions and fails with a message that asks to switch it on and try again.
  *
  * @see <a href="https://developer.apple.com/documentation/fskit">FSKit documentation</a>
  */
@@ -53,18 +56,20 @@ public class FSKitMountProvider implements MountService {
 
 	private final ProcessHelper.Starter processStarter;
 	private final SessionFactory sessionFactory;
+	private final ExtensionCheck extensionCheck;
 
 	public FSKitMountProvider() {
-		this(ProcessBuilder::start, FSKitMountProvider::createSession);
+		this(ProcessBuilder::start, FSKitMountProvider::createSession, NativeExtensionCheck.SHARED);
 	}
 
 	static BridgeSession createSession(Path fileSystemRoot, boolean readOnly) throws IOException {
 		return new BridgeSession(new FileSystemOperations(fileSystemRoot, readOnly), SESSION_CLOSE_TIMEOUT);
 	}
 
-	FSKitMountProvider(ProcessHelper.Starter processStarter, SessionFactory sessionFactory) {
+	FSKitMountProvider(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck) {
 		this.processStarter = processStarter;
 		this.sessionFactory = sessionFactory;
+		this.extensionCheck = extensionCheck;
 	}
 
 	@Override
@@ -74,7 +79,14 @@ public class FSKitMountProvider implements MountService {
 
 	@Override
 	public boolean isSupported() {
-		return isSupported(System.getProperty("os.version"));
+		return isSupported(System.getProperty("os.version"), System.getProperty("os.arch"));
+	}
+
+	/**
+	 * Checks the app bundle only on a system that can run the extension. Asking FSKit takes too long for this check, so an extension that is embedded but not registered counts as supported.
+	 */
+	boolean isSupported(String osVersion, String osArch) {
+		return isSupported(osVersion) && osArch.equals("aarch64") && extensionCheck.embedded(fsType()) != ExtensionCheck.Status.NOT_EMBEDDED;
 	}
 
 	static boolean isSupported(String osVersion) {
@@ -87,7 +99,11 @@ public class FSKitMountProvider implements MountService {
 
 	@Override
 	public MountBuilder forFileSystem(Path fileSystemRoot) {
-		return new FSKitMountBuilder(processStarter, sessionFactory, fileSystemRoot);
+		return new FSKitMountBuilder(processStarter, sessionFactory, extensionCheck, fsType(), fileSystemRoot);
+	}
+
+	private static String fsType() {
+		return System.getProperty(FS_TYPE_PROPERTY, DEFAULT_FS_TYPE);
 	}
 
 	@Override
@@ -111,14 +127,18 @@ public class FSKitMountProvider implements MountService {
 
 		private final ProcessHelper.Starter processStarter;
 		private final SessionFactory sessionFactory;
+		private final ExtensionCheck extensionCheck;
+		private final String fsType;
 		private final Path fileSystemRoot;
 		private Path mountPoint;
 		private boolean readOnly;
 		private String volumeName = "Untitled";
 
-		public FSKitMountBuilder(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, Path fileSystemRoot) {
+		public FSKitMountBuilder(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck, String fsType, Path fileSystemRoot) {
 			this.processStarter = processStarter;
 			this.sessionFactory = sessionFactory;
+			this.extensionCheck = extensionCheck;
+			this.fsType = fsType;
 			this.fileSystemRoot = fileSystemRoot;
 		}
 
@@ -147,6 +167,7 @@ public class FSKitMountProvider implements MountService {
 		@Override
 		public Mount mount() throws MountFailedException {
 			Objects.requireNonNull(mountPoint);
+			checkExtensionSwitchedOn();
 			Path realMountPoint;
 			try {
 				realMountPoint = mountPoint.toRealPath();
@@ -202,8 +223,24 @@ public class FSKitMountProvider implements MountService {
 			}
 		}
 
+		/**
+		 * Fails if the extension is switched off, after opening System Settings, since only the user can switch it on.
+		 * Without this check, {@code mount} would fail with a message about a disabled module.
+		 */
+		private void checkExtensionSwitchedOn() throws MountFailedException {
+			switch (extensionCheck.status(fsType)) {
+				case DISABLED -> {
+					boolean opened = extensionCheck.openSettings();
+					throw new MountFailedException("The FSKit extension is switched off. Switch it on in System Settings > General > Login Items & Extensions > File System Extensions, which " + (opened ? "has been opened" : "could not be opened") + ", and try again.");
+				}
+				case FAILED -> LOG.warn("Mounting without knowing whether the FSKit extension is switched on");
+				default -> {
+				}
+			}
+		}
+
 		private List<String> mountCommand(Path rendezvousDir) {
-			List<String> command = new ArrayList<>(List.of("/sbin/mount", "-F", "-t", System.getProperty(FS_TYPE_PROPERTY, DEFAULT_FS_TYPE)));
+			List<String> command = new ArrayList<>(List.of("/sbin/mount", "-F", "-t", fsType));
 			if (readOnly) {
 				// makes the system refuse changes itself, through an option the extension declares. The session enforces read-only as well.
 				command.addAll(List.of("-o", "rdonly"));

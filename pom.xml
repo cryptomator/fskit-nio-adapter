@@ -31,9 +31,17 @@
         <!-- build dependencies -->
         <mvn-compiler.version>3.16.0</mvn-compiler.version>
         <mvn-dependency.version>3.11.0</mvn-dependency.version>
+        <mvn-deploy.version>3.2.0</mvn-deploy.version>
+        <mvn-enforcer.version>3.6.3</mvn-enforcer.version>
+        <mvn-gpg.version>3.2.8</mvn-gpg.version>
         <mvn-jar.version>3.5.1</mvn-jar.version>
+        <mvn-javadoc.version>3.12.0</mvn-javadoc.version>
+        <mvn-resources.version>3.5.0</mvn-resources.version>
+        <mvn-source.version>3.4.0</mvn-source.version>
         <mvn-surefire.version>3.6.0</mvn-surefire.version>
         <mvn-exec.version>3.6.4</mvn-exec.version>
+        <build-helper.version>3.6.1</build-helper.version>
+        <central-publishing.version>0.11.0</central-publishing.version>
         <jacoco.version>0.8.15</jacoco.version>
     </properties>
 
@@ -128,29 +136,39 @@
     <build>
         <pluginManagement>
             <plugins>
-                <!-- shared setup of the mirror and crypto-mirror profiles, which run the interactive MirroringFSKitMountTest; fskit/scripts/interop-test.sh runs BridgeServerMain and fskit/scripts/smoke-test.sh runs SmokeMountMain through the mirror profile -->
+                <!-- declares no execution: one declared here would run in every build that uses the plugin, also through fskit-native, which is active on every Mac -->
                 <plugin>
                     <groupId>org.codehaus.mojo</groupId>
                     <artifactId>exec-maven-plugin</artifactId>
                     <version>${mvn-exec.version}</version>
+                </plugin>
+                <!-- for the deploy profiles. A release without the library could not check for the extension, and one without the zip would give the app nothing to embed. -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-enforcer-plugin</artifactId>
+                    <version>${mvn-enforcer.version}</version>
                     <executions>
                         <execution>
-                            <id>run-mirror</id>
-                            <phase>test</phase>
+                            <id>require-native-artifacts</id>
+                            <phase>verify</phase>
                             <goals>
-                                <goal>exec</goal>
+                                <goal>enforce</goal>
                             </goals>
+                            <configuration>
+                                <rules>
+                                    <requireActiveProfile>
+                                        <profiles>fskit-native</profiles>
+                                    </requireActiveProfile>
+                                    <requireFilesExist>
+                                        <files>
+                                            <file>${project.build.outputDirectory}/org/cryptomator/frontend/fskit/mount/libFSKitNioSupport.dylib</file>
+                                            <file>${project.build.directory}/${project.build.finalName}-appex.zip</file>
+                                        </files>
+                                    </requireFilesExist>
+                                </rules>
+                            </configuration>
                         </execution>
                     </executions>
-                    <configuration>
-                        <executable>${java.home}/bin/java</executable>
-                        <classpathScope>test</classpathScope>
-                        <arguments>
-                            <argument>-classpath</argument>
-                            <classpath/>
-                            <argument>${mirror.mainClass}</argument>
-                        </arguments>
-                    </configuration>
                 </plugin>
             </plugins>
         </pluginManagement>
@@ -201,13 +219,40 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>${mvn-surefire.version}</version>
                 <configuration>
-                    <argLine>@{surefire.jacoco.args} -javaagent:"${org.mockito:mockito-core:jar}"</argLine>
+                    <argLine>@{surefire.jacoco.args} -javaagent:"${org.mockito:mockito-core:jar}" --enable-native-access=org.cryptomator.frontend.fskit</argLine>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>${mvn-jar.version}</version>
+            </plugin>
+            <plugin>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>${mvn-source.version}</version>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>${mvn-javadoc.version}</version>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                        <configuration>
+                            <release>${project.build.jdk}</release>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
@@ -233,6 +278,141 @@
             </build>
         </profile>
 
+        <!-- Builds the library that checks for the extension into the jar, and attaches the unsigned extension as a zip with the classifier appex. Off on other systems, which cannot build for FSKit. -P'!fskit-native' switches it off on a Mac. -->
+        <profile>
+            <id>fskit-native</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                </os>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <!-- its swift build builds the library as well, so both come from one build -->
+                            <execution>
+                                <id>build-appex</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${project.basedir}/fskit/scripts/build-appex.sh</executable>
+                                    <arguments>
+                                        <argument>${project.build.directory}/appex</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>zip-appex</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>ditto</executable>
+                                    <arguments>
+                                        <argument>-c</argument>
+                                        <argument>-k</argument>
+                                        <!-- leaves out extended attributes of the build host, which would land in the zip as ._ entries -->
+                                        <argument>--norsrc</argument>
+                                        <argument>--keepParent</argument>
+                                        <argument>${project.build.directory}/appex/FSKitNioExtension.appex</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}-appex.zip</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <!-- NativeExtensionCheckTest needs the library this profile builds -->
+                                <fskitNative>true</fskitNative>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <version>${mvn-resources.version}</version>
+                        <executions>
+                            <execution>
+                                <id>copy-native-library</id>
+                                <phase>process-classes</phase>
+                                <goals>
+                                    <goal>copy-resources</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- the package of NativeExtensionCheck, which loads it -->
+                                    <outputDirectory>${project.build.outputDirectory}/org/cryptomator/frontend/fskit/mount</outputDirectory>
+                                    <resources>
+                                        <resource>
+                                            <!-- where swift build puts its products for the flags of build-appex.sh -->
+                                            <directory>${project.basedir}/fskit/.build/out/Products/Release</directory>
+                                            <includes>
+                                                <include>libFSKitNioSupport.dylib</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>${build-helper.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-appex</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>attach-artifact</goal>
+                                </goals>
+                                <configuration>
+                                    <artifacts>
+                                        <artifact>
+                                            <file>${project.build.directory}/${project.build.finalName}-appex.zip</file>
+                                            <type>zip</type>
+                                            <classifier>appex</classifier>
+                                        </artifact>
+                                    </artifacts>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>sign</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>${mvn-gpg.version}</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <signer>bc</signer>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
         <!-- Mirrors one or more directories, see `mvn test -Pmirror` -->
         <profile>
             <id>mirror</id>
@@ -246,6 +426,25 @@
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>run-mirror</id>
+                                <phase>test</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${java.home}/bin/java</executable>
+                                    <classpathScope>test</classpathScope>
+                                    <arguments>
+                                        <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>${mirror.mainClass}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
                     </plugin>
                 </plugins>
             </build>
@@ -264,6 +463,70 @@
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>run-mirror</id>
+                                <phase>test</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${java.home}/bin/java</executable>
+                                    <classpathScope>test</classpathScope>
+                                    <arguments>
+                                        <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>${mirror.mainClass}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>deploy-central</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>${central-publishing.version}</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>deploy-github</id>
+            <distributionManagement>
+                <repository>
+                    <id>github</id>
+                    <name>GitHub Packages</name>
+                    <url>https://maven.pkg.github.com/cryptomator/fskit-nio-adapter</url>
+                </repository>
+            </distributionManagement>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-deploy-plugin</artifactId>
+                        <version>${mvn-deploy.version}</version>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
                     </plugin>
                 </plugins>
             </build>
