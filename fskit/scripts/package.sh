@@ -14,7 +14,8 @@
 # Environment:
 #   CODESIGN_IDENTITY     signing identity (default: "-" = ad-hoc)
 #   PROVISIONING_PROFILE  .provisionprofile authorizing com.apple.developer.fskit.fsmodule,
-#                         embedded into the appex. Required for mounting: the entitlement
+#                         embedded into the appex (default: Bundle/FSKitNioExtension.provisionprofile
+#                         if present). Required for mounting: the entitlement
 #                         is restricted, so ExtensionKit refuses to launch an unprovisioned
 #                         extension (extensionKit error 2). Ad-hoc builds compile and
 #                         register but cannot mount.
@@ -31,6 +32,10 @@ BUILD_DIR="$FSKIT_DIR/build"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 HOST_BUNDLE_ID="${HOST_BUNDLE_ID:-org.cryptomator.fskit.host}"
 FS_TYPE_NAME="${FS_TYPE_NAME:-cryptomatorfs}"
+DEFAULT_PROFILE="$FSKIT_DIR/Bundle/FSKitNioExtension.provisionprofile"
+if [[ -z "${PROVISIONING_PROFILE:-}" && -f "$DEFAULT_PROFILE" ]]; then
+	PROVISIONING_PROFILE="$DEFAULT_PROFILE"
+fi
 # the flags of build-appex.sh, so that the host and the extension come from one build
 BUILD_FLAGS=(-c release --arch arm64)
 
@@ -68,6 +73,11 @@ if [[ -n "${PROVISIONING_PROFILE:-}" ]]; then
 	cp "$PROVISIONING_PROFILE" "$APPEX/Contents/embedded.provisionprofile"
 	APP_IDENTIFIER="$(security cms -D -i "$PROVISIONING_PROFILE" | plutil -extract 'Entitlements.com\.apple\.application-identifier' raw -o - -)"
 	TEAM_IDENTIFIER="$(security cms -D -i "$PROVISIONING_PROFILE" | plutil -extract 'TeamIdentifier.0' raw -o - -)"
+	# a profile for another identifier still signs, but the extension then fails to launch with only "mount: Unable to invoke task"
+	if [[ "$APP_IDENTIFIER" != "$TEAM_IDENTIFIER.$HOST_BUNDLE_ID.extension" ]]; then
+		echo >&2 "Provisioning profile is for $APP_IDENTIFIER, not $TEAM_IDENTIFIER.$HOST_BUNDLE_ID.extension"
+		exit 1
+	fi
 	APPEX_ENTITLEMENTS="$BUILD_DIR/FSKitNioExtension.entitlements"
 	cp "$FSKIT_DIR/Bundle/FSKitNioExtension.entitlements" "$APPEX_ENTITLEMENTS"
 	/usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $APP_IDENTIFIER" "$APPEX_ENTITLEMENTS"

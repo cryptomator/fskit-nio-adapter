@@ -59,9 +59,8 @@ When the hook reformats a staged file, it stops the commit so that the result ca
 
 ```
 cd fskit
-CODESIGN_IDENTITY="Apple Development: …" \
-PROVISIONING_PROFILE=<profile for the extension's bundle identifier> \
-scripts/package.sh
+cp <profile for the extension's bundle identifier> Bundle/FSKitNioExtension.provisionprofile  # once, gitignored
+CODESIGN_IDENTITY="Apple Development: …" scripts/package.sh
 
 ditto build/FSKitNioHost.app /Applications/FSKitNioHost.app
 codesign --verify --deep --strict /Applications/FSKitNioHost.app  # must pass
@@ -77,7 +76,7 @@ For a file system type that no extension provides, `mount` exits with status 69 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CODESIGN_IDENTITY` | `-` (ad-hoc) | Signing identity |
-| `PROVISIONING_PROFILE` | none | Profile to embed into the extension |
+| `PROVISIONING_PROFILE` | `fskit/Bundle/FSKitNioExtension.provisionprofile` if present | Profile to embed into the extension |
 | `HOST_BUNDLE_ID` | `org.cryptomator.fskit.host` | Bundle identifier of the host app. The extension's is this plus `.extension`. |
 | `FS_TYPE_NAME` | `cryptomatorfs` | File system type name, as passed to `mount -t` |
 | `SKIP_SWIFT` | unset | Set to `1` to skip `swift build` |
