@@ -108,6 +108,7 @@ Notes:
 - `REMOVE` and `RENAME`: the `attributes` of an item that is removed or replaced are the ones read just before the change. `replaced` is set when the rename replaced an item the client was given a node id for.
 - `RENAME`: a rename that replaces nothing, or replaces a file with a file, is done in one step. Where the backing file system cannot do that, as across its file stores, the reply is `EXDEV` (18) and nothing has changed. A rename that replaces a directory or a symbolic link, or moves either onto an existing item, removes the target first. A directory cannot be renamed into itself or below itself (`EINVAL`, 22).
 - `OPEN` of a directory or a symbolic link succeeds without opening anything. A `READ` or `WRITE` of a symbolic link is answered with `ENOTSUP` (45).
+- `OPEN`, `READ` and `WRITE` of a file other than `no_log` need a successful `LOOKUP`, `CREATE` or `SYMLINK` response for it that the client has not forgotten yet. For a file known only from a listing they are answered with `ESTALE` (70), since the server keeps its node only while it holds a listing of its directory.
 - `CLOSE`: `keptModes` are the modes that stay open. With none kept, the server closes the item's channel.
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.

@@ -2216,6 +2216,18 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("an open, read or write of a file that was only listed is refused as stale and opens no channel")
+		public void testListedNodeGetsNoChannel() throws IOException {
+			backing("listed.txt", "content");
+			long listed = readdir(ROOT, 0, 0, false).entries().get(2).nodeId();
+
+			assertStatus(Errno.ESTALE, new OpenRequest(listed, Messages.MODE_READ));
+			assertStatus(Errno.ESTALE, new ReadRequest(listed, 0, 7));
+			assertStatus(Errno.ESTALE, new WriteRequest(listed, 0, StandardCharsets.UTF_8.encode("data")));
+			Assertions.assertEquals(List.of(), ops.openedChannels);
+		}
+
+		@Test
 		@DisplayName("an entry that vanished since the listing was taken is left out of a page with attributes")
 		public void testVanishedEntry() throws IOException {
 			backing("stays.txt", "");

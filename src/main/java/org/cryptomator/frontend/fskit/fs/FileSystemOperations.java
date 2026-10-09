@@ -961,6 +961,10 @@ public class FileSystemOperations implements Closeable {
 				// the path is gone, so a removed item is stuck with the channel it has
 				throw new StatusException(Errno.EIO);
 			}
+			if (!nodes.isHeld(node)) {
+				// a node that was only listed leaves the table with the last listing of its directory, which would drop its channel unclosed
+				throw new StatusException(Errno.ESTALE);
+			}
 			// a channel cannot be upgraded in place, so open one with the widened modes and swap it in
 			FileChannel opened = openChannel(node.path, openOptions(widened));
 			FileChannel previous = node.channel;

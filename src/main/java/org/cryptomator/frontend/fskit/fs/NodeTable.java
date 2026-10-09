@@ -61,6 +61,13 @@ final class NodeTable {
 		return List.copyOf(nodesWithChannel);
 	}
 
+	/**
+	 * @return Whether the kernel references the node. A referenced node stays in the table until the forget that drops its last reference, which closes its channel. Only a forget lowers the count, and it takes the node's data lock, so the answer holds while the caller has that lock.
+	 */
+	synchronized boolean isHeld(Node node) {
+		return node.lookups > 0;
+	}
+
 	synchronized void setChannel(Node node, FileChannel channel, int modes) {
 		node.channel = channel;
 		node.modes = modes;
