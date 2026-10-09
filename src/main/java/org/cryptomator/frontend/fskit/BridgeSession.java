@@ -99,6 +99,13 @@ public class BridgeSession implements Closeable {
 	}
 
 	/**
+	 * @return Whether this session has ended and closed all open channels
+	 */
+	public boolean hasEnded() {
+		return ended.isDone();
+	}
+
+	/**
 	 * Ends this session: closes the listener and the connection and waits for the requests in flight to return and the session thread to close all open channels.
 	 * <p>
 	 * No thread is interrupted: an interrupted thread cannot write, so it could not flush the channels it closes.

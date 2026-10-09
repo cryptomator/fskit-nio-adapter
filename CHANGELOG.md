@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 * A warning in the log when a volume goes away without an unmount through the provider, as when its extension or `fskitd` ends or someone else unmounts it, since whatever is written to the mount point then lands on the local disk
 
+### Fixed
+* A mount fails instead of returning a volume that serves nothing when the extension disconnects again right after connecting
+* A listing of mounts or a `umount` that does not finish within its timeout is ended, and a listing that never closes its output no longer blocks mounting or unmounting for good
+
 
 ## [0.1.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.1.0) - 2026-10-08
 ### Added

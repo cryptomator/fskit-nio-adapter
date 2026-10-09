@@ -73,7 +73,7 @@ final class FSKitMount implements Mount {
 			if (!success) {
 				sessionEndExpected = false;
 				// a session that ended during the attempt was taken for the end of this unmount
-				if (session.ended().toCompletableFuture().isDone()) {
+				if (session.hasEnded()) {
 					reportUnexpectedEnd();
 				}
 			}
@@ -136,14 +136,22 @@ final class FSKitMount implements Mount {
 		}
 		String target = realMountpoint.toString();
 		ProcessBuilder command = forced ? new ProcessBuilder("/sbin/umount", "-f", "--", target) : new ProcessBuilder("/sbin/umount", "--", target);
+		Process umount = processStarter.start(command);
+		boolean exited = false;
 		try {
-			ProcessHelper.waitForSuccess(processStarter.start(command), UMOUNT_TIMEOUT_SECONDS, forced ? "`umount -f`" : "`umount`");
+			ProcessHelper.waitForSuccess(umount, UMOUNT_TIMEOUT_SECONDS, forced ? "`umount -f`" : "`umount`");
+			exited = true;
 		} catch (ProcessHelper.CommandFailedException e) {
+			exited = true;
 			// unmounted by someone else since the mount table was read
 			if (!e.stderr.contains("not currently mounted")) {
 				throw e;
 			}
 			LOG.info("{} already unmounted. Nothing to do.", realMountpoint);
+		} finally {
+			if (!exited) {
+				umount.destroyForcibly();
+			}
 		}
 	}
 

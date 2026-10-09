@@ -204,6 +204,9 @@ public class FSKitMountProvider implements MountService {
 				if (!session.awaitHandshake(Duration.ZERO)) {
 					throw new MountFailedException("`mount` succeeded, but the extension did not connect");
 				}
+				if (session.hasEnded()) {
+					throw new MountFailedException("`mount` succeeded, but the extension disconnected again");
+				}
 				var mount = new FSKitMount(processStarter, session, rendezvousDir, mountPoint, realMountPoint);
 				success = true;
 				return mount;

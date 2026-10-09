@@ -1,9 +1,13 @@
 package org.cryptomator.frontend.fskit.mount;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
@@ -14,12 +18,29 @@ import java.util.concurrent.TimeoutException;
 record MountTable(List<String> lines) {
 
 	private static final int TIMEOUT_SECONDS = 10;
+	private static final String DESCRIPTION = "`mount` (listing mounts)";
 
 	static MountTable read(ProcessHelper.Starter processStarter) throws IOException, TimeoutException, InterruptedException, ProcessHelper.CommandFailedException {
 		Process process = processStarter.start(new ProcessBuilder("/sbin/mount"));
-		@SuppressWarnings("resource") List<String> lines = process.inputReader(StandardCharsets.UTF_8).lines().toList();
-		ProcessHelper.waitForSuccess(process, TIMEOUT_SECONDS, "`mount` (listing mounts)");
-		return new MountTable(lines);
+		// read on a thread of its own while waiting: waiting first would stall a listing that fills the pipe, and reading first would block without a timeout on one that never closes its output
+		@SuppressWarnings("resource") FutureTask<List<String>> output = new FutureTask<>(() -> process.inputReader(StandardCharsets.UTF_8).lines().toList());
+		Thread.ofVirtual().name("mount-table-reader").start(output);
+		boolean success = false;
+		try {
+			ProcessHelper.waitForSuccess(process, TIMEOUT_SECONDS, DESCRIPTION);
+			MountTable table = new MountTable(output.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+			success = true;
+			return table;
+		} catch (TimeoutException e) {
+			throw new TimeoutException(DESCRIPTION + " did not finish within " + TIMEOUT_SECONDS + "s");
+		} catch (ExecutionException e) {
+			throw e.getCause() instanceof UncheckedIOException unchecked ? unchecked.getCause() : new IOException("Failed to read the output of " + DESCRIPTION, e.getCause());
+		} finally {
+			if (!success) {
+				// ends the reader as well
+				process.destroyForcibly();
+			}
+		}
 	}
 
 	/**

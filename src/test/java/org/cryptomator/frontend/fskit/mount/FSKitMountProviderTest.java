@@ -37,6 +37,7 @@ import org.mockito.Mockito;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
 import java.io.StringReader;
@@ -53,6 +54,7 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Timeout(30)
 public class FSKitMountProviderTest {
@@ -178,17 +180,31 @@ public class FSKitMountProviderTest {
 	}
 
 	/**
-	 * A process that does not exit by itself. Like a real one, it can no longer be read once it has been destroyed.
+	 * A process that does not exit by itself. Its standard output ends only once it has been destroyed. Like a real one, its standard error can no longer be read then.
 	 */
 	private static Process hanging(String stderr) {
 		try {
 			Process process = Mockito.mock(Process.class);
+			CountDownLatch destroyed = new CountDownLatch(1);
+			InputStream outputStream = new InputStream() {
+				@Override
+				public int read() throws IOException {
+					try {
+						destroyed.await();
+						return -1;
+					} catch (InterruptedException e) {
+						throw new InterruptedIOException();
+					}
+				}
+			};
 			ClosableStream errorStream = new ClosableStream(stderr);
 			Mockito.when(process.waitFor(Mockito.any(Duration.class))).thenAnswer(_ -> interruptibly(false));
 			Mockito.when(process.waitFor()).thenAnswer(_ -> interruptibly(137));
+			Mockito.when(process.inputReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new InputStreamReader(outputStream, StandardCharsets.UTF_8)));
 			Mockito.when(process.getErrorStream()).thenReturn(errorStream);
 			Mockito.when(process.errorReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new InputStreamReader(errorStream, StandardCharsets.UTF_8)));
 			Mockito.when(process.destroyForcibly()).thenAnswer(_ -> {
+				destroyed.countDown();
 				errorStream.close();
 				return process;
 			});
@@ -269,9 +285,13 @@ public class FSKitMountProviderTest {
 	/**
 	 * Drops the connection of the last mount's extension and waits for its session thread to end. The mount reports the end of its session on that thread.
 	 */
-	private void disconnectExtension() throws IOException, InterruptedException {
+	private void disconnectExtension() throws IOException {
 		clients.getLast().close();
-		sessionThreads.getLast().join();
+		try {
+			sessionThreads.getLast().join();
+		} catch (InterruptedException e) {
+			throw new InterruptedIOException();
+		}
 	}
 
 	/**
@@ -523,6 +543,20 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
+		@DisplayName("a mount table listing that does not finish is ended and fails the mount")
+		public void testMountTableListingHangs() {
+			Process[] process = new Process[1];
+			mountTableHandler = _ -> process[0] = hanging("");
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertInstanceOf(TimeoutException.class, e.getCause());
+			Mockito.verify(process[0]).destroyForcibly();
+			Assertions.assertEquals(List.of(List.of("/sbin/mount")), commands.stream().map(ProcessBuilder::command).toList());
+			Assertions.assertEquals(List.of(), operations);
+		}
+
+		@Test
 		@DisplayName("rejects an occupied mount point given through a symbolic link")
 		public void testOccupiedMountPointThroughSymlink() throws IOException {
 			Path link = Files.createSymbolicLink(mountPoint.resolveSibling("link"), mountPoint);
@@ -609,6 +643,23 @@ public class FSKitMountProviderTest {
 			Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
 
 			Mockito.verify(process[0], Mockito.atLeastOnce()).destroyForcibly();
+			Assertions.assertEquals(List.of(List.of("/sbin/umount", "-f", "--", realMountPoint())), commandsStartingWith("/sbin/umount"));
+			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a mount whose extension disconnects before the mount returns fails, is removed and reports no lost volume")
+		public void testDisconnectedWhileMounting() throws Throwable {
+			mountCommandHandler = mount -> {
+				Process mounted = mountAndConnect(mount);
+				disconnectExtension();
+				return mounted;
+			};
+
+			String log = LogCapture.of(() -> Assertions.assertThrows(MountFailedException.class, () -> builder().mount()));
+
+			Assertions.assertTrue(log.lines().noneMatch(line -> line.contains(" WARN ") || line.contains(" ERROR ")), log);
 			Assertions.assertEquals(List.of(List.of("/sbin/umount", "-f", "--", realMountPoint())), commandsStartingWith("/sbin/umount"));
 			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
 			assertNothingLeftBehind();
@@ -837,6 +888,23 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
+		@DisplayName("a umount that times out is ended and keeps the session and the rendezvous directory")
+		public void testUmountTimesOut() throws MountFailedException, IOException, UnmountFailedException {
+			try (Mount mount = builder().mount()) {
+				Process[] process = new Process[1];
+				umountCommandHandler = _ -> process[0] = hanging("");
+
+				Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
+
+				Mockito.verify(process[0]).destroyForcibly();
+				Assertions.assertTrue(Files.isDirectory(lastMountCommand.rendezvousDir()));
+				Assertions.assertFalse(clients.getFirst().request(new GetattrRequest(Messages.ROOT_NODE_ID)) instanceof Failure);
+				umountCommandHandler = FSKitMountProviderTest.this::unmount;
+			}
+			assertNothingLeftBehind();
+		}
+
+		@Test
 		@DisplayName("a volume that goes away without an unmount, as when its extension ends, is reported, since its mount point is a plain directory again")
 		public void testGoneWithoutUnmount() throws Throwable {
 			Mount mount = builder().mount();
@@ -867,11 +935,7 @@ public class FSKitMountProviderTest {
 		public void testEndedDuringFailingUmount() throws Throwable {
 			Mount mount = builder().mount();
 			umountCommandHandler = _ -> {
-				try {
-					disconnectExtension();
-				} catch (InterruptedException e) {
-					throw new InterruptedIOException();
-				}
+				disconnectExtension();
 				return exited(1, "", UMOUNT_BUSY);
 			};
 
@@ -900,11 +964,7 @@ public class FSKitMountProviderTest {
 		public void testUnmountReportsNothing() throws Throwable {
 			Mount mount = builder().mount();
 			umountCommandHandler = command -> {
-				try {
-					disconnectExtension();
-				} catch (InterruptedException e) {
-					throw new InterruptedIOException();
-				}
+				disconnectExtension();
 				return unmount(command);
 			};
 
