@@ -8,10 +8,6 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
-import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
-
 public class NativeExtensionCheckTest {
 
 	@Test
@@ -34,20 +30,15 @@ public class NativeExtensionCheckTest {
 
 	@Test
 	@DisplayName("without its library, every check fails, and the failure to load it is logged once")
-	public void testMissingLibrary() {
+	public void testMissingLibrary() throws Throwable {
 		NativeExtensionCheck check = new NativeExtensionCheck("missing.dylib");
-		ByteArrayOutputStream log = new ByteArrayOutputStream();
-		PrintStream stderr = System.err;
-		// slf4j-simple looks up System.err for every message
-		System.setErr(new PrintStream(log, true, StandardCharsets.UTF_8));
-		try {
+
+		String log = LogCapture.of(() -> {
 			Assertions.assertEquals(Status.FAILED, check.embedded("cryptomatorfs"));
 			Assertions.assertEquals(Status.FAILED, check.status("cryptomatorfs"));
 			Assertions.assertFalse(check.openSettings());
-		} finally {
-			System.setErr(stderr);
-		}
+		});
 
-		Assertions.assertEquals(1, log.toString(StandardCharsets.UTF_8).split("Failed to load missing.dylib", -1).length - 1, log.toString(StandardCharsets.UTF_8));
+		Assertions.assertEquals(1, log.split("Failed to load missing.dylib", -1).length - 1, log);
 	}
 }

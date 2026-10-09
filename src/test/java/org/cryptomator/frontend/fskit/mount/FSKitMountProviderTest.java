@@ -38,6 +38,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.io.StringReader;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -57,6 +58,7 @@ import java.util.concurrent.TimeUnit;
 public class FSKitMountProviderTest {
 
 	private static final String OTHER_MOUNT = "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)";
+	private static final String UMOUNT_BUSY = "umount(/mnt): Resource busy -- try 'diskutil unmount'";
 
 	private Path fileSystemRoot;
 	private Path mountPoint;
@@ -67,6 +69,7 @@ public class FSKitMountProviderTest {
 	private final List<String> mountTable = new CopyOnWriteArrayList<>(List.of(OTHER_MOUNT));
 	private final List<ProcessBuilder> commands = new CopyOnWriteArrayList<>();
 	private final List<HookedOperations> operations = new CopyOnWriteArrayList<>();
+	private final List<Thread> sessionThreads = new CopyOnWriteArrayList<>();
 	private final List<TestBridgeClient> clients = new CopyOnWriteArrayList<>();
 	private volatile CommandHandler<MountCommand> mountCommandHandler = this::mountAndConnect;
 	private volatile CommandHandler<ProcessBuilder> umountCommandHandler = this::unmount;
@@ -102,7 +105,9 @@ public class FSKitMountProviderTest {
 		provider = new FSKitMountProvider(this::start, (root, readOnly) -> {
 			HookedOperations ops = new HookedOperations(root, readOnly);
 			operations.add(ops);
-			return new BridgeSession(ops, sessionCloseTimeout);
+			BridgeSession session = new BridgeSession(ops, sessionCloseTimeout);
+			sessionThreads.add(Thread.getAllStackTraces().keySet().stream().filter(thread -> thread.getName().equals("fskit-session-" + session.port())).findFirst().orElseThrow());
+			return session;
 		}, extensionCheck);
 	}
 
@@ -259,6 +264,26 @@ public class FSKitMountProviderTest {
 		for (HookedOperations ops : operations) {
 			Assertions.assertEquals(0, ops.closed.getCount(), "session still open");
 		}
+	}
+
+	/**
+	 * Drops the connection of the last mount's extension and waits for its session thread to end. The mount reports the end of its session on that thread.
+	 */
+	private void disconnectExtension() throws IOException, InterruptedException {
+		clients.getLast().close();
+		sessionThreads.getLast().join();
+	}
+
+	/**
+	 * Takes the last mount off the mount table and drops its extension's connection, as when the extension ends.
+	 */
+	private void loseMount() throws IOException, InterruptedException {
+		mountTable.removeLast();
+		disconnectExtension();
+	}
+
+	private static void assertLogged(String log, String level, String message) {
+		Assertions.assertTrue(log.lines().anyMatch(line -> line.contains(" " + level + " ") && line.contains(message)), log);
 	}
 
 	/* tests */
@@ -617,7 +642,7 @@ public class FSKitMountProviderTest {
 				addToMountTable(mount);
 				return exited(0, "", "");
 			};
-			umountCommandHandler = _ -> exited(1, "", "umount(/mnt): Resource busy -- try 'diskutil unmount'");
+			umountCommandHandler = _ -> exited(1, "", UMOUNT_BUSY);
 
 			Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
 
@@ -800,7 +825,7 @@ public class FSKitMountProviderTest {
 		@DisplayName("a failing umount keeps the session and the rendezvous directory")
 		public void testUmountFails() throws MountFailedException, IOException, UnmountFailedException {
 			try (Mount mount = builder().mount()) {
-				umountCommandHandler = _ -> exited(1, "", "umount(/mnt): Resource busy -- try 'diskutil unmount'");
+				umountCommandHandler = _ -> exited(1, "", UMOUNT_BUSY);
 
 				Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
 
@@ -808,6 +833,84 @@ public class FSKitMountProviderTest {
 				Assertions.assertFalse(clients.getFirst().request(new GetattrRequest(Messages.ROOT_NODE_ID)) instanceof Failure);
 				umountCommandHandler = FSKitMountProviderTest.this::unmount;
 			}
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a volume that goes away without an unmount, as when its extension ends, is reported, since its mount point is a plain directory again")
+		public void testGoneWithoutUnmount() throws Throwable {
+			Mount mount = builder().mount();
+
+			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+
+			assertLogged(log, "WARN", "The volume at " + mountPoint + " was unmounted by someone else");
+			mount.unmount();
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a volume that goes away after a failing umount is reported all the same")
+		public void testGoneAfterUmountFails() throws Throwable {
+			Mount mount = builder().mount();
+			umountCommandHandler = _ -> exited(1, "", UMOUNT_BUSY);
+			Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
+
+			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+
+			assertLogged(log, "WARN", "The volume at " + mountPoint + " was unmounted by someone else");
+			mount.unmount();
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a session that ends during a failing umount is reported once the umount has failed")
+		public void testEndedDuringFailingUmount() throws Throwable {
+			Mount mount = builder().mount();
+			umountCommandHandler = _ -> {
+				try {
+					disconnectExtension();
+				} catch (InterruptedException e) {
+					throw new InterruptedIOException();
+				}
+				return exited(1, "", UMOUNT_BUSY);
+			};
+
+			String log = LogCapture.of(() -> Assertions.assertThrows(UnmountFailedException.class, mount::unmount));
+
+			assertLogged(log, "ERROR", "The volume at " + mountPoint + " lost its connection");
+			umountCommandHandler = FSKitMountProviderTest.this::unmount;
+			mount.unmount();
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a volume whose session ends while it stays mounted is reported as failing every operation")
+		public void testDisconnectedWhileMounted() throws Throwable {
+			Mount mount = builder().mount();
+
+			String log = LogCapture.of(FSKitMountProviderTest.this::disconnectExtension);
+
+			assertLogged(log, "ERROR", "The volume at " + mountPoint + " lost its connection");
+			mount.unmount();
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("an unmount, during which the extension disconnects before the session is closed, reports nothing")
+		public void testUnmountReportsNothing() throws Throwable {
+			Mount mount = builder().mount();
+			umountCommandHandler = command -> {
+				try {
+					disconnectExtension();
+				} catch (InterruptedException e) {
+					throw new InterruptedIOException();
+				}
+				return unmount(command);
+			};
+
+			String log = LogCapture.of(mount::unmount);
+
+			Assertions.assertTrue(log.lines().noneMatch(line -> line.contains(" WARN ") || line.contains(" ERROR ")), log);
 			assertNothingLeftBehind();
 		}
 

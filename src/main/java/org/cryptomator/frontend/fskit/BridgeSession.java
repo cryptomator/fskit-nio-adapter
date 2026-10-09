@@ -30,10 +30,14 @@ import java.nio.channels.SocketChannel;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -53,7 +57,7 @@ public class BridgeSession implements Closeable {
 	private final byte[] token = new byte[Messages.TOKEN_LENGTH];
 	private final ServerSocketChannel listener;
 	private final CountDownLatch handshake = new CountDownLatch(1);
-	private final CountDownLatch finished = new CountDownLatch(1);
+	private final CompletableFuture<Void> ended = new CompletableFuture<>();
 	// held while a response is written, so that frames never interleave
 	private final Lock writing = new ReentrantLock();
 	private volatile @Nullable SocketChannel connection;
@@ -88,6 +92,13 @@ public class BridgeSession implements Closeable {
 	}
 
 	/**
+	 * @return A stage that completes once this session has ended for any reason and has closed all open channels
+	 */
+	public CompletionStage<Void> ended() {
+		return ended.minimalCompletionStage();
+	}
+
+	/**
 	 * Ends this session: closes the listener and the connection and waits for the requests in flight to return and the session thread to close all open channels.
 	 * <p>
 	 * No thread is interrupted: an interrupted thread cannot write, so it could not flush the channels it closes.
@@ -102,9 +113,11 @@ public class BridgeSession implements Closeable {
 			connected.close();
 		}
 		try {
-			if (!finished.await(closeTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-				throw new IOException("An operation is still running in the backend. Cleanup is outstanding.");
-			}
+			ended.get(closeTimeout.toMillis(), TimeUnit.MILLISECONDS);
+		} catch (TimeoutException e) {
+			throw new IOException("An operation is still running in the backend. Cleanup is outstanding.");
+		} catch (ExecutionException e) {
+			throw new IllegalStateException("The end of a session is never exceptional.", e);
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 			throw new InterruptedIOException("Interrupted while waiting for the session to end.");
@@ -120,7 +133,7 @@ public class BridgeSession implements Closeable {
 		} catch (IOException | RuntimeException e) {
 			LOG.warn("Session ended unexpectedly.", e);
 		} finally {
-			finished.countDown();
+			ended.complete(null);
 		}
 	}
 

@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.1.0...HEAD)
-
-No changes yet.
+### Added
+* A warning in the log when a volume goes away without an unmount through the provider, as when its extension or `fskitd` ends or someone else unmounts it, since whatever is written to the mount point then lands on the local disk
 
 
 ## [0.1.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.1.0) - 2026-10-08

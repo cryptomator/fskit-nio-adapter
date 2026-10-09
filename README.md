@@ -182,7 +182,7 @@ Observed on macOS 27.0.1 with JDK 26.
 - A rename that replaces an existing entry is atomic only when a file replaces a file. With a directory or a symbolic link on either side, the target is removed first and is gone if the move then fails.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.
 - A mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
-- A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". The mount point is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`.
+- A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". The mount point is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`. The provider logs a warning, as it does when someone else unmounts the volume. `integrations-api` has no way to tell the application.
 - On macOS 27 or later with an `aarch64` JVM, the provider is offered whether or not macOS has registered an extension for its file system type. Inside an app, it is offered only if the app embeds such an extension. Where no extension serves the type, `mount()` fails with `MountFailedException`.
 
 ## License

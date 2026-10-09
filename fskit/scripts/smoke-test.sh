@@ -992,6 +992,8 @@ occupied() {
 
 external-unmount() {
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
+	# the provider warns that the mount point is a plain directory again
+	EXPECTED_WARNING="was unmounted by someone else"
 	# the session ends with the umount from the shell, not with the program's unmount
 	open_window
 	check "umount from the shell succeeds" /sbin/umount "$MNT"

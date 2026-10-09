@@ -61,6 +61,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -488,15 +489,15 @@ public class BridgeSessionTest {
 	}
 
 	@Test
-	@DisplayName("a dropped connection ends the session, which closes all channels and stops listening")
-	public void testDroppedConnection() throws IOException, InterruptedException {
+	@DisplayName("a dropped connection ends the session, which closes all channels, stops listening and reports its end")
+	public void testDroppedConnection() throws IOException, InterruptedException, ExecutionException, TimeoutException {
 		try (TestBridgeClient client = connect()) {
 			long file = ok(client.request(new CreateRequest(ROOT, "file.txt", NodeType.FILE, 0644)), CreateResponse.class).attributes().nodeId();
 			ok(client.request(new OpenRequest(file, Messages.MODE_WRITE)), OpenResponse.class);
 			Assertions.assertTrue(operations.openedChannels.getFirst().isOpen());
 		}
 
-		Assertions.assertTrue(operations.closed.await(10, TimeUnit.SECONDS));
+		session.ended().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
 		Assertions.assertFalse(operations.openedChannels.getFirst().isOpen());
 		Assertions.assertThrows(IOException.class, () -> new TestBridgeClient(session.port()));

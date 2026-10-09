@@ -142,7 +142,7 @@ public class HookedOperations extends FileSystemOperations {
 	 */
 	public final List<Exception> unexpectedFailures = new CopyOnWriteArrayList<>();
 	/**
-	 * Counted down once the session thread has closed these operations, which is its last act.
+	 * Counted down once the session thread has closed these operations, before {@code BridgeSession.ended()} completes.
 	 */
 	public final CountDownLatch closed = new CountDownLatch(1);
 
