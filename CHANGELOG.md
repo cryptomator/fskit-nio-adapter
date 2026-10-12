@@ -5,10 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.1.0...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.2.0...HEAD)
+
+No changes yet.
+
+
+## [0.2.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.2.0) - 2026-10-12
 ### Added
-* Mounting without a mount point (`MOUNT_TO_SYSTEM_CHOSEN_PATH`), into a directory the system creates in `/Volumes`, for an app with the entitlement `com.apple.developer.fskit.mount`
+* Mounting without a mount point (`MOUNT_TO_SYSTEM_CHOSEN_PATH`), into a directory the system creates in `/Volumes` and names after the volume in ASCII, for an app with the entitlement `com.apple.developer.fskit.mount`
 * A warning in the log when a volume goes away without an unmount through the provider, as when its extension or `fskitd` ends or someone else unmounts it. A mount point the application chose is then a plain directory again, and whatever is written to it lands on the local disk
+
+### Changed
+* The extension in the `appex` zip carries the release version as its `CFBundleVersion` as well, where it had `1`
 
 ### Fixed
 * A mount fails instead of returning a volume that serves nothing when the extension disconnects again right after connecting
