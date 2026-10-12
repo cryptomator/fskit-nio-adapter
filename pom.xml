@@ -278,7 +278,7 @@
             </build>
         </profile>
 
-        <!-- Builds the library that checks for the extension into the jar, and attaches the unsigned extension as a zip with the classifier appex. Off on other systems, which cannot build for FSKit. -P'!fskit-native' switches it off on a Mac. -->
+        <!-- Builds the library FSKitNioSupport into the jar, and attaches the unsigned extension as a zip with the classifier appex. Off on other systems, which cannot build for FSKit. -P'!fskit-native' switches it off on a Mac. -->
         <profile>
             <id>fskit-native</id>
             <activation>
@@ -331,7 +331,7 @@
                         <artifactId>maven-surefire-plugin</artifactId>
                         <configuration>
                             <systemPropertyVariables>
-                                <!-- NativeExtensionCheckTest needs the library this profile builds -->
+                                <!-- the tests that load the library this profile builds run only with this property -->
                                 <fskitNative>true</fskitNative>
                             </systemPropertyVariables>
                         </configuration>
@@ -347,7 +347,7 @@
                                     <goal>copy-resources</goal>
                                 </goals>
                                 <configuration>
-                                    <!-- the package of NativeExtensionCheck, which loads it -->
+                                    <!-- the package of NativeLibrary, which loads it -->
                                     <outputDirectory>${project.build.outputDirectory}/org/cryptomator/frontend/fskit/mount</outputDirectory>
                                     <resources>
                                         <resource>

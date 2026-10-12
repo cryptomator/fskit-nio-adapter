@@ -7,7 +7,7 @@ let package = Package(
 		.macOS("27.0")
 	],
 	products: [
-		// loaded by the Java provider through FFM, to check the app it runs in for the extension
+		// loaded by the Java provider through FFM, to check the app it runs in for the extension and to mount without a mount point
 		.library(name: "FSKitNioSupport", type: .dynamic, targets: ["FSKitNioSupport"])
 	],
 	targets: [

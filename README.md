@@ -16,7 +16,8 @@ flowchart LR
     Ops -->|java.nio.file| Path["Path to mount"]
 ```
 
-- `mount()` starts a session on an ephemeral loopback port, writes the port and a random token into a manifest in an owner-only directory under the temp directory, and runs `/sbin/mount -F -t cryptomatorfs <that directory> <mountpoint>`.
+- `mount()` starts a session on an ephemeral loopback port, and writes the port and a random token into a manifest in an owner-only directory under the temp directory. With a mount point set, it runs `/sbin/mount -F -t cryptomatorfs <that directory> <mountpoint>`. Without one, it asks FSKit through `libFSKitNioSupport.dylib` to mount that directory (`FSClient.mountSingleVolume`), and the system creates the mount point in `/Volumes`.
+- `fskitd` names a mount point in `/Volumes` after the volume, appends ` 1` to a name that is taken, and refuses a name that is not ASCII. So the extension starts the volume under its name transliterated to ASCII, and gives it its real name once it is mounted.
 - The extension reads the manifest, connects and presents the token. From then on it forwards the operations it supports and refuses every caller but root and the user who mounted.
 - The extension answers what needs no round trip itself: extended attributes, lookups of hidden names, a sync with nothing written since the last one, the open of a file it created, and the continuation of a listing page. Apart from what these answers need, it holds only a map from node ids to FSKit items with the number of lookups of each, the volume's size, and the newest free space it has seen. While requests overlap, it also keeps the newest attributes of their items.
 - The table of nodes and their paths, name handling, directory listings and open channels live in Java (`org.cryptomator.frontend.fskit.fs`).
@@ -33,7 +34,7 @@ Java (JDK 25, on macOS or Linux):
 ./mvnw verify
 ```
 
-The build fails on a compiler warning. On macOS it also runs `swift build` (macOS 27 SDK). It puts `libFSKitNioSupport.dylib`, through which the provider checks the app, into the jar and zips the extension into `target/fskit-nio-adapter-<version>-appex.zip`. `-P'!fskit-native'` leaves both out and needs no Swift tooling, as on Linux.
+The build fails on a compiler warning. On macOS it also runs `swift build` (macOS 27 SDK). It puts `libFSKitNioSupport.dylib`, through which the provider checks the app and mounts without a mount point, into the jar and zips the extension into `target/fskit-nio-adapter-<version>-appex.zip`. `-P'!fskit-native'` leaves both out and needs no Swift tooling, as on Linux.
 
 Swift (macOS 27 SDK, Swift 6.2 or later):
 
@@ -100,7 +101,8 @@ The app:
 3. Embeds a provisioning profile for the extension's identifier that authorizes `com.apple.developer.fskit.fsmodule`, as `Contents/embedded.provisionprofile` of the extension.
 4. Signs the dylib in the jar, as notarization requires.
 5. Signs the extension with `fskit/Bundle/FSKitNioExtension.entitlements` plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` from the profile, then signs the app. `codesign --deep` on the app re-signs the extension without its own entitlements. So any `--deep` pass comes before the extension is signed, and the app's last signing is without `--deep`.
-6. Starts the JVM with the provider's module in `--enable-native-access`: `org.cryptomator.frontend.fskit` on the module path, `ALL-UNNAMED` on the class path.
+6. To mount without a mount point, embeds a profile for the app's identifier with the "FSKit Mounter" capability as `Contents/embedded.provisionprofile`, and signs its main executable with the entitlement `com.apple.developer.fskit.mount` plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` from that profile. Without it, a mount without a mount point fails, while a mount at a chosen directory works. A JVM outside an app, as in tests or an IDE, needs a mount point.
+7. Starts the JVM with the provider's module in `--enable-native-access`: `org.cryptomator.frontend.fskit` on the module path, `ALL-UNNAMED` on the class path.
 
 `fskit/scripts/package.sh` does steps 2, 3 and 5 for the test host app.
 
@@ -134,7 +136,7 @@ With the extension installed and enabled, and built with the default `FS_TYPE_NA
 fskit/scripts/smoke-test.sh
 ```
 
-It does not cover Finder, a disabled extension, a killed extension process or a killed JVM. The scenario `access` checks that another account is refused. It joins the run only when `SMOKE_OTHER_ACCOUNT` names a second account, which `sudo -n -u` has to reach without a password:
+It does not cover Finder, mounting without a mount point, a disabled extension, a killed extension process or a killed JVM. The scenario `access` checks that another account is refused. It joins the run only when `SMOKE_OTHER_ACCOUNT` names a second account, which `sudo -n -u` has to reach without a password:
 
 ```
 SMOKE_OTHER_ACCOUNT=<account> fskit/scripts/smoke-test.sh
@@ -154,7 +156,7 @@ Observed on macOS 27.0.1 with JDK 26.
   - An FSEvents stream on the mount point reports the paths of entries as they change.
   - For a symbolic link the mounting user has read, `readlink` answers with the target. Reading a file of the volume through the link is still refused.
 
-  A mount point below a directory the other account cannot enter keeps all of this from it.
+  A mount point below a directory the other account cannot enter keeps all of this from it. A volume mounted without a mount point is in `/Volumes`, which every account can enter.
 - Finder's Trash creates `.Trashes` in the volume root, which appears in the mounted `Path`.
 - The name `.fseventsd` in the volume root is taken. The volume shows a directory of that name with an empty file `no_log` in it, which keeps macOS from creating the directory in the mounted `Path` and storing its log of file system events there. Neither is stored or can be changed, and the root's listing leaves the directory out. An entry named `.fseventsd` that the mounted `Path` already holds cannot be reached through the volume and stays as it is. Without that log, macOS has no event history for the volume, and an FSEvents stream created relative to the device reports absolute paths. Events are still delivered as they happen.
 - AppleDouble files (`._<name>`) and `.DS_Store` are hidden, as the macFUSE provider hides them with its `noappledouble` option. Such entries in the mounted `Path` cannot be reached through the volume, and listings leave them out. Creating one, or renaming an entry to such a name, fails with "Operation not permitted". Removing a directory, or replacing one by a rename, deletes the hidden files in it when it holds nothing else. A directory that holds a hidden directory cannot be removed through the volume ("Directory not empty"). If every entry of such a plain directory starts with `._`, macOS deletes the `._` files before it refuses, as it does without the volume.
@@ -181,8 +183,10 @@ Observed on macOS 27.0.1 with JDK 26.
 - A modification or access time later than 11 April 2262, 23:47:16 UTC, is set to that time, the latest the JDK sets.
 - A rename that replaces an existing entry is atomic only when a file replaces a file. With a directory or a symbolic link on either side, the target is removed first and is gone if the move then fails.
 - A file that was opened for writing only and then loses its owner-write permission cannot be opened for reading until it is closed.
-- A mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once, and `umount -f` removes the mount. The directory holding the manifest stays in the temp directory.
-- A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". The mount point is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`. The provider logs a warning, as it does when someone else unmounts the volume. `integrations-api` has no way to tell the application.
+- A volume mounted without a mount point, in `/Volumes`, is unmounted through the provider or with `diskutil unmount`. `umount` answers "Operation not permitted" to the user who mounted it.
+- A volume mounted without a mount point gets a mount point named after it in ASCII: `Tresor Müller` is mounted at `/Volumes/Tresor Muller`. A character without an ASCII form, and `/`, becomes `_`. Finder shows the name unchanged.
+- A mount does not survive its JVM. When the JVM dies, operations on the volume fail with an I/O error at once. `umount -f` removes the mount, and `diskutil unmount force` removes one in `/Volumes`. The directory holding the manifest stays in the temp directory.
+- A mount does not survive its extension process either. When the process dies, macOS removes the mount at once, and an operation in flight fails with "Device not configured". A mount point the application chose is a plain directory again, so whatever is written to it afterwards lands in that directory, not in the mounted `Path`. A mount point in `/Volumes` is removed together with the mount. The provider logs a warning, as it does when someone else unmounts the volume. `integrations-api` has no way to tell the application.
 - On macOS 27 or later with an `aarch64` JVM, the provider is offered whether or not macOS has registered an extension for its file system type. Inside an app, it is offered only if the app embeds such an extension. Where no extension serves the type, `mount()` fails with `MountFailedException`.
 
 ## License

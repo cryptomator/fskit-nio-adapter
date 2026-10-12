@@ -30,13 +30,15 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 	private let lister: DirectoryLister
 	private let state = OSAllocatedUnfairLock(uncheckedState: State())
 	private let fileSystemTypeName: String
+	private let displayName: String
 
 	init(uuid: UUID, name: String, client: BridgeClient) {
 		self.client = client
 		self.lister = DirectoryLister(client: client)
 		let extensionAttributes = Bundle.main.object(forInfoDictionaryKey: "EXAppExtensionAttributes") as? [String: Any]
 		self.fileSystemTypeName = extensionAttributes?["FSShortName"] as? String ?? ""
-		super.init(volumeID: FSVolume.Identifier(uuid: uuid), volumeName: FSFileName(string: name))
+		self.displayName = name
+		super.init(volumeID: FSVolume.Identifier(uuid: uuid), volumeName: FSFileName(string: MountPointName.of(name)))
 	}
 
 	/// Ends the connection. Requests in flight fail.
@@ -282,7 +284,10 @@ extension BridgeVolume: FSVolume.Handler {
 
 	func deactivateVolume(options: FSDeactivateOptions = []) async throws {}
 
-	func mount(options: FSTaskOptions) async throws {}
+	func mount(options: FSTaskOptions) async throws {
+		// the mount point exists by now and keeps its name
+		name = FSFileName(string: displayName)
+	}
 
 	func unmount(replyHandler reply: @escaping @Sendable () -> Void) {
 		// once the handlers in flight are done

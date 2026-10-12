@@ -14,7 +14,7 @@ public class NativeExtensionCheckTest {
 	@EnabledIfSystemProperty(named = "fskitNative", matches = "true", disabledReason = "built without the profile fskit-native, which builds the library")
 	@DisplayName("the library built for the jar answers that the JVM runs from no app")
 	public void testOutsideApp() {
-		NativeExtensionCheck check = new NativeExtensionCheck(NativeExtensionCheck.LIBRARY);
+		NativeExtensionCheck check = new NativeExtensionCheck(new NativeLibrary(NativeLibrary.LIBRARY));
 
 		Assertions.assertEquals(Status.NOT_IN_APP, check.embedded("cryptomatorfs"));
 		Assertions.assertEquals(Status.NOT_IN_APP, check.status("cryptomatorfs"));
@@ -25,13 +25,13 @@ public class NativeExtensionCheckTest {
 	@DisplayName("decodes the codes of ExtensionStatus, and every other code as FAILED")
 	@CsvSource(value = {"0, NOT_IN_APP", "1, NOT_EMBEDDED", "2, EMBEDDED", "3, NOT_REGISTERED", "4, DISABLED", "5, ENABLED", "-1, FAILED", "-2, FAILED", "6, FAILED"})
 	public void testCodes(int code, Status expected) {
-		Assertions.assertEquals(expected, new NativeExtensionCheck(NativeExtensionCheck.LIBRARY).decode(code));
+		Assertions.assertEquals(expected, new NativeExtensionCheck(new NativeLibrary(NativeLibrary.LIBRARY)).decode(code));
 	}
 
 	@Test
 	@DisplayName("without its library, every check fails, and the failure to load it is logged once")
 	public void testMissingLibrary() throws Throwable {
-		NativeExtensionCheck check = new NativeExtensionCheck("missing.dylib");
+		NativeExtensionCheck check = new NativeExtensionCheck(new NativeLibrary("missing.dylib"));
 
 		String log = LogCapture.of(() -> {
 			Assertions.assertEquals(Status.FAILED, check.embedded("cryptomatorfs"));

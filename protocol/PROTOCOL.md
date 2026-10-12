@@ -141,7 +141,7 @@ bool   hasAttributes
 
 ## Manifest
 
-The server writes a manifest file named `manifest` into the directory that is passed to `mount`. The client reads it to find the server.
+The server writes a manifest file named `manifest` into the directory the volume is mounted from, which the client receives as its resource. The client reads it to find the server.
 
 ```
 u16    protocolVersion

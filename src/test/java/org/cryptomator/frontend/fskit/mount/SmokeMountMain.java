@@ -42,7 +42,9 @@ public class SmokeMountMain {
 	}
 
 	// smoke-test.sh builds without the native library. The provider would then warn on every mount, which the script's log scan reports. Outside an app, the library would answer NOT_IN_APP anyway.
-	private final FSKitMountProvider provider = new FSKitMountProvider(ProcessBuilder::start, FSKitMountProvider::createSession, new OutsideApp());
+	private final FSKitMountProvider provider = new FSKitMountProvider(ProcessBuilder::start, FSKitMountProvider::createSession, new OutsideApp(), (_, _, _) -> {
+		throw new MountFailedException("every smoke mount sets a mount point");
+	});
 	private final Map<String, Mounted> mounted = new LinkedHashMap<>();
 
 	/**

@@ -9,21 +9,41 @@ public enum FetchOutcome<Value: Sendable>: Sendable {
 
 	private struct NoResult: Error {}
 
-	/// Starts a fetch and blocks the calling thread until its completion handler runs or the timeout passes. A completion after the timeout is dropped.
+	private enum State: Sendable {
+		case waiting
+		case completed(FetchOutcome)
+		/// The wait timed out before the fetch completed.
+		case abandoned
+	}
+
+	/// Starts a fetch and blocks the calling thread until its completion handler runs or the timeout passes. A late error is dropped.
 	///
-	/// - Parameter fetch: Starts the fetch and calls the handler it is given once, with a value or an error.
-	public init(waitingAtMost timeout: DispatchTimeInterval, for fetch: (@escaping @Sendable (Value?, (any Error)?) -> Void) -> Void) {
-		// the handler holds on to these, so that a completion after the timeout writes into them harmlessly
-		let outcome = OSAllocatedUnfairLock<Self?>(initialState: nil)
+	/// - Parameters:
+	///   - lateValue: Receives the value of a fetch that completes after the timeout, which no caller received.
+	///   - fetch: Starts the fetch and calls the handler it is given once, with a value or an error.
+	public init(waitingAtMost timeout: DispatchTimeInterval, lateValue: (@Sendable (Value) -> Void)? = nil, for fetch: (@escaping @Sendable (Value?, (any Error)?) -> Void) -> Void) {
+		let state = OSAllocatedUnfairLock(initialState: State.waiting)
 		let completed = DispatchSemaphore(value: 0)
 		fetch { value, error in
-			outcome.withLock { $0 = value.map(Self.fetched) ?? .failed(error ?? NoResult()) }
+			let late = state.withLock { state -> Value? in
+				guard case .abandoned = state else {
+					state = .completed(value.map(Self.fetched) ?? .failed(error ?? NoResult()))
+					return nil
+				}
+				return value
+			}
+			if let late {
+				lateValue?(late)
+			}
 			completed.signal()
 		}
-		guard completed.wait(timeout: .now() + timeout) == .success, let fetched = outcome.withLock({ $0 }) else {
-			self = .timedOut
-			return
+		_ = completed.wait(timeout: .now() + timeout)
+		self = state.withLock { state in
+			guard case let .completed(outcome) = state else {
+				state = .abandoned
+				return .timedOut
+			}
+			return outcome
 		}
-		self = fetched
 	}
 }

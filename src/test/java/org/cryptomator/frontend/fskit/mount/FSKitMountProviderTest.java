@@ -75,6 +75,14 @@ public class FSKitMountProviderTest {
 	private final List<TestBridgeClient> clients = new CopyOnWriteArrayList<>();
 	private volatile CommandHandler<MountCommand> mountCommandHandler = this::mountAndConnect;
 	private volatile CommandHandler<ProcessBuilder> umountCommandHandler = this::unmount;
+	private volatile CommandHandler<ProcessBuilder> diskutilCommandHandler = this::diskutilUnmount;
+	private volatile VolumeMountHandler volumeMountHandler = this::mountInVolumesAndConnect;
+	private final List<VolumeMount> volumeMounts = new CopyOnWriteArrayList<>();
+	/**
+	 * Where the substituted mounter reports a volume mounted.
+	 */
+	private volatile Path volumePath = Path.of("/Volumes/Tresor");
+	private volatile Rendezvous lastRendezvous;
 	private volatile CommandHandler<ProcessBuilder> mountTableHandler = _ -> exited(0, String.join("\n", mountTable), "");
 	private volatile MountCommand lastMountCommand;
 	private volatile Duration sessionCloseTimeout = Duration.ofSeconds(10);
@@ -92,10 +100,29 @@ public class FSKitMountProviderTest {
 	private record MountCommand(ProcessBuilder command, Path rendezvousDir, int port) {
 	}
 
+	/**
+	 * @param rendezvousDir The directory passed to the mounter
+	 * @param port          The port in the manifest, read while the manifest still exists
+	 */
+	private record VolumeMount(Path rendezvousDir, int port, boolean readOnly) {
+	}
+
+	/**
+	 * The directory that either way of mounting was given last, and the port in its manifest.
+	 */
+	private record Rendezvous(Path dir, int port) {
+	}
+
 	@FunctionalInterface
 	private interface CommandHandler<T> {
 
 		Process start(T command) throws IOException;
+	}
+
+	@FunctionalInterface
+	private interface VolumeMountHandler {
+
+		Path mount(VolumeMount mount) throws IOException, MountFailedException;
 	}
 
 	@BeforeEach
@@ -110,7 +137,7 @@ public class FSKitMountProviderTest {
 			BridgeSession session = new BridgeSession(ops, sessionCloseTimeout);
 			sessionThreads.add(Thread.getAllStackTraces().keySet().stream().filter(thread -> thread.getName().equals("fskit-session-" + session.port())).findFirst().orElseThrow());
 			return session;
-		}, extensionCheck);
+		}, extensionCheck, (_, rendezvousDir, readOnly) -> mountInVolumes(rendezvousDir, readOnly));
 	}
 
 	@AfterEach
@@ -130,9 +157,12 @@ public class FSKitMountProviderTest {
 		} else if (args.getFirst().equals("/sbin/mount")) {
 			Path rendezvousDir = Path.of(args.get(args.size() - 2));
 			lastMountCommand = new MountCommand(command, rendezvousDir, Manifest.read(rendezvousDir).port());
+			lastRendezvous = new Rendezvous(rendezvousDir, lastMountCommand.port());
 			return mountCommandHandler.start(lastMountCommand);
 		} else if (args.getFirst().equals("/sbin/umount")) {
 			return umountCommandHandler.start(command);
+		} else if (args.getFirst().equals("/usr/sbin/diskutil")) {
+			return diskutilCommandHandler.start(command);
 		} else {
 			throw new IllegalArgumentException("Unexpected command " + args);
 		}
@@ -162,6 +192,43 @@ public class FSKitMountProviderTest {
 		} else {
 			return exited(1, "", "umount: " + target + ": not currently mounted");
 		}
+	}
+
+	/**
+	 * Unmounts the last mount at the argument. Where nothing is mounted, it fails as {@code diskutil} does there, with output that does not tell that nothing was mounted.
+	 */
+	private Process diskutilUnmount(ProcessBuilder command) {
+		String target = command.command().getLast();
+		var match = new ArrayList<>(mountTable).reversed().stream().filter(line -> line.contains(" on " + target + " (")).findFirst();
+		if (match.isPresent()) {
+			mountTable.remove(match.get());
+			return exited(0, "Volume Tresor on disk5 unmounted", "");
+		} else {
+			return exited(1, "", "Unmount failed for " + target);
+		}
+	}
+
+	/* substituted mounter */
+
+	private Path mountInVolumes(Path rendezvousDir, boolean readOnly) throws MountFailedException {
+		try {
+			VolumeMount mount = new VolumeMount(rendezvousDir, Manifest.read(rendezvousDir).port(), readOnly);
+			volumeMounts.add(mount);
+			lastRendezvous = new Rendezvous(rendezvousDir, mount.port());
+			return volumeMountHandler.mount(mount);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	private Path mountInVolumesAndConnect(VolumeMount mount) throws IOException {
+		clients.add(TestBridgeClient.connect(mount.rendezvousDir()));
+		return addToVolumes(mount);
+	}
+
+	private Path addToVolumes(VolumeMount mount) {
+		mountTable.add("file://" + mount.rendezvousDir() + "/ on " + volumePath + " (cryptomatorfs, local, nodev, nosuid, noowners, noatime, fskit, mounted by me)");
+		return volumePath;
 	}
 
 	private static Process exited(int exitCode, String stdout, String stderr) {
@@ -275,8 +342,8 @@ public class FSKitMountProviderTest {
 	}
 
 	private void assertNothingLeftBehind() {
-		Assertions.assertFalse(Files.exists(lastMountCommand.rendezvousDir()), "rendezvous directory exists");
-		Assertions.assertThrows(IOException.class, () -> new TestBridgeClient(lastMountCommand.port()).close(), "session still listens");
+		Assertions.assertFalse(Files.exists(lastRendezvous.dir()), "rendezvous directory exists");
+		Assertions.assertThrows(IOException.class, () -> new TestBridgeClient(lastRendezvous.port()).close(), "session still listens");
 		for (HookedOperations ops : operations) {
 			Assertions.assertEquals(0, ops.closed.getCount(), "session still open");
 		}
@@ -309,9 +376,9 @@ public class FSKitMountProviderTest {
 	/* tests */
 
 	@Test
-	@DisplayName("has exactly four capabilities")
+	@DisplayName("has exactly five capabilities")
 	public void testCapabilities() {
-		Assertions.assertEquals(Set.of(MountCapability.MOUNT_TO_EXISTING_DIR, MountCapability.READ_ONLY, MountCapability.UNMOUNT_FORCED, MountCapability.VOLUME_NAME), provider.capabilities());
+		Assertions.assertEquals(Set.of(MountCapability.MOUNT_TO_EXISTING_DIR, MountCapability.MOUNT_TO_SYSTEM_CHOSEN_PATH, MountCapability.READ_ONLY, MountCapability.UNMOUNT_FORCED, MountCapability.VOLUME_NAME), provider.capabilities());
 	}
 
 	@ParameterizedTest(name = "os.version {0} -> {1}")
@@ -399,15 +466,6 @@ public class FSKitMountProviderTest {
 
 			Assertions.assertThrows(IllegalArgumentException.class, () -> builder.setMountpoint(file));
 		}
-
-		@Test
-		@DisplayName("refuses to mount without a mount point")
-		public void testNoMountPoint() {
-			MountBuilder builder = provider.forFileSystem(fileSystemRoot);
-
-			Assertions.assertThrows(NullPointerException.class, builder::mount);
-			Assertions.assertEquals(List.of(), commands);
-		}
 	}
 
 	@Nested
@@ -489,7 +547,7 @@ public class FSKitMountProviderTest {
 
 		@ParameterizedTest
 		@DisplayName("mounts without opening System Settings when the extension is not known to be switched off")
-		@EnumSource(names = {"ENABLED", "NOT_REGISTERED", "NOT_IN_APP", "FAILED"})
+		@EnumSource(names = {"ENABLED", "NOT_REGISTERED", "NOT_IN_APP", "NOT_EMBEDDED", "FAILED"})
 		public void testExtensionNotSwitchedOff(Status status) throws MountFailedException, UnmountFailedException, IOException {
 			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(status);
 
@@ -998,6 +1056,195 @@ public class FSKitMountProviderTest {
 			Assertions.assertFalse(Files.exists(lastMountCommand.rendezvousDir()));
 			mount.close();
 			Assertions.assertEquals(1, commandsStartingWith("/sbin/umount").size());
+		}
+	}
+
+	@Nested
+	@DisplayName("without a mount point")
+	public class SystemChosenPath {
+
+		@BeforeEach
+		public void setup() {
+			Mockito.when(extensionCheck.status(Mockito.anyString())).thenReturn(Status.ENABLED);
+		}
+
+		private MountBuilder builder() {
+			return provider.forFileSystem(fileSystemRoot).setVolumeName("Tresor");
+		}
+
+		private List<List<String>> diskutilCommands() {
+			return commandsStartingWith("/usr/sbin/diskutil");
+		}
+
+		@Test
+		@DisplayName("mounts through FSKit at the path it reports, and serves the session there")
+		public void testMount() throws MountFailedException, UnmountFailedException, IOException {
+			volumePath = Path.of("/Volumes/Tresor 1");
+
+			try (Mount mount = builder().mount()) {
+				Assertions.assertEquals(Mountpoint.forPath(volumePath), mount.getMountpoint());
+				Assertions.assertEquals(List.of(new VolumeMount(lastRendezvous.dir(), lastRendezvous.port(), false)), volumeMounts);
+				Assertions.assertEquals(Path.of(System.getProperty("java.io.tmpdir")), lastRendezvous.dir().getParent());
+				Assertions.assertEquals("Tresor", Manifest.read(lastRendezvous.dir()).volumeName());
+				Assertions.assertEquals(List.of(), commandsStartingWith("/sbin/mount"));
+				Assertions.assertFalse(clients.getFirst().request(new GetattrRequest(Messages.ROOT_NODE_ID)) instanceof Failure);
+			}
+		}
+
+		@Test
+		@DisplayName("a read-only mount asks FSKit for one and serves a read-only session")
+		public void testReadOnly() throws MountFailedException, UnmountFailedException, IOException {
+			try (Mount _ = builder().setReadOnly(true).mount()) {
+				Assertions.assertTrue(volumeMounts.getLast().readOnly());
+				Assertions.assertEquals(new Failure(Errno.EROFS), clients.getFirst().request(new CreateRequest(Messages.ROOT_NODE_ID, "file.txt", NodeType.FILE, 0644)));
+			}
+		}
+
+		@ParameterizedTest
+		@DisplayName("outside an app or in one without the extension, fails before anything is started and asks for a mount point")
+		@EnumSource(names = {"NOT_IN_APP", "NOT_EMBEDDED"})
+		public void testWithoutEmbeddedExtension(Status status) {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(status);
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertTrue(e.getMessage().contains("Set a mount point"), e.getMessage());
+			Assertions.assertEquals(List.of(), volumeMounts);
+			Assertions.assertEquals(List.of(), operations);
+			Assertions.assertEquals(List.of(), commands);
+		}
+
+		@ParameterizedTest
+		@DisplayName("mounts when the app embeds the extension but FSKit does not list it or could not be asked, and leaves the answer to FSKit")
+		@EnumSource(names = {"NOT_REGISTERED", "FAILED"})
+		public void testExtensionNotKnownToBeSwitchedOn(Status status) throws MountFailedException, UnmountFailedException, IOException {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(status);
+
+			try (Mount _ = builder().mount()) {
+				Assertions.assertEquals(1, volumeMounts.size());
+			}
+		}
+
+		@Test
+		@DisplayName("with the extension switched off, fails before FSKit is asked to mount")
+		public void testExtensionSwitchedOff() {
+			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
+
+			Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertEquals(List.of(), volumeMounts);
+			Assertions.assertEquals(List.of(), operations);
+		}
+
+		@Test
+		@DisplayName("a failing FSKit mount reports its failure, runs no unmount and leaves nothing behind")
+		public void testMounterFails() {
+			volumeMountHandler = _ -> {
+				throw new MountFailedException("FSKit did not mount within 30000 ms");
+			};
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertEquals("FSKit did not mount within 30000 ms", e.getMessage());
+			Assertions.assertEquals(List.of(), diskutilCommands());
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a volume FSKit mounted without the extension connecting is unmounted by force")
+		public void testNoHandshake() {
+			volumeMountHandler = FSKitMountProviderTest.this::addToVolumes;
+
+			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+
+			Assertions.assertTrue(e.getMessage().contains("FSKit succeeded, but the extension did not connect"), e.getMessage());
+			Assertions.assertEquals(List.of(List.of("/usr/sbin/diskutil", "unmount", "force", volumePath.toString())), diskutilCommands());
+			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("unmount runs diskutil unmount, closes the session and deletes the rendezvous directory")
+		public void testUnmount() throws MountFailedException, UnmountFailedException {
+			Mount mount = builder().mount();
+
+			mount.unmount();
+
+			Assertions.assertEquals(List.of(List.of("/usr/sbin/diskutil", "unmount", volumePath.toString())), diskutilCommands());
+			Assertions.assertEquals(List.of(), commandsStartingWith("/sbin/umount"));
+			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("unmountForced runs diskutil unmount force")
+		public void testUnmountForced() throws MountFailedException, UnmountFailedException {
+			Mount mount = builder().mount();
+
+			mount.unmountForced();
+
+			Assertions.assertEquals(List.of(List.of("/usr/sbin/diskutil", "unmount", "force", volumePath.toString())), diskutilCommands());
+			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a failing diskutil counts as success once the volume is gone from the mount table")
+		public void testUnmountedConcurrently() throws MountFailedException, UnmountFailedException {
+			Mount mount = builder().mount();
+			diskutilCommandHandler = _ -> {
+				mountTable.removeLast();
+				return exited(1, "", "Unmount failed for " + volumePath);
+			};
+
+			mount.unmount();
+
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a failing diskutil, with the volume still mounted, keeps the session and the rendezvous directory")
+		public void testDiskutilFails() throws MountFailedException, IOException, UnmountFailedException {
+			try (Mount mount = builder().mount()) {
+				diskutilCommandHandler = _ -> exited(1, "", "Unmount failed for " + volumePath);
+
+				Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
+
+				Assertions.assertTrue(Files.isDirectory(lastRendezvous.dir()));
+				Assertions.assertFalse(clients.getFirst().request(new GetattrRequest(Messages.ROOT_NODE_ID)) instanceof Failure);
+				diskutilCommandHandler = FSKitMountProviderTest.this::diskutilUnmount;
+			}
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("while something else is mounted on top of the volume, unmounting fails without running diskutil")
+		public void testUnmountBelowAnotherMount() throws MountFailedException, IOException, UnmountFailedException {
+			String onTop = "//user@server/share on " + volumePath + " (smbfs, nodev, nosuid, mounted by me)";
+			try (Mount mount = builder().mount()) {
+				mountTable.add(onTop);
+
+				Assertions.assertThrows(UnmountFailedException.class, mount::unmountForced);
+
+				Assertions.assertEquals(List.of(), diskutilCommands());
+				Assertions.assertEquals(3, mountTable.size());
+				mountTable.remove(onTop);
+			}
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("a volume that goes away without an unmount is reported, without calling its mount point a plain directory, since the system removed it")
+		public void testGoneWithoutUnmount() throws Throwable {
+			Mount mount = builder().mount();
+
+			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+
+			assertLogged(log, "WARN", "The volume at " + volumePath + " was unmounted by someone else");
+			Assertions.assertFalse(log.contains("plain directory"), log);
+			mount.unmount();
+			Assertions.assertEquals(List.of(), diskutilCommands());
+			assertNothingLeftBehind();
 		}
 	}
 }

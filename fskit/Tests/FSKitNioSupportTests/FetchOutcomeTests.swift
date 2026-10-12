@@ -11,11 +11,11 @@ struct FetchOutcomeTests {
 	/// Waits for a fetch on a thread of its own and returns the outcome.
 	///
 	/// When the wait has not returned well after its deadline, this records an issue and returns `nil`, leaving the thread behind. A wait that ignores its deadline thus fails its test, which `.timeLimit` could not do, since it cannot end a thread blocked on a semaphore.
-	private func outcome(of fetch: @escaping @Sendable (@escaping @Sendable ([Int]?, (any Error)?) -> Void) -> Void) -> FetchOutcome<[Int]>? {
+	private func outcome(lateValue: (@Sendable ([Int]) -> Void)? = nil, of fetch: @escaping @Sendable (@escaping @Sendable ([Int]?, (any Error)?) -> Void) -> Void) -> FetchOutcome<[Int]>? {
 		let outcome = OSAllocatedUnfairLock<FetchOutcome<[Int]>?>(initialState: nil)
 		let returned = DispatchSemaphore(value: 0)
 		Thread.detachNewThread {
-			let waited = FetchOutcome(waitingAtMost: Self.timeout, for: fetch)
+			let waited = FetchOutcome(waitingAtMost: Self.timeout, lateValue: lateValue, for: fetch)
 			outcome.withLock { $0 = waited }
 			returned.signal()
 		}
@@ -38,19 +38,44 @@ struct FetchOutcomeTests {
 		#expect(outcome { _ in }?.isTimedOut == true)
 	}
 
-	@Test func dropsACompletionAfterTheDeadline() {
-		let completedLate = DispatchSemaphore(value: 0)
+	/// Completes the fetch with `value` or `error` well after the deadline, waits for that completion, and returns the outcome with the values `lateValue` received.
+	private func completedLate(with value: [Int]?, _ error: (any Error)? = nil) -> (FetchOutcome<[Int]>?, [[Int]]) {
+		let lateValues = OSAllocatedUnfairLock<[[Int]]>(initialState: [])
+		let completed = DispatchSemaphore(value: 0)
 
-		let outcome = outcome { completion in
+		let outcome = outcome(lateValue: { value in lateValues.withLock { $0.append(value) } }, of: { completion in
 			Thread.detachNewThread {
 				Thread.sleep(forTimeInterval: 0.5)
-				completion([1], nil)
-				completedLate.signal()
+				completion(value, error)
+				completed.signal()
 			}
-		}
+		})
+
+		#expect(completed.wait(timeout: .now() + 5) == .success)
+		return (outcome, lateValues.withLock { $0 })
+	}
+
+	@Test func handsAValueCompletedAfterTheDeadlineToLateValueOnce() {
+		let (outcome, lateValues) = completedLate(with: [1])
 
 		#expect(outcome?.isTimedOut == true)
-		#expect(completedLate.wait(timeout: .now() + 5) == .success)
+		#expect(lateValues == [[1]])
+	}
+
+	@Test func dropsAnErrorCompletedAfterTheDeadline() {
+		let (outcome, lateValues) = completedLate(with: nil, FetchError())
+
+		#expect(outcome?.isTimedOut == true)
+		#expect(lateValues.isEmpty)
+	}
+
+	@Test func keepsAValueCompletedBeforeTheDeadlineFromLateValue() {
+		let lateValues = OSAllocatedUnfairLock<[[Int]]>(initialState: [])
+
+		let outcome = outcome(lateValue: { value in lateValues.withLock { $0.append(value) } }, of: { $0([1], nil) })
+
+		#expect(outcome?.value == [1])
+		#expect(lateValues.withLock { $0 }.isEmpty)
 	}
 }
 

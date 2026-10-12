@@ -256,6 +256,11 @@ mounted_source() {
 	done
 }
 
+# Prints the name of the volume mounted at a mount point, as NSURLVolumeNameKey reports it.
+volume_name() {
+	osascript -l JavaScript -e 'ObjC.import("Foundation"); function run(argv) { const name = Ref(); $.NSURL.fileURLWithPath(argv[0]).getResourceValueForKeyError(name, $.NSURLVolumeNameKey, null); return ObjC.unwrap(name[0]); }' "$1"
+}
+
 # Prints the options the mount table lists for whatever is mounted at a mount point.
 mount_options() {
 	local line
@@ -960,12 +965,15 @@ parallel() {
 }
 
 two-mounts() {
-	local second_backing="$SCENARIO_DIR/second backing" second_mnt="$SCENARIO_DIR/Smoke (1)"
+	# the second volume's name is not ASCII, which the extension gives the volume only once it is mounted
+	local second_backing="$SCENARIO_DIR/second backing" second_mnt="$SCENARIO_DIR/Smoke (1)" second_id="$SCENARIO-"$'\xc3\xbc'
 	mkdir "$second_backing"
 	echo one > "$BACKING/one.txt"
 	echo two > "$second_backing/two.txt"
 	mount_volume "$SCENARIO-1" plain rw "$BACKING" "$MNT" || return 0
-	if mount_volume "$SCENARIO-2" plain rw "$second_backing" "$second_mnt"; then
+	if mount_volume "$second_id" plain rw "$second_backing" "$second_mnt"; then
+		check "the first has its name" test "$(volume_name "$MNT")" = "Smoke $SCENARIO-1"
+		check "the second has its name" test "$(volume_name "$second_mnt")" = "Smoke $second_id"
 		check "the first shows its own directory" test "$(entries "$MNT")" = one.txt
 		check "the second shows its own directory" test "$(entries "$second_mnt")" = two.txt
 		check "a file is written to the first" echo_to written "$MNT/written.txt"
@@ -973,7 +981,7 @@ two-mounts() {
 		check "it does not appear in the second" test "$(entries "$second_mnt")" = two.txt
 		check "nor in its backing directory" test "$(entries "$second_backing")" = two.txt
 		check "the mount table lists both" test -n "$(mounted_source "$MNT")" -a -n "$(mounted_source "$second_mnt")"
-		unmount_volume "$SCENARIO-2" "$second_mnt"
+		unmount_volume "$second_id" "$second_mnt"
 	fi
 	unmount_volume "$SCENARIO-1" "$MNT"
 }

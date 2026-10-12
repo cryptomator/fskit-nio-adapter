@@ -9,7 +9,7 @@ public struct InstalledExtension: Equatable, Sendable {
 	}
 }
 
-/// The answers of the exported functions. `NativeExtensionCheck` in the Java provider mirrors the codes.
+/// The answers of the exported checks for the extension. `NativeExtensionCheck` in the Java provider mirrors the codes.
 public enum ExtensionStatus: Int32, Sendable {
 	case notInApp = 0
 	case notEmbedded = 1

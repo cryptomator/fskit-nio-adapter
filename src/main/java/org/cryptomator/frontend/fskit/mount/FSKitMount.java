@@ -24,6 +24,7 @@ final class FSKitMount implements Mount {
 	private final Path rendezvousDir;
 	private final Path mountpoint;
 	private final Path realMountpoint;
+	private final Placement placement;
 	private boolean unmounted;
 	// set before `umount` runs, since `umount` ends the session before this mount closes it, and cleared again if unmounting fails
 	private volatile boolean sessionEndExpected;
@@ -31,13 +32,28 @@ final class FSKitMount implements Mount {
 	/**
 	 * @param realMountpoint {@code mountpoint} with symbolic links resolved, as the mount table names it
 	 */
-	FSKitMount(ProcessHelper.Starter processStarter, BridgeSession session, Path rendezvousDir, Path mountpoint, Path realMountpoint) {
+	FSKitMount(ProcessHelper.Starter processStarter, BridgeSession session, Path rendezvousDir, Path mountpoint, Path realMountpoint, Placement placement) {
 		this.processStarter = processStarter;
 		this.session = session;
 		this.rendezvousDir = rendezvousDir;
 		this.mountpoint = mountpoint;
 		this.realMountpoint = realMountpoint;
+		this.placement = placement;
 		session.ended().thenRun(this::reportUnexpectedEnd);
+	}
+
+	/**
+	 * Where a volume is mounted, which decides how it is unmounted.
+	 */
+	enum Placement {
+		/**
+		 * At an existing directory, mounted with {@code mount}. Once the volume is gone, the directory is a plain one again.
+		 */
+		EXISTING_DIR,
+		/**
+		 * In {@code /Volumes}, where FSKit created the mount point. {@code umount} is refused there, and the system removes the mount point with the volume.
+		 */
+		SYSTEM_CHOSEN_PATH
 	}
 
 	@Override
@@ -59,7 +75,7 @@ final class FSKitMount implements Mount {
 		sessionEndExpected = true;
 		boolean success = false;
 		try {
-			unmountIfMounted(processStarter, rendezvousDir, realMountpoint, forced);
+			unmountIfMounted(processStarter, rendezvousDir, realMountpoint, placement, forced);
 			success = true;
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
@@ -103,9 +119,10 @@ final class FSKitMount implements Mount {
 			return;
 		}
 		try {
-			boolean stillMounted = MountTable.read(processStarter).sourcesOfMountsAt(realMountpoint).stream().anyMatch(source -> namesRendezvousDir(source, rendezvousDir));
-			if (stillMounted) {
+			if (isMounted(processStarter, rendezvousDir, realMountpoint)) {
 				LOG.error("The volume at {} lost its connection and fails every operation until it is unmounted.", mountpoint);
+			} else if (placement == Placement.SYSTEM_CHOSEN_PATH) {
+				LOG.warn("The volume at {} was unmounted by someone else, or its FSKit extension or fskitd ended.", mountpoint);
 			} else {
 				LOG.warn("The volume at {} was unmounted by someone else, or its FSKit extension or fskitd ended. The mount point is a plain directory again: whatever is written to it lands on the local disk, not in the mounted file system.", mountpoint);
 			}
@@ -124,7 +141,7 @@ final class FSKitMount implements Mount {
 	 *
 	 * @throws IOException If something else is mounted on top of the volume, which would be unmounted in its place
 	 */
-	static void unmountIfMounted(ProcessHelper.Starter processStarter, Path rendezvousDir, Path realMountpoint, boolean forced) throws IOException, TimeoutException, InterruptedException, ProcessHelper.CommandFailedException {
+	static void unmountIfMounted(ProcessHelper.Starter processStarter, Path rendezvousDir, Path realMountpoint, Placement placement, boolean forced) throws IOException, TimeoutException, InterruptedException, ProcessHelper.CommandFailedException {
 		List<String> sources = MountTable.read(processStarter).sourcesOfMountsAt(realMountpoint);
 		if (sources.stream().noneMatch(source -> namesRendezvousDir(source, rendezvousDir))) {
 			LOG.info("{} already unmounted. Nothing to do.", realMountpoint);
@@ -135,16 +152,27 @@ final class FSKitMount implements Mount {
 			throw new IOException("Something else is mounted on top of " + realMountpoint);
 		}
 		String target = realMountpoint.toString();
-		ProcessBuilder command = forced ? new ProcessBuilder("/sbin/umount", "-f", "--", target) : new ProcessBuilder("/sbin/umount", "--", target);
+		ProcessBuilder command = switch (placement) {
+			case EXISTING_DIR -> forced ? new ProcessBuilder("/sbin/umount", "-f", "--", target) : new ProcessBuilder("/sbin/umount", "--", target);
+			case SYSTEM_CHOSEN_PATH -> forced ? new ProcessBuilder("/usr/sbin/diskutil", "unmount", "force", target) : new ProcessBuilder("/usr/sbin/diskutil", "unmount", target);
+		};
+		String description = switch (placement) {
+			case EXISTING_DIR -> forced ? "`umount -f`" : "`umount`";
+			case SYSTEM_CHOSEN_PATH -> forced ? "`diskutil unmount force`" : "`diskutil unmount`";
+		};
 		Process umount = processStarter.start(command);
 		boolean exited = false;
 		try {
-			ProcessHelper.waitForSuccess(umount, UMOUNT_TIMEOUT_SECONDS, forced ? "`umount -f`" : "`umount`");
+			ProcessHelper.waitForSuccess(umount, UMOUNT_TIMEOUT_SECONDS, description);
 			exited = true;
 		} catch (ProcessHelper.CommandFailedException e) {
 			exited = true;
-			// unmounted by someone else since the mount table was read
-			if (!e.stderr.contains("not currently mounted")) {
+			// unmounted by someone else since the mount table was read. `diskutil` fails alike for a path where nothing is mounted, so only the mount table tells.
+			boolean unmountedMeanwhile = switch (placement) {
+				case EXISTING_DIR -> e.stderr.contains("not currently mounted");
+				case SYSTEM_CHOSEN_PATH -> !isMounted(processStarter, rendezvousDir, realMountpoint);
+			};
+			if (!unmountedMeanwhile) {
 				throw e;
 			}
 			LOG.info("{} already unmounted. Nothing to do.", realMountpoint);
@@ -153,6 +181,10 @@ final class FSKitMount implements Mount {
 				umount.destroyForcibly();
 			}
 		}
+	}
+
+	private static boolean isMounted(ProcessHelper.Starter processStarter, Path rendezvousDir, Path realMountpoint) throws IOException, TimeoutException, InterruptedException, ProcessHelper.CommandFailedException {
+		return MountTable.read(processStarter).sourcesOfMountsAt(realMountpoint).stream().anyMatch(source -> namesRendezvousDir(source, rendezvousDir));
 	}
 
 	// the name of the rendezvous directory is unique to its mount

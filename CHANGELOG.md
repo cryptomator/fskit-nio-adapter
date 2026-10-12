@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.1.0...HEAD)
 ### Added
-* A warning in the log when a volume goes away without an unmount through the provider, as when its extension or `fskitd` ends or someone else unmounts it, since whatever is written to the mount point then lands on the local disk
+* Mounting without a mount point (`MOUNT_TO_SYSTEM_CHOSEN_PATH`), into a directory the system creates in `/Volumes`, for an app with the entitlement `com.apple.developer.fskit.mount`
+* A warning in the log when a volume goes away without an unmount through the provider, as when its extension or `fskitd` ends or someone else unmounts it. A mount point the application chose is then a plain directory again, and whatever is written to it lands on the local disk
 
 ### Fixed
 * A mount fails instead of returning a volume that serves nothing when the extension disconnects again right after connecting

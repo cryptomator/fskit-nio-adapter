@@ -1,6 +1,7 @@
 package org.cryptomator.frontend.fskit.mount;
 
 import org.cryptomator.frontend.fskit.BridgeSession;
+import org.cryptomator.frontend.fskit.mount.FSKitMount.Placement;
 import org.cryptomator.frontend.fskit.fs.FileSystemOperations;
 import org.cryptomator.frontend.fskit.protocol.Manifest;
 import org.cryptomator.frontend.fskit.protocol.Messages;
@@ -25,12 +26,12 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
 import static org.cryptomator.integrations.mount.MountCapability.MOUNT_TO_EXISTING_DIR;
+import static org.cryptomator.integrations.mount.MountCapability.MOUNT_TO_SYSTEM_CHOSEN_PATH;
 import static org.cryptomator.integrations.mount.MountCapability.READ_ONLY;
 import static org.cryptomator.integrations.mount.MountCapability.UNMOUNT_FORCED;
 import static org.cryptomator.integrations.mount.MountCapability.VOLUME_NAME;
@@ -40,6 +41,8 @@ import static org.cryptomator.integrations.mount.MountCapability.VOLUME_NAME;
  * <p>
  * The file system is served by this JVM. An FSKit extension answers some operations itself and forwards the others to it.
  * The provider is supported on macOS 27 or later with an {@code aarch64} JVM, unless the JVM runs from an app that embeds no extension for the file system type. A JVM outside an app, as in tests, or in an app that cannot be checked counts as supported.
+ * <p>
+ * The provider mounts at a chosen existing directory with {@code /sbin/mount -F}. Without a mount point, FSKit mounts the volume in {@code /Volumes}. That needs an app that embeds the extension and holds the entitlement {@code com.apple.developer.fskit.mount}.
  * <p>
  * An app installs its extension switched off. Mounting with the extension switched off opens System Settings at File System Extensions and fails with a message that asks to switch it on and try again.
  *
@@ -53,23 +56,26 @@ public class FSKitMountProvider implements MountService {
 	private static final String FS_TYPE_PROPERTY = "org.cryptomator.frontend.fskit.fsType";
 	private static final String DEFAULT_FS_TYPE = "cryptomatorfs";
 	private static final Duration SESSION_CLOSE_TIMEOUT = Duration.ofSeconds(10);
+	static final int MOUNT_TIMEOUT_SECONDS = 30;
 
 	private final ProcessHelper.Starter processStarter;
 	private final SessionFactory sessionFactory;
 	private final ExtensionCheck extensionCheck;
+	private final VolumeMounter volumeMounter;
 
 	public FSKitMountProvider() {
-		this(ProcessBuilder::start, FSKitMountProvider::createSession, NativeExtensionCheck.SHARED);
+		this(ProcessBuilder::start, FSKitMountProvider::createSession, NativeExtensionCheck.SHARED, NativeVolumeMounter.SHARED);
 	}
 
 	static BridgeSession createSession(Path fileSystemRoot, boolean readOnly) throws IOException {
 		return new BridgeSession(new FileSystemOperations(fileSystemRoot, readOnly), SESSION_CLOSE_TIMEOUT);
 	}
 
-	FSKitMountProvider(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck) {
+	FSKitMountProvider(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck, VolumeMounter volumeMounter) {
 		this.processStarter = processStarter;
 		this.sessionFactory = sessionFactory;
 		this.extensionCheck = extensionCheck;
+		this.volumeMounter = volumeMounter;
 	}
 
 	@Override
@@ -99,7 +105,7 @@ public class FSKitMountProvider implements MountService {
 
 	@Override
 	public MountBuilder forFileSystem(Path fileSystemRoot) {
-		return new FSKitMountBuilder(processStarter, sessionFactory, extensionCheck, fsType(), fileSystemRoot);
+		return new FSKitMountBuilder(processStarter, sessionFactory, extensionCheck, volumeMounter, fsType(), fileSystemRoot);
 	}
 
 	private static String fsType() {
@@ -108,7 +114,7 @@ public class FSKitMountProvider implements MountService {
 
 	@Override
 	public Set<MountCapability> capabilities() {
-		return EnumSet.of(MOUNT_TO_EXISTING_DIR, READ_ONLY, UNMOUNT_FORCED, VOLUME_NAME);
+		return EnumSet.of(MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, READ_ONLY, UNMOUNT_FORCED, VOLUME_NAME);
 	}
 
 	/**
@@ -123,21 +129,22 @@ public class FSKitMountProvider implements MountService {
 	private static class FSKitMountBuilder implements MountBuilder {
 
 		private static final Logger LOG = LoggerFactory.getLogger(FSKitMountBuilder.class);
-		private static final int MOUNT_TIMEOUT_SECONDS = 30;
 
 		private final ProcessHelper.Starter processStarter;
 		private final SessionFactory sessionFactory;
 		private final ExtensionCheck extensionCheck;
+		private final VolumeMounter volumeMounter;
 		private final String fsType;
 		private final Path fileSystemRoot;
-		private Path mountPoint;
+		private @Nullable Path mountPoint;
 		private boolean readOnly;
 		private String volumeName = "Untitled";
 
-		public FSKitMountBuilder(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck, String fsType, Path fileSystemRoot) {
+		public FSKitMountBuilder(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck, VolumeMounter volumeMounter, String fsType, Path fileSystemRoot) {
 			this.processStarter = processStarter;
 			this.sessionFactory = sessionFactory;
 			this.extensionCheck = extensionCheck;
+			this.volumeMounter = volumeMounter;
 			this.fsType = fsType;
 			this.fileSystemRoot = fileSystemRoot;
 		}
@@ -166,21 +173,16 @@ public class FSKitMountProvider implements MountService {
 
 		@Override
 		public Mount mount() throws MountFailedException {
-			Objects.requireNonNull(mountPoint);
-			checkExtensionSwitchedOn();
-			Path realMountPoint;
-			try {
-				realMountPoint = mountPoint.toRealPath();
-				if (!MountTable.read(processStarter).sourcesOfMountsAt(realMountPoint).isEmpty()) {
-					throw new MountFailedException("Something is already mounted at " + mountPoint);
+			ExtensionCheck.Status extensionStatus = checkExtensionSwitchedOn();
+			Placement placement = mountPoint == null ? Placement.SYSTEM_CHOSEN_PATH : Placement.EXISTING_DIR;
+			Path realMountPoint = null;
+			switch (placement) {
+				case EXISTING_DIR -> realMountPoint = checkMountPointFree();
+				case SYSTEM_CHOSEN_PATH -> {
+					if (extensionStatus == ExtensionCheck.Status.NOT_IN_APP || extensionStatus == ExtensionCheck.Status.NOT_EMBEDDED) {
+						throw new MountFailedException("Mounting without a mount point needs an app that embeds the FSKit extension. Set a mount point.");
+					}
 				}
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				throw new MountFailedException(e);
-			} catch (ProcessHelper.CommandFailedException e) {
-				throw new MountFailedException("Failed to determine whether the mount point is in use: " + e.stderr, e);
-			} catch (IOException | TimeoutException e) {
-				throw new MountFailedException("Failed to determine whether the mount point is in use", e);
 			}
 
 			BridgeSession session;
@@ -193,21 +195,34 @@ public class FSKitMountProvider implements MountService {
 			// the directory that is passed to `mount` only tells the extension where to find the session; its name identifies this mount in the mount table
 			Path rendezvousDir = Path.of(System.getProperty("java.io.tmpdir"), UUID.randomUUID().toString());
 			Process mountProcess = null;
+			Path unmountAt = null;
 			boolean success = false;
 			try {
 				Files.createDirectory(rendezvousDir, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
 				new Manifest(Messages.PROTOCOL_VERSION, session.port(), session.token(), volumeName).write(rendezvousDir);
-				ProcessBuilder command = new ProcessBuilder(mountCommand(rendezvousDir));
-				LOG.debug("Mounting {} using {}", fileSystemRoot.getFileSystem(), command.command());
-				mountProcess = processStarter.start(command);
-				ProcessHelper.waitForSuccess(mountProcess, MOUNT_TIMEOUT_SECONDS, "`mount`");
+				String mounter = switch (placement) {
+					case EXISTING_DIR -> {
+						ProcessBuilder command = new ProcessBuilder(mountCommand(rendezvousDir));
+						LOG.debug("Mounting {} using {}", fileSystemRoot.getFileSystem(), command.command());
+						mountProcess = processStarter.start(command);
+						unmountAt = realMountPoint;
+						ProcessHelper.waitForSuccess(mountProcess, MOUNT_TIMEOUT_SECONDS, "`mount`");
+						yield "`mount`";
+					}
+					case SYSTEM_CHOSEN_PATH -> {
+						LOG.debug("Mounting {} through FSKit", fileSystemRoot.getFileSystem());
+						// FSKit creates the mount point as a new directory in `/Volumes`, so the path it reports is the one the mount table names
+						unmountAt = realMountPoint = volumeMounter.mount(fsType, rendezvousDir, readOnly);
+						yield "FSKit";
+					}
+				};
 				if (!session.awaitHandshake(Duration.ZERO)) {
-					throw new MountFailedException("`mount` succeeded, but the extension did not connect");
+					throw new MountFailedException(mounter + " succeeded, but the extension did not connect");
 				}
 				if (session.hasEnded()) {
-					throw new MountFailedException("`mount` succeeded, but the extension disconnected again");
+					throw new MountFailedException(mounter + " succeeded, but the extension disconnected again");
 				}
-				var mount = new FSKitMount(processStarter, session, rendezvousDir, mountPoint, realMountPoint);
+				var mount = new FSKitMount(processStarter, session, rendezvousDir, mountPoint != null ? mountPoint : realMountPoint, realMountPoint, placement);
 				success = true;
 				return mount;
 			} catch (InterruptedException e) {
@@ -221,8 +236,28 @@ public class FSKitMountProvider implements MountService {
 				throw new MountFailedException(e.getMessage() + ": " + e.stderr, e);
 			} finally {
 				if (!success) {
-					cleanUp(mountProcess, realMountPoint, session, rendezvousDir);
+					cleanUp(mountProcess, unmountAt, placement, session, rendezvousDir);
 				}
+			}
+		}
+
+		/**
+		 * @return The mount point with symbolic links resolved, as the mount table names it
+		 */
+		private Path checkMountPointFree() throws MountFailedException {
+			try {
+				Path realMountPoint = mountPoint.toRealPath();
+				if (!MountTable.read(processStarter).sourcesOfMountsAt(realMountPoint).isEmpty()) {
+					throw new MountFailedException("Something is already mounted at " + mountPoint);
+				}
+				return realMountPoint;
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new MountFailedException(e);
+			} catch (ProcessHelper.CommandFailedException e) {
+				throw new MountFailedException("Failed to determine whether the mount point is in use: " + e.stderr, e);
+			} catch (IOException | TimeoutException e) {
+				throw new MountFailedException("Failed to determine whether the mount point is in use", e);
 			}
 		}
 
@@ -230,8 +265,9 @@ public class FSKitMountProvider implements MountService {
 		 * Fails if the extension is switched off, after opening System Settings, since only the user can switch it on.
 		 * Without this check, {@code mount} would fail with a message about a disabled module.
 		 */
-		private void checkExtensionSwitchedOn() throws MountFailedException {
-			switch (extensionCheck.status(fsType)) {
+		private ExtensionCheck.Status checkExtensionSwitchedOn() throws MountFailedException {
+			ExtensionCheck.Status status = extensionCheck.status(fsType);
+			switch (status) {
 				case DISABLED -> {
 					boolean opened = extensionCheck.openSettings();
 					throw new MountFailedException("The FSKit extension is switched off. Switch it on in System Settings > General > Login Items & Extensions > File System Extensions, which " + (opened ? "has been opened" : "could not be opened") + ", and try again.");
@@ -240,6 +276,7 @@ public class FSKitMountProvider implements MountService {
 				default -> {
 				}
 			}
+			return status;
 		}
 
 		private List<String> mountCommand(Path rendezvousDir) {
@@ -264,21 +301,26 @@ public class FSKitMountProvider implements MountService {
 			}
 		}
 
-		private void cleanUp(@Nullable Process mountProcess, Path realMountPoint, BridgeSession session, Path rendezvousDir) {
+		/**
+		 * @param unmountAt Where the attempt may have mounted, as the mount table names it, or {@code null} where it cannot have. A volume FSKit reports only after the timeout is unmounted by the library.
+		 */
+		private void cleanUp(@Nullable Process mountProcess, @Nullable Path unmountAt, Placement placement, BridgeSession session, Path rendezvousDir) {
 			// an interrupted mount attempt is cleaned up all the same, which involves waiting
 			boolean interrupted = Thread.interrupted();
-			if (mountProcess != null) {
-				try {
+			try {
+				if (mountProcess != null) {
 					mountProcess.destroyForcibly().waitFor();
-					// a mount command that timed out, was interrupted or succeeded without the extension connecting may have left a mount behind
-					FSKitMount.unmountIfMounted(processStarter, rendezvousDir, realMountPoint, true);
-				} catch (InterruptedException e) {
-					interrupted = true;
-				} catch (ProcessHelper.CommandFailedException e) {
-					LOG.warn("Failed to unmount {} after a failed mount attempt. {}: {}", mountPoint, e.getMessage(), e.stderr);
-				} catch (IOException | TimeoutException e) {
-					LOG.warn("Failed to unmount {} after a failed mount attempt", mountPoint, e);
 				}
+				if (unmountAt != null) {
+					// a `mount` that timed out or was interrupted, or a mount the extension did not connect to, may have left a mount behind
+					FSKitMount.unmountIfMounted(processStarter, rendezvousDir, unmountAt, placement, true);
+				}
+			} catch (InterruptedException e) {
+				interrupted = true;
+			} catch (ProcessHelper.CommandFailedException e) {
+				LOG.warn("Failed to unmount {} after a failed mount attempt. {}: {}", unmountAt, e.getMessage(), e.stderr);
+			} catch (IOException | TimeoutException e) {
+				LOG.warn("Failed to unmount {} after a failed mount attempt", unmountAt, e);
 			}
 			try {
 				session.close();
