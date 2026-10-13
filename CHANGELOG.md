@@ -5,8 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.2.0...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.3.0...HEAD)
 
+No changes yet.
+
+
+## [0.3.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.3.0) - 2026-10-13
 ### Added
 * `Mount#whenTerminated()` (`WHEN_TERMINATED`, from integrations-api 1.10.0). It completes once a mount has ended for any reason: unmounted through the provider or by someone else, its extension or `fskitd` ended, or its connection failed. It does not complete before every operation still running on the mounted `Path` has returned
 
