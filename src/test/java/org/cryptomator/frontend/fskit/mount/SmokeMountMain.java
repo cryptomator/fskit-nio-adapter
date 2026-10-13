@@ -27,6 +27,8 @@ import java.util.Set;
  * Mounts and unmounts directories and throwaway vaults on command, see {@code fskit/scripts/smoke-test.sh}.
  * <p>
  * Reads one command per line from standard input, its fields separated by tabs, and answers each with one log line whose message starts with {@code REPLY}. The replies are logged, so that they share one ordered stream with the log lines of the sessions.
+ * <p>
+ * Once a mount has terminated, for whatever reason, a log line whose message starts with {@code TERMINATED} says so. That line answers no command.
  */
 public class SmokeMountMain {
 
@@ -116,6 +118,7 @@ public class SmokeMountMain {
 				Path root = vault != null ? vault.getPath("/") : Path.of(backingDir);
 				Mount mount = provider.forFileSystem(root).setVolumeName("Smoke " + id).setReadOnly(readOnly).setMountpoint(Path.of(mountPoint)).mount();
 				mounted.put(id, new Mounted(mount, vault));
+				mount.whenTerminated().thenRun(() -> LOG.info("TERMINATED {}", id));
 			} catch (MountFailedException | RuntimeException e) {
 				if (vault != null) {
 					vault.close();

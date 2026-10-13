@@ -408,6 +408,17 @@ scan_log() {
 	fi
 }
 
+# logged_in_window <text>: waits up to 10 s for a line of the log that holds the text and was written since the window opened
+logged_in_window() {
+	local attempt
+	for attempt in {1..50}; do
+		[[ "$(tail -c +$(( WINDOW_START + 1 )) "$PROGRAM_LOG" | grep -c -F -- "$1")" -gt 0 ]] && return 0
+		sleep 0.2
+	done
+	print -r -- "no line of the log holds: $1"
+	return 1
+}
+
 # --- helpers of the scenarios ---
 
 # Prints the names in a directory, without the entry macOS adds to a volume.
@@ -1000,11 +1011,10 @@ occupied() {
 
 external-unmount() {
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
-	# the provider warns that the mount point is a plain directory again
-	EXPECTED_WARNING="was unmounted by someone else"
 	# the session ends with the umount from the shell, not with the program's unmount
 	open_window
 	check "umount from the shell succeeds" /sbin/umount "$MNT"
+	check "the program learns that the volume went away" logged_in_window "SmokeMountMain - TERMINATED $SCENARIO"
 	request unmount "$SCENARIO"
 	close_window
 	check "the program's unmount succeeds" reply_is UNMOUNTED

@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.2.0...HEAD)
 
-No changes yet.
+### Added
+* `Mount#whenTerminated()` (`WHEN_TERMINATED`, from integrations-api 1.10.0). It completes once a mount has ended for any reason: unmounted through the provider or by someone else, its extension or `fskitd` ended, or its connection failed. It does not complete before every operation still running on the mounted `Path` has returned
+
+### Removed
+* The warning and the error in the log when a volume goes away or loses its connection without an unmount through the provider, which `Mount#whenTerminated()` replaces
 
 
 ## [0.2.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.2.0) - 2026-10-12

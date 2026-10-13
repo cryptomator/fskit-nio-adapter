@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeoutException;
 
 final class FSKitMount implements Mount {
@@ -26,8 +27,6 @@ final class FSKitMount implements Mount {
 	private final Path realMountpoint;
 	private final Placement placement;
 	private boolean unmounted;
-	// set before `umount` runs, since `umount` ends the session before this mount closes it, and cleared again if unmounting fails
-	private volatile boolean sessionEndExpected;
 
 	/**
 	 * @param realMountpoint {@code mountpoint} with symbolic links resolved, as the mount table names it
@@ -39,7 +38,6 @@ final class FSKitMount implements Mount {
 		this.mountpoint = mountpoint;
 		this.realMountpoint = realMountpoint;
 		this.placement = placement;
-		session.ended().thenRun(this::reportUnexpectedEnd);
 	}
 
 	/**
@@ -72,11 +70,8 @@ final class FSKitMount implements Mount {
 	}
 
 	private void unmount(boolean forced) throws UnmountFailedException {
-		sessionEndExpected = true;
-		boolean success = false;
 		try {
 			unmountIfMounted(processStarter, rendezvousDir, realMountpoint, placement, forced);
-			success = true;
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 			throw new UnmountFailedException(e);
@@ -85,14 +80,6 @@ final class FSKitMount implements Mount {
 		} catch (ProcessHelper.CommandFailedException e) {
 			LOG.warn("{}:\nSTDOUT: {}\nSTDERR: {}\n", e.getMessage(), e.stdout, e.stderr);
 			throw new UnmountFailedException(e);
-		} finally {
-			if (!success) {
-				sessionEndExpected = false;
-				// a session that ended during the attempt was taken for the end of this unmount
-				if (session.hasEnded()) {
-					reportUnexpectedEnd();
-				}
-			}
 		}
 		try {
 			// the caller closes the backing file system once this returns, so all channels must be closed by then
@@ -105,34 +92,14 @@ final class FSKitMount implements Mount {
 	}
 
 	@Override
+	public CompletionStage<Void> whenTerminated() {
+		return session.ended();
+	}
+
+	@Override
 	public void close() throws UnmountFailedException {
 		if (!unmounted) {
 			unmountForced();
-		}
-	}
-
-	/**
-	 * Reports a session that ended without an unmount through this mount, as when someone else unmounted the volume, its extension or {@code fskitd} ended, or the connection failed.
-	 */
-	private void reportUnexpectedEnd() {
-		if (sessionEndExpected) {
-			return;
-		}
-		try {
-			if (isMounted(processStarter, rendezvousDir, realMountpoint)) {
-				LOG.error("The volume at {} lost its connection and fails every operation until it is unmounted.", mountpoint);
-			} else if (placement == Placement.SYSTEM_CHOSEN_PATH) {
-				LOG.warn("The volume at {} was unmounted by someone else, or its FSKit extension or fskitd ended.", mountpoint);
-			} else {
-				LOG.warn("The volume at {} was unmounted by someone else, or its FSKit extension or fskitd ended. The mount point is a plain directory again: whatever is written to it lands on the local disk, not in the mounted file system.", mountpoint);
-			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			LOG.warn("The session of the volume at {} ended unexpectedly. Interrupted while determining whether it is still mounted.", mountpoint);
-		} catch (ProcessHelper.CommandFailedException e) {
-			LOG.warn("The session of the volume at {} ended unexpectedly. Failed to determine whether it is still mounted. {}: {}", mountpoint, e.getMessage(), e.stderr);
-		} catch (IOException | TimeoutException | RuntimeException e) {
-			LOG.warn("The session of the volume at {} ended unexpectedly. Failed to determine whether it is still mounted.", mountpoint, e);
 		}
 	}
 

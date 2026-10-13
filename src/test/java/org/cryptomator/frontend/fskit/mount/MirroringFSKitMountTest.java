@@ -114,6 +114,7 @@ public class MirroringFSKitMountTest {
 				var mount = mountProvider.forFileSystem(m.pathToMirror()).setVolumeName(m.volumeName()).setReadOnly(readOnly).setMountpoint(m.mountPoint()).mount();
 				mounts.add(mount);
 				LOG.info("Mounted successfully to: {}", mount.getMountpoint().uri());
+				mount.whenTerminated().thenRun(() -> LOG.info("Terminated: {}", mount.getMountpoint().uri()));
 			}
 			LOG.info("Enter anything to unmount...");
 			scanner.nextLine();

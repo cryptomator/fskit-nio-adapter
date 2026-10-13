@@ -51,6 +51,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -350,7 +351,7 @@ public class FSKitMountProviderTest {
 	}
 
 	/**
-	 * Drops the connection of the last mount's extension and waits for its session thread to end. The mount reports the end of its session on that thread.
+	 * Drops the connection of the last mount's extension and waits for its session thread to end, so that the session has ended when this returns.
 	 */
 	private void disconnectExtension() throws IOException {
 		clients.getLast().close();
@@ -369,16 +370,21 @@ public class FSKitMountProviderTest {
 		disconnectExtension();
 	}
 
-	private static void assertLogged(String log, String level, String message) {
-		Assertions.assertTrue(log.lines().anyMatch(line -> line.contains(" " + level + " ") && line.contains(message)), log);
+	private static void assertTerminated(CompletionStage<Void> terminated) {
+		// a caller waiting for the end of the session can go on before the session thread has completed this stage
+		Assertions.assertDoesNotThrow(() -> terminated.toCompletableFuture().get(5, TimeUnit.SECONDS), "mount not terminated normally");
+	}
+
+	private static void assertNotTerminated(CompletionStage<Void> terminated) {
+		Assertions.assertFalse(terminated.toCompletableFuture().isDone(), "mount terminated");
 	}
 
 	/* tests */
 
 	@Test
-	@DisplayName("has exactly five capabilities")
+	@DisplayName("has exactly six capabilities")
 	public void testCapabilities() {
-		Assertions.assertEquals(Set.of(MountCapability.MOUNT_TO_EXISTING_DIR, MountCapability.MOUNT_TO_SYSTEM_CHOSEN_PATH, MountCapability.READ_ONLY, MountCapability.UNMOUNT_FORCED, MountCapability.VOLUME_NAME), provider.capabilities());
+		Assertions.assertEquals(Set.of(MountCapability.MOUNT_TO_EXISTING_DIR, MountCapability.MOUNT_TO_SYSTEM_CHOSEN_PATH, MountCapability.READ_ONLY, MountCapability.UNMOUNT_FORCED, MountCapability.VOLUME_NAME, MountCapability.WHEN_TERMINATED), provider.capabilities());
 	}
 
 	@ParameterizedTest(name = "os.version {0} -> {1}")
@@ -707,7 +713,7 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
-		@DisplayName("a mount whose extension disconnects before the mount returns fails, is removed and reports no lost volume")
+		@DisplayName("a mount whose extension disconnects before the mount returns fails, is removed and logs no warning or error")
 		public void testDisconnectedWhileMounting() throws Throwable {
 			mountCommandHandler = mount -> {
 				Process mounted = mountAndConnect(mount);
@@ -797,14 +803,17 @@ public class FSKitMountProviderTest {
 	public class Unmounting {
 
 		@Test
-		@DisplayName("unmount runs umount on the resolved mount point, closes the session and deletes the rendezvous directory")
+		@DisplayName("unmount runs umount on the resolved mount point, closes the session, deletes the rendezvous directory and terminates the mount")
 		public void testUnmount() throws MountFailedException, UnmountFailedException, IOException {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
+			assertNotTerminated(terminated);
 
 			mount.unmount();
 
 			Assertions.assertEquals(List.of("/sbin/umount", "--", realMountPoint()), commands.getLast().command());
 			assertNothingLeftBehind();
+			assertTerminated(terminated);
 
 			mount.close();
 			Assertions.assertEquals(1, commandsStartingWith("/sbin/umount").size());
@@ -963,64 +972,70 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
-		@DisplayName("a volume that goes away without an unmount, as when its extension ends, is reported, since its mount point is a plain directory again")
+		@DisplayName("a volume that goes away without an unmount, as when its extension ends, terminates the mount")
 		public void testGoneWithoutUnmount() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 
-			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+			loseMount();
 
-			assertLogged(log, "WARN", "The volume at " + mountPoint + " was unmounted by someone else");
+			assertTerminated(terminated);
 			mount.unmount();
 			assertNothingLeftBehind();
 		}
 
 		@Test
-		@DisplayName("a volume that goes away after a failing umount is reported all the same")
+		@DisplayName("a failing umount leaves the mount running, and a volume that goes away afterwards terminates it")
 		public void testGoneAfterUmountFails() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 			umountCommandHandler = _ -> exited(1, "", UMOUNT_BUSY);
 			Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
+			assertNotTerminated(terminated);
 
-			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+			loseMount();
 
-			assertLogged(log, "WARN", "The volume at " + mountPoint + " was unmounted by someone else");
+			assertTerminated(terminated);
 			mount.unmount();
 			assertNothingLeftBehind();
 		}
 
 		@Test
-		@DisplayName("a session that ends during a failing umount is reported once the umount has failed")
+		@DisplayName("a session that ends during a failing umount terminates the mount")
 		public void testEndedDuringFailingUmount() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 			umountCommandHandler = _ -> {
 				disconnectExtension();
 				return exited(1, "", UMOUNT_BUSY);
 			};
 
-			String log = LogCapture.of(() -> Assertions.assertThrows(UnmountFailedException.class, mount::unmount));
+			Assertions.assertThrows(UnmountFailedException.class, mount::unmount);
 
-			assertLogged(log, "ERROR", "The volume at " + mountPoint + " lost its connection");
+			assertTerminated(terminated);
 			umountCommandHandler = FSKitMountProviderTest.this::unmount;
 			mount.unmount();
 			assertNothingLeftBehind();
 		}
 
 		@Test
-		@DisplayName("a volume whose session ends while it stays mounted is reported as failing every operation")
+		@DisplayName("a volume whose session ends while it stays mounted terminates the mount")
 		public void testDisconnectedWhileMounted() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 
-			String log = LogCapture.of(FSKitMountProviderTest.this::disconnectExtension);
+			disconnectExtension();
 
-			assertLogged(log, "ERROR", "The volume at " + mountPoint + " lost its connection");
+			assertTerminated(terminated);
 			mount.unmount();
 			assertNothingLeftBehind();
 		}
 
 		@Test
-		@DisplayName("an unmount, during which the extension disconnects before the session is closed, reports nothing")
-		public void testUnmountReportsNothing() throws Throwable {
+		@DisplayName("an unmount, during which the extension disconnects before the session is closed, logs no warning or error and terminates the mount")
+		public void testUnmountQuietly() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 			umountCommandHandler = command -> {
 				disconnectExtension();
 				return unmount(command);
@@ -1029,14 +1044,32 @@ public class FSKitMountProviderTest {
 			String log = LogCapture.of(mount::unmount);
 
 			Assertions.assertTrue(log.lines().noneMatch(line -> line.contains(" WARN ") || line.contains(" ERROR ")), log);
+			assertTerminated(terminated);
 			assertNothingLeftBehind();
 		}
 
 		@Test
-		@DisplayName("while an operation is running in the backend, unmounting fails and keeps the rendezvous directory; a retry succeeds once it has returned")
+		@DisplayName("a caller cannot complete the termination stage of a running mount")
+		public void testTerminationOnlyByTheSession() throws Throwable {
+			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
+
+			terminated.toCompletableFuture().complete(null);
+			mount.whenTerminated().toCompletableFuture().completeExceptionally(new IOException("not ended"));
+
+			assertNotTerminated(terminated);
+			assertNotTerminated(mount.whenTerminated());
+			mount.unmount();
+			assertTerminated(terminated);
+			assertNothingLeftBehind();
+		}
+
+		@Test
+		@DisplayName("while an operation is running in the backend, unmounting fails, keeps the rendezvous directory and does not terminate the mount; once the operation has returned, the mount terminates and a retry succeeds")
 		public void testUnmountWithOutstandingCleanup() throws MountFailedException, IOException, InterruptedException, UnmountFailedException {
 			sessionCloseTimeout = Duration.ofMillis(300);
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 			CountDownLatch entered = new CountDownLatch(1);
 			CountDownLatch release = new CountDownLatch(1);
 			operations.getFirst().beforeReadingAttributes = HookedOperations.blocking(entered, release);
@@ -1047,9 +1080,11 @@ public class FSKitMountProviderTest {
 
 			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
 			Assertions.assertTrue(Files.isDirectory(lastMountCommand.rendezvousDir()));
+			assertNotTerminated(terminated);
 
 			release.countDown();
 			Assertions.assertTrue(operations.getFirst().closed.await(10, TimeUnit.SECONDS));
+			assertTerminated(terminated);
 			mount.unmountForced();
 
 			Assertions.assertEquals(1, commandsStartingWith("/sbin/umount").size());
@@ -1234,14 +1269,14 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
-		@DisplayName("a volume that goes away without an unmount is reported, without calling its mount point a plain directory, since the system removed it")
+		@DisplayName("a volume that goes away without an unmount terminates the mount, and unmounting runs no diskutil, since the system removed it")
 		public void testGoneWithoutUnmount() throws Throwable {
 			Mount mount = builder().mount();
+			CompletionStage<Void> terminated = mount.whenTerminated();
 
-			String log = LogCapture.of(FSKitMountProviderTest.this::loseMount);
+			loseMount();
 
-			assertLogged(log, "WARN", "The volume at " + volumePath + " was unmounted by someone else");
-			Assertions.assertFalse(log.contains("plain directory"), log);
+			assertTerminated(terminated);
 			mount.unmount();
 			Assertions.assertEquals(List.of(), diskutilCommands());
 			assertNothingLeftBehind();

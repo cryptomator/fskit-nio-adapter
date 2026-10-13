@@ -35,6 +35,7 @@ import static org.cryptomator.integrations.mount.MountCapability.MOUNT_TO_SYSTEM
 import static org.cryptomator.integrations.mount.MountCapability.READ_ONLY;
 import static org.cryptomator.integrations.mount.MountCapability.UNMOUNT_FORCED;
 import static org.cryptomator.integrations.mount.MountCapability.VOLUME_NAME;
+import static org.cryptomator.integrations.mount.MountCapability.WHEN_TERMINATED;
 
 /**
  * Mounts a file system on macOS using FSKit.
@@ -114,7 +115,7 @@ public class FSKitMountProvider implements MountService {
 
 	@Override
 	public Set<MountCapability> capabilities() {
-		return EnumSet.of(MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, READ_ONLY, UNMOUNT_FORCED, VOLUME_NAME);
+		return EnumSet.of(MOUNT_TO_EXISTING_DIR, MOUNT_TO_SYSTEM_CHOSEN_PATH, READ_ONLY, UNMOUNT_FORCED, VOLUME_NAME, WHEN_TERMINATED);
 	}
 
 	/**
