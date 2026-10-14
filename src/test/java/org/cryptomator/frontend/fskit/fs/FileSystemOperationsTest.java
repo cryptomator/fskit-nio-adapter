@@ -474,6 +474,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(file, lookup(user, "file.txt").nodeId());
 			Assertions.assertEquals("file.txt", ok(new LookupRequest(user, "file.txt"), LookupResponse.class).name());
 			assertStatus(Errno.ENOENT, new LookupRequest(user, "missing.txt"));
+			assertStatus(Errno.ENOENT, new LookupRequest(trash, "missing.txt"));
 		}
 
 		@Test
@@ -489,15 +490,17 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(user, 0, 0, false)));
 		}
 
-		@Test
+		@ParameterizedTest(name = "directly inside: {0}")
 		@DisplayName("both spellings of a name resolve to one node")
-		public void testSpellings() {
-			CreateResponse created = ok(new CreateRequest(user, DECOMPOSED, NodeType.FILE, 0644), CreateResponse.class);
+		@ValueSource(booleans = {true, false})
+		public void testSpellings(boolean directlyInside) {
+			long directory = directlyInside ? trash : user;
+			CreateResponse created = ok(new CreateRequest(directory, DECOMPOSED, NodeType.FILE, 0644), CreateResponse.class);
 
 			Assertions.assertEquals(COMPOSED, created.name());
-			Assertions.assertEquals(created.attributes().nodeId(), lookup(user, DECOMPOSED).nodeId());
-			Assertions.assertEquals(created.attributes().nodeId(), lookup(user, COMPOSED).nodeId());
-			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(user, DECOMPOSED), LookupResponse.class).name());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(directory, DECOMPOSED).nodeId());
+			Assertions.assertEquals(created.attributes().nodeId(), lookup(directory, COMPOSED).nodeId());
+			Assertions.assertEquals(COMPOSED, ok(new LookupRequest(directory, DECOMPOSED), LookupResponse.class).name());
 		}
 	}
 
@@ -505,10 +508,33 @@ public class FileSystemOperationsTest {
 	@DisplayName("on a case-insensitive store")
 	public class CaseInsensitiveStore {
 
+		private Path searchOnly;
+
 		@BeforeEach
 		public void assumeCaseInsensitiveStore() throws IOException {
 			backing("File.txt", "original");
 			Assumptions.assumeTrue(Files.exists(root.resolve("file.txt")), "store is case-sensitive");
+		}
+
+		@AfterEach
+		public void makeReadable() throws IOException {
+			if (searchOnly != null) {
+				Files.setPosixFilePermissions(searchOnly, PosixFilePermissions.fromString("rwx------"));
+			}
+		}
+
+		/**
+		 * Creates the directory {@code dir} with the file {@code Entry.txt}, which holds "original". The directory may then be searched but not read, like the .Trashes directory macOS creates in a volume's root.
+		 *
+		 * @return The directory's node
+		 */
+		private long searchOnlyDirectory() throws IOException {
+			searchOnly = Files.createDirectory(root.resolve("dir"));
+			Files.writeString(searchOnly.resolve("Entry.txt"), "original");
+			long directory = lookup(ROOT, "dir").nodeId();
+			Files.setPosixFilePermissions(searchOnly, PosixFilePermissions.fromString("-wx--x--x"));
+			Assumptions.assumeFalse(Files.isReadable(searchOnly), "permissions do not apply to this user");
+			return directory;
 		}
 
 		@Test
@@ -542,24 +568,115 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a case variant found while its directory could not be read is absent once the directory can be read")
-		public void testCaseVariantAfterDirectoryBecomesReadable() throws IOException {
-			Path dir = Files.createDirectory(root.resolve("dir"));
-			Files.writeString(dir.resolve("Entry.txt"), "original");
-			backing("other.txt", "other");
-			long dirId = lookup(ROOT, "dir").nodeId();
-			long other = lookup(ROOT, "other.txt").nodeId();
-			Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("-wx--x--x"));
-			boolean unreadable = !Files.isReadable(dir);
-			Response whileUnreadable = ops.handle(new LookupRequest(dirId, "entry.txt"));
-			Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
-			Assumptions.assumeTrue(unreadable, "permissions do not apply to this user");
-			// nothing could tell the stored spelling then, so the variant was found
-			Assertions.assertEquals("entry.txt", Assertions.assertInstanceOf(LookupResponse.class, whileUnreadable).name());
+		@DisplayName("in a directory that may be searched but not read, lookup of a case variant yields ENOENT, and of the stored name finds the entry under it")
+		public void testLookupCaseVariantInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
 
-			assertStatus(Errno.ENOENT, new LookupRequest(dirId, "entry.txt"));
-			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, "other.txt", dirId, "entry.txt"));
-			Assertions.assertEquals("original", Files.readString(dir.resolve("Entry.txt")));
+			assertStatus(Errno.ENOENT, new LookupRequest(directory, "entry.txt"));
+			Assertions.assertEquals("Entry.txt", ok(new LookupRequest(directory, "Entry.txt"), LookupResponse.class).name());
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, lookup of a case variant of a name of 255 characters in three bytes each yields ENOENT")
+		public void testLookupCaseVariantOfLongNameInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			// the longest a name can take, 765 bytes in UTF-8, which with its terminator the kernel pads to 768
+			String stored = "\u1e00".repeat(255);
+			Files.writeString(searchOnly.resolve(stored), "");
+
+			assertStatus(Errno.ENOENT, new LookupRequest(directory, "\u1e01".repeat(255)));
+			Assertions.assertEquals(stored, ok(new LookupRequest(directory, stored), LookupResponse.class).name());
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, an entry stored decomposed resolves under both spellings to one node with its stored name")
+		public void testDecomposedNameInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			Files.writeString(searchOnly.resolve(DECOMPOSED), "");
+
+			LookupResponse response = ok(new LookupRequest(directory, COMPOSED), LookupResponse.class);
+
+			Assertions.assertEquals(DECOMPOSED, response.name());
+			Assertions.assertEquals(response.attributes().nodeId(), lookup(directory, DECOMPOSED).nodeId());
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, renaming another entry to a case variant yields EEXIST and leaves the existing entry unchanged")
+		public void testRenameToCaseVariantInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			backing("other.txt", "other");
+			long other = lookup(ROOT, "other.txt").nodeId();
+
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, "other.txt", directory, "entry.txt"));
+
+			Assertions.assertEquals("original", Files.readString(searchOnly.resolve("Entry.txt")));
+			Assertions.assertEquals(List.of("File.txt", "dir", "other.txt"), backingNames());
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, renaming another entry to the stored name replaces the entry")
+		public void testRenameToStoredNameInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			backing("other.txt", "other");
+			long other = lookup(ROOT, "other.txt").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(other, ROOT, "other.txt", directory, "Entry.txt"), RenameResponse.class);
+
+			Assertions.assertEquals("Entry.txt", response.name());
+			Assertions.assertEquals("other", Files.readString(searchOnly.resolve("Entry.txt")));
+			Assertions.assertEquals(List.of("File.txt", "dir"), backingNames());
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, renaming an entry to a case variant of itself changes its case")
+		public void testRenameToOwnCaseVariantInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			long file = lookup(directory, "Entry.txt").nodeId();
+
+			RenameResponse response = ok(new RenameRequest(file, directory, "Entry.txt", directory, "entry.txt"), RenameResponse.class);
+
+			Assertions.assertEquals("entry.txt", response.name());
+			Assertions.assertEquals(file, lookup(directory, "entry.txt").nodeId());
+			makeReadable();
+			Assertions.assertEquals(List.of("entry.txt"), backingNames(searchOnly));
+		}
+
+		@Test
+		@DisplayName("in a directory that may be searched but not read, a symbolic link is found by its own stored name, not its target's")
+		public void testLinkInSearchOnlyDirectory() throws IOException {
+			long directory = searchOnlyDirectory();
+			Files.writeString(searchOnly.resolve("Target.txt"), "target");
+			Files.createSymbolicLink(searchOnly.resolve("Link"), Path.of("Target.txt"));
+
+			assertStatus(Errno.ENOENT, new LookupRequest(directory, "link"));
+			LookupResponse response = ok(new LookupRequest(directory, "Link"), LookupResponse.class);
+			Assertions.assertEquals("Link", response.name());
+			Assertions.assertEquals(NodeType.SYMLINK, response.attributes().type());
+		}
+
+		@Test
+		@DisplayName("a case variant found while its directory could not be read and no stored name could be had is absent once the directory can be read")
+		public void testCaseVariantAfterDirectoryBecomesReadable() throws IOException {
+			long directory = searchOnlyDirectory();
+			backing("other.txt", "other");
+			long other = lookup(ROOT, "other.txt").nodeId();
+			ops.storedNameReader = _ -> null;
+			// with no stored name to be had, the variant is found
+			Assertions.assertEquals("entry.txt", ok(new LookupRequest(directory, "entry.txt"), LookupResponse.class).name());
+			makeReadable();
+
+			assertStatus(Errno.ENOENT, new LookupRequest(directory, "entry.txt"));
+			assertStatus(Errno.EEXIST, new RenameRequest(other, ROOT, "other.txt", directory, "entry.txt"));
+			Assertions.assertEquals("original", Files.readString(searchOnly.resolve("Entry.txt")));
+		}
+
+		@Test
+		@DisplayName("a stored name that is no variant of the requested one is not taken for the entry's")
+		public void testUnrelatedStoredName() throws IOException {
+			long directory = searchOnlyDirectory();
+			ops.storedNameReader = _ -> "unrelated.txt";
+
+			Assertions.assertEquals("entry.txt", ok(new LookupRequest(directory, "entry.txt"), LookupResponse.class).name());
 		}
 	}
 

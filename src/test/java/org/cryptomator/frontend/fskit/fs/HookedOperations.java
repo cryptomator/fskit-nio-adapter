@@ -2,6 +2,7 @@ package org.cryptomator.frontend.fskit.fs;
 
 import org.cryptomator.frontend.fskit.protocol.Messages.NodeType;
 import org.cryptomator.frontend.fskit.protocol.Messages.Request;
+import org.jetbrains.annotations.Nullable;
 import org.mockito.Mockito;
 
 import java.io.IOException;
@@ -22,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
 /**
@@ -131,6 +133,10 @@ public class HookedOperations extends FileSystemOperations {
 	public volatile Hook beforeSettingPermissions = _ -> {};
 	public volatile Hook beforeSettingTimes = _ -> {};
 	public volatile Hook beforeResolvingRealPath = _ -> {};
+	/**
+	 * Answering {@code null} stands for a system that cannot read a stored name from the entry itself, as Linux.
+	 */
+	public volatile Function<Path, @Nullable String> storedNameReader = super::readStoredName;
 	public volatile UnaryOperator<FileChannel> channelWrapper = UnaryOperator.identity();
 	public final List<FileChannel> openedChannels = new CopyOnWriteArrayList<>();
 	/**
@@ -223,6 +229,11 @@ public class HookedOperations extends FileSystemOperations {
 	Path toRealPath(Path path) throws IOException {
 		beforeResolvingRealPath.run(path);
 		return super.toRealPath(path);
+	}
+
+	@Override
+	@Nullable String readStoredName(Path path) {
+		return storedNameReader.apply(path);
 	}
 
 	// for seams that cannot fail, which tests only block

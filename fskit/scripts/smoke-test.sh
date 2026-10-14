@@ -939,8 +939,14 @@ links() {
 # below a directory that may be searched but not read, like the .Trashes directory macOS creates in a volume's root
 unreadable-directory() {
 	mkdir -p "$BACKING/trash/501"
+	echo original > "$BACKING/trash/Entry.txt"
+	echo other > "$BACKING/other.txt"
 	chmod 311 "$BACKING/trash"
 	mount_volume "$SCENARIO" plain rw "$BACKING" "$MNT" || return 0
+	check "cat reads a file directly inside it" test "$(cat "$MNT/trash/Entry.txt")" = original
+	check_fails "a name that differs in case is absent there" "No such file or directory" cat "$MNT/trash/entry.txt"
+	check_fails "mv onto that name fails" "File exists" mv "$MNT/other.txt" "$MNT/trash/entry.txt"
+	check "the file keeps its content" test "$(cat "$BACKING/trash/Entry.txt")" = original
 	check "a file is created" echo_to content "$MNT/trash/501/file.txt"
 	check "the backing directory holds it" test "$(cat "$BACKING/trash/501/file.txt")" = content
 	check "mv renames it" mv "$MNT/trash/501/file.txt" "$MNT/trash/501/renamed.txt"

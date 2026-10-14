@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.3.0...HEAD)
 
-No changes yet.
+### Fixed
+* On a plain directory on a case-insensitive file system, a name that differs only in case from an entry directly inside a directory that may be searched but not read, such as `.Trashes`, is reported as absent. A rename onto that name fails with "File exists" instead of replacing the entry
 
 
 ## [0.3.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.3.0) - 2026-10-13

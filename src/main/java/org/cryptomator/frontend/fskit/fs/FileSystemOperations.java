@@ -59,6 +59,7 @@ import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
@@ -839,7 +840,11 @@ public class FileSystemOperations implements Closeable {
 				}
 			}
 		} catch (AccessDeniedException e) {
-			// nothing can tell the stored spelling of an entry in a directory that cannot be read, but whether it exists can be told
+			// in a directory that cannot be read, getattrlist on the entry tells its stored spelling. Only a variant of the requested name is taken, since a mount point answers its volume's name. Otherwise only whether the entry exists can be told, and the requested spelling is assumed.
+			String stored = readStoredName(path);
+			if (stored != null && compose(stored).equalsIgnoreCase(compose(name))) {
+				return path.resolveSibling(stored);
+			}
 			readFileAttributes(path);
 			return path;
 		} catch (DirectoryIteratorException e) {
@@ -1193,5 +1198,14 @@ public class FileSystemOperations implements Closeable {
 	 */
 	Path toRealPath(Path path) throws IOException {
 		return path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+	}
+
+	/**
+	 * Reads the name an entry is stored under from the entry itself, without following a symbolic link.
+	 *
+	 * @return The name, or {@code null} if it cannot be read that way, as on Linux or on another file system than the default one
+	 */
+	@Nullable String readStoredName(Path path) {
+		return path.getFileSystem() == FileSystems.getDefault() ? StoredNames.of(path) : null;
 	}
 }
