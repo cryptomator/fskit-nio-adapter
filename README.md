@@ -154,7 +154,7 @@ Observed on macOS 27.0.1 with JDK 26.
   - Removing such an entry reports success, although nothing is removed.
   - Extended attribute calls by path on such an entry are not refused. They reveal nothing, and what they set is discarded.
   - An FSEvents stream on the mount point reports the paths of entries as they change.
-  - For a symbolic link the mounting user has read, `readlink` answers with the target. Reading a file of the volume through the link is still refused.
+  - For a symbolic link the mounting user has read, listed with `ls -l` or followed, `readlink` answers with the target from the kernel's cache. `cp -P` copies such a link, reports that it could not copy the extended attributes and exits with status 1. Reading a file of the volume through the link is still refused.
 
   A mount point below a directory the other account cannot enter keeps all of this from it. A volume mounted without a mount point is in `/Volumes`, which every account can enter.
 - Finder's Trash creates `.Trashes` in the volume root, which appears in the mounted `Path`.
