@@ -5,8 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.3.0...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.3.1...HEAD)
 
+No changes yet.
+
+
+## [0.3.1](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.3.1) - 2026-10-14
 ### Fixed
 * On a plain directory on a case-insensitive file system, a name that differs only in case from an entry directly inside a directory that may be searched but not read, such as `.Trashes`, is reported as absent. A rename onto that name fails with "File exists" instead of replacing the entry
 * A failed mount attempt whose `mount` command does not end when killed, as one stuck in the kernel, gives up on it after 10 s, where `mount()` never returned
