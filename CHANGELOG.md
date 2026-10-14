@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 * On a plain directory on a case-insensitive file system, a name that differs only in case from an entry directly inside a directory that may be searched but not read, such as `.Trashes`, is reported as absent. A rename onto that name fails with "File exists" instead of replacing the entry
+* A failed mount attempt whose `mount` command does not end when killed, as one stuck in the kernel, gives up on it after 10 s, where `mount()` never returned
+* A mount attempt interrupted while it waits for its killed `mount` command still removes a mount the command may have left behind
 
 
 ## [0.3.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.3.0) - 2026-10-13

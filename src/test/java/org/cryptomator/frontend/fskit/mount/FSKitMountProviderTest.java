@@ -32,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.io.BufferedReader;
@@ -236,7 +237,6 @@ public class FSKitMountProviderTest {
 		try {
 			Process process = Mockito.mock(Process.class);
 			Mockito.when(process.waitFor(Mockito.any(Duration.class))).thenAnswer(_ -> interruptibly(true));
-			Mockito.when(process.waitFor()).thenAnswer(_ -> interruptibly(exitCode));
 			Mockito.when(process.exitValue()).thenReturn(exitCode);
 			Mockito.when(process.inputReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new StringReader(stdout)));
 			Mockito.when(process.errorReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new StringReader(stderr)));
@@ -248,7 +248,7 @@ public class FSKitMountProviderTest {
 	}
 
 	/**
-	 * A process that does not exit by itself. Its standard output ends only once it has been destroyed. Like a real one, its standard error can no longer be read then.
+	 * A process that exits only once it has been destroyed, which also ends its standard output. Like a real one, its standard error can no longer be read then.
 	 */
 	private static Process hanging(String stderr) {
 		try {
@@ -266,8 +266,7 @@ public class FSKitMountProviderTest {
 				}
 			};
 			ClosableStream errorStream = new ClosableStream(stderr);
-			Mockito.when(process.waitFor(Mockito.any(Duration.class))).thenAnswer(_ -> interruptibly(false));
-			Mockito.when(process.waitFor()).thenAnswer(_ -> interruptibly(137));
+			Mockito.when(process.waitFor(Mockito.any(Duration.class))).thenAnswer(_ -> interruptibly(destroyed.getCount() == 0));
 			Mockito.when(process.inputReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new InputStreamReader(outputStream, StandardCharsets.UTF_8)));
 			Mockito.when(process.getErrorStream()).thenReturn(errorStream);
 			Mockito.when(process.errorReader(StandardCharsets.UTF_8)).thenReturn(new BufferedReader(new InputStreamReader(errorStream, StandardCharsets.UTF_8)));
@@ -282,10 +281,30 @@ public class FSKitMountProviderTest {
 		}
 	}
 
-	private static Process interruptedWhileWaitedFor() {
+	/**
+	 * A process whose first wait is interrupted, or, {@code afterKill}, whose first wait times out and whose wait once destroyed is interrupted.
+	 */
+	private static Process interruptedWhileWaitedFor(boolean afterKill) {
 		try {
 			Process process = hanging("");
-			Mockito.doThrow(new InterruptedException()).when(process).waitFor(Mockito.any(Duration.class));
+			if (afterKill) {
+				Mockito.doReturn(false).doThrow(new InterruptedException()).when(process).waitFor(Mockito.any(Duration.class));
+			} else {
+				Mockito.doThrow(new InterruptedException()).doAnswer(_ -> interruptibly(true)).when(process).waitFor(Mockito.any(Duration.class));
+			}
+			return process;
+		} catch (InterruptedException e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	/**
+	 * A process that does not exit, not even when destroyed, as one stuck in the kernel.
+	 */
+	private static Process unkillable() {
+		try {
+			Process process = hanging("");
+			Mockito.when(process.waitFor(Mockito.any(Duration.class))).thenAnswer(_ -> interruptibly(false));
 			return process;
 		} catch (InterruptedException e) {
 			throw new IllegalStateException(e);
@@ -713,6 +732,22 @@ public class FSKitMountProviderTest {
 		}
 
 		@Test
+		@DisplayName("a mount command that does not end when killed is given up on, and its mount is still removed")
+		public void testMountCommandSurvivesKill() throws Throwable {
+			mountCommandHandler = mount -> {
+				addToMountTable(mount);
+				return unkillable();
+			};
+
+			String log = LogCapture.of(() -> Assertions.assertThrows(MountFailedException.class, () -> builder().mount()));
+
+			Assertions.assertTrue(log.contains("`mount` did not end within"), log);
+			Assertions.assertEquals(List.of(List.of("/sbin/umount", "-f", "--", realMountPoint())), commandsStartingWith("/sbin/umount"));
+			Assertions.assertEquals(List.of(OTHER_MOUNT), mountTable);
+			assertNothingLeftBehind();
+		}
+
+		@Test
 		@DisplayName("a mount whose extension disconnects before the mount returns fails, is removed and logs no warning or error")
 		public void testDisconnectedWhileMounting() throws Throwable {
 			mountCommandHandler = mount -> {
@@ -729,12 +764,13 @@ public class FSKitMountProviderTest {
 			assertNothingLeftBehind();
 		}
 
-		@Test
-		@DisplayName("an interrupted mount is cleaned up all the same, and the thread stays interrupted")
-		public void testInterruptedWhileMounting() throws InterruptedException {
+		@ParameterizedTest(name = "interrupted after the kill: {0}")
+		@DisplayName("an interrupted mount is cleaned up all the same, also when the wait for the killed mount command is interrupted, and the thread stays interrupted")
+		@ValueSource(booleans = {false, true})
+		public void testInterruptedWhileMounting(boolean afterKill) throws InterruptedException {
 			mountCommandHandler = mount -> {
 				addToMountTable(mount);
-				return interruptedWhileWaitedFor();
+				return interruptedWhileWaitedFor(afterKill);
 			};
 
 			try {

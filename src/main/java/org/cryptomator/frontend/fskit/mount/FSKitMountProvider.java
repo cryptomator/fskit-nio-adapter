@@ -57,6 +57,7 @@ public class FSKitMountProvider implements MountService {
 	private static final String FS_TYPE_PROPERTY = "org.cryptomator.frontend.fskit.fsType";
 	private static final String DEFAULT_FS_TYPE = "cryptomatorfs";
 	private static final Duration SESSION_CLOSE_TIMEOUT = Duration.ofSeconds(10);
+	private static final Duration KILLED_MOUNT_TIMEOUT = Duration.ofSeconds(10);
 	static final int MOUNT_TIMEOUT_SECONDS = 30;
 
 	private final ProcessHelper.Starter processStarter;
@@ -309,9 +310,14 @@ public class FSKitMountProvider implements MountService {
 			// an interrupted mount attempt is cleaned up all the same, which involves waiting
 			boolean interrupted = Thread.interrupted();
 			try {
-				if (mountProcess != null) {
-					mountProcess.destroyForcibly().waitFor();
+				// a `mount` that SIGKILL cannot end, as one stuck in the kernel, must not keep the attempt from failing
+				if (mountProcess != null && !mountProcess.destroyForcibly().waitFor(KILLED_MOUNT_TIMEOUT)) {
+					LOG.warn("`mount` did not end within {}s of being killed after a failed mount attempt", KILLED_MOUNT_TIMEOUT.toSeconds());
 				}
+			} catch (InterruptedException e) {
+				interrupted = true;
+			}
+			try {
 				if (unmountAt != null) {
 					// a `mount` that timed out or was interrupted, or a mount the extension did not connect to, may have left a mount behind
 					FSKitMount.unmountIfMounted(processStarter, rendezvousDir, unmountAt, placement, true);
