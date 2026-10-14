@@ -108,7 +108,7 @@ The app:
 
 `isSupported()` is true on macOS 27 or later with an `aarch64` JVM, unless the JVM runs from an app that embeds no extension whose `FSShortName` is the type to mount. Outside an app, as in tests or an IDE, it is true, and so it is when `libFSKitNioSupport.dylib` cannot be loaded. It looks into the app bundle only. Asking FSKit takes too long for this check, so an extension that macOS has not registered counts as well.
 
-macOS installs the extension switched off. A mount then opens System Settings at General > Login Items & Extensions > File System Extensions and fails with a message that asks to switch the extension on and try again. Once it is on, the next mount works, without restarting the app.
+macOS installs the extension switched off. A mount then opens System Settings at General > Login Items & Extensions > File System Extensions and fails with `org.cryptomator.frontend.fskit.mount.ExtensionSwitchedOffException`, a `MountFailedException`. Its message asks to switch the extension on and try again. The module exports no package, so an app recognizes this exception by its class name. Once the extension is on, the next mount works, without restarting the app.
 
 ## Mirroring test
 

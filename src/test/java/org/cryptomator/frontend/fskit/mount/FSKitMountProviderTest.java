@@ -525,8 +525,10 @@ public class FSKitMountProviderTest {
 			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
 			Mockito.when(extensionCheck.openSettings()).thenReturn(true);
 
-			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+			ExtensionSwitchedOffException e = Assertions.assertThrowsExactly(ExtensionSwitchedOffException.class, () -> builder().mount());
 
+			// Cryptomator matches this fully qualified name as a string
+			Assertions.assertEquals("org.cryptomator.frontend.fskit.mount.ExtensionSwitchedOffException", e.getClass().getName());
 			Assertions.assertTrue(e.getMessage().contains("System Settings > General > Login Items & Extensions > File System Extensions, which has been opened"), e.getMessage());
 			Mockito.verify(extensionCheck).openSettings();
 			Assertions.assertEquals(List.of(), commands);
@@ -539,7 +541,7 @@ public class FSKitMountProviderTest {
 			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
 			Mockito.when(extensionCheck.openSettings()).thenReturn(false);
 
-			MountFailedException e = Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+			ExtensionSwitchedOffException e = Assertions.assertThrowsExactly(ExtensionSwitchedOffException.class, () -> builder().mount());
 
 			Assertions.assertTrue(e.getMessage().contains("System Settings > General > Login Items & Extensions > File System Extensions, which could not be opened"), e.getMessage());
 			Assertions.assertEquals(List.of(), commands);
@@ -1201,7 +1203,7 @@ public class FSKitMountProviderTest {
 		public void testExtensionSwitchedOff() {
 			Mockito.when(extensionCheck.status("cryptomatorfs")).thenReturn(Status.DISABLED);
 
-			Assertions.assertThrows(MountFailedException.class, () -> builder().mount());
+			Assertions.assertThrowsExactly(ExtensionSwitchedOffException.class, () -> builder().mount());
 
 			Assertions.assertEquals(List.of(), volumeMounts);
 			Assertions.assertEquals(List.of(), operations);

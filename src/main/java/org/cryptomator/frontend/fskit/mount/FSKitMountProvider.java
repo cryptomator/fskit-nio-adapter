@@ -45,7 +45,7 @@ import static org.cryptomator.integrations.mount.MountCapability.WHEN_TERMINATED
  * <p>
  * The provider mounts at a chosen existing directory with {@code /sbin/mount -F}. Without a mount point, FSKit mounts the volume in {@code /Volumes}. That needs an app that embeds the extension and holds the entitlement {@code com.apple.developer.fskit.mount}.
  * <p>
- * An app installs its extension switched off. Mounting with the extension switched off opens System Settings at File System Extensions and fails with a message that asks to switch it on and try again.
+ * An app installs its extension switched off. Mounting with the extension switched off opens System Settings at File System Extensions and fails with {@link ExtensionSwitchedOffException}, whose message asks to switch it on and try again.
  *
  * @see <a href="https://developer.apple.com/documentation/fskit">FSKit documentation</a>
  */
@@ -272,7 +272,7 @@ public class FSKitMountProvider implements MountService {
 			switch (status) {
 				case DISABLED -> {
 					boolean opened = extensionCheck.openSettings();
-					throw new MountFailedException("The FSKit extension is switched off. Switch it on in System Settings > General > Login Items & Extensions > File System Extensions, which " + (opened ? "has been opened" : "could not be opened") + ", and try again.");
+					throw new ExtensionSwitchedOffException("The FSKit extension is switched off. Switch it on in System Settings > General > Login Items & Extensions > File System Extensions, which " + (opened ? "has been opened" : "could not be opened") + ", and try again.");
 				}
 				case FAILED -> LOG.warn("Mounting without knowing whether the FSKit extension is switched on");
 				default -> {
