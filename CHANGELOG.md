@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.3.1...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.4.0...HEAD)
+
+No changes yet.
+
+
+## [0.4.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.4.0) - 2026-10-14
 ### Added
 * `org.cryptomator.frontend.fskit.mount.ExtensionSwitchedOffException`, the `MountFailedException` that `mount()` throws while the FSKit extension is switched off, so that an app can tell this failure apart by the exception's class name. Its message is unchanged
 
