@@ -24,7 +24,7 @@ import java.util.Scanner;
 /**
  * Test programs to mirror existing directories or a vault.
  * <p>
- * The FSKit extension must be installed and enabled, see the README.
+ * The test host app must be installed and its extension enabled, see the README.
  */
 public class MirroringFSKitMountTest {
 

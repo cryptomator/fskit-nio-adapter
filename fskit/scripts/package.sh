@@ -21,17 +21,19 @@
 #                         register but cannot mount.
 #   HOST_BUNDLE_ID        bundle identifier of the host app (default: org.cryptomator.fskit.host).
 #                         The extension's identifier is this plus ".extension".
-#   FS_TYPE_NAME          file system type name, as passed to `mount -t` (default: cryptomatorfs)
+#   FS_TYPE_NAME          file system type name, as passed to `mount -t` (default: the property
+#                         fskit.test.fsType of pom.xml)
 #   SKIP_SWIFT=1          skip swift build
 #
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 FSKIT_DIR="${SCRIPT_DIR:h}"
+REPO_ROOT="${FSKIT_DIR:h}"
 BUILD_DIR="$FSKIT_DIR/build"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 HOST_BUNDLE_ID="${HOST_BUNDLE_ID:-org.cryptomator.fskit.host}"
-FS_TYPE_NAME="${FS_TYPE_NAME:-cryptomatorfs}"
+FS_TYPE_NAME="${FS_TYPE_NAME:-$(xmllint --xpath "/*[local-name()='project']/*[local-name()='properties']/*[local-name()='fskit.test.fsType']/text()" "$REPO_ROOT/pom.xml")}"
 DEFAULT_PROFILE="$FSKIT_DIR/Bundle/FSKitNioExtension.provisionprofile"
 if [[ -z "${PROVISIONING_PROFILE:-}" && -f "$DEFAULT_PROFILE" ]]; then
 	PROVISIONING_PROFILE="$DEFAULT_PROFILE"
@@ -61,6 +63,8 @@ BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $HOST_BUNDLE_ID.extension" "$APPEX/Contents/Info.plist"
+DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APPEX/Contents/Info.plist")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME (Dev)" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :EXAppExtensionAttributes:FSShortName $FS_TYPE_NAME" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :EXAppExtensionAttributes:FSPersonalities:CryptomatorFS:FSName $FS_TYPE_NAME" "$APPEX/Contents/Info.plist"
 

@@ -68,7 +68,7 @@ codesign --verify --deep --strict /Applications/FSKitNioHost.app  # must pass
 open /Applications/FSKitNioHost.app
 ```
 
-Then enable "Cryptomator FSKit File System Extension" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m | grep -i fskit` lists the extension once it is registered. macOS switches the extension off again when a reinstalled build has a changed `Info.plist`. A new bundle version alone, which the build takes from `pom.xml`, keeps it on.
+Then enable "Cryptomator FSKit File System Extension (Dev)" in System Settings > General > Login Items & Extensions > File System Extensions (in the "By Category" view). `pluginkit -m -i org.cryptomator.fskit.host.extension` lists the extension once it is registered. macOS switches the extension off again when a reinstalled build has a changed `Info.plist`. A new bundle version alone, which the build takes from `pom.xml`, keeps it on.
 
 For a file system type that no extension provides, `mount` exits with status 69 and `mount: Unable to invoke task`. With the extension disabled, it additionally prints `Module <bundle identifier> is disabled!`.
 
@@ -79,10 +79,12 @@ For a file system type that no extension provides, `mount` exits with status 69 
 | `CODESIGN_IDENTITY` | `-` (ad-hoc) | Signing identity |
 | `PROVISIONING_PROFILE` | `fskit/Bundle/FSKitNioExtension.provisionprofile` if present | Profile to embed into the extension |
 | `HOST_BUNDLE_ID` | `org.cryptomator.fskit.host` | Bundle identifier of the host app. The extension's is this plus `.extension`. |
-| `FS_TYPE_NAME` | `cryptomatorfs` | File system type name, as passed to `mount -t` |
+| `FS_TYPE_NAME` | `cryptomatordev`, from the property `fskit.test.fsType` of `pom.xml` | File system type name, as passed to `mount -t` |
 | `SKIP_SWIFT` | unset | Set to `1` to skip `swift build` |
 
-A build with a different `FS_TYPE_NAME` needs the JVM started with `-Dorg.cryptomator.frontend.fskit.fsType=<name>`.
+The published extension declares `cryptomatorfs`, the provider's default. The test host's extension declares a type of its own, so that an app that embeds the published extension, such as Cryptomator, cannot serve the test host's mounts. Its display name ends in "(Dev)", which tells the two extensions apart in System Settings.
+
+The smoke test mounts with the type the installed test host declares, the mirroring test with `fskit.test.fsType`. For a build with another `FS_TYPE_NAME`, pass `-Dfskit.test.fsType=<name>` to the mirroring test. Any other JVM needs `-Dorg.cryptomator.frontend.fskit.fsType=<name>`.
 
 ### Signing
 
@@ -97,7 +99,7 @@ An app that offers the provider embeds the extension. Next to the jar `org.crypt
 The app:
 
 1. Expands the zip.
-2. Places `FSKitNioExtension.appex` in its `Contents/Extensions`, with a `CFBundleIdentifier` that starts with its own and a dot. The extension's `FSShortName` must be the type the JVM mounts with. The zip declares `cryptomatorfs`, the default, and an app that sets `-Dorg.cryptomator.frontend.fskit.fsType` changes it to match.
+2. Places `FSKitNioExtension.appex` in its `Contents/Extensions`, with a `CFBundleIdentifier` that starts with its own and a dot. The extension's `FSShortName` must be the type the JVM mounts with. The zip declares `cryptomatorfs`, the default, and an app that sets `-Dorg.cryptomator.frontend.fskit.fsType` changes it to match. Of two enabled extensions that declare the same type, either can serve the other app's mounts, so a second build of an app, such as a beta, declares a type of its own.
 3. Embeds a provisioning profile for the extension's identifier that authorizes `com.apple.developer.fskit.fsmodule`, as `Contents/embedded.provisionprofile` of the extension.
 4. Signs the dylib in the jar, as notarization requires.
 5. Signs the extension with `fskit/Bundle/FSKitNioExtension.entitlements` plus `com.apple.application-identifier` and `com.apple.developer.team-identifier` from the profile, then signs the app. `codesign --deep` on the app re-signs the extension without its own entitlements. So any `--deep` pass comes before the extension is signed, and the app's last signing is without `--deep`.
@@ -112,7 +114,7 @@ macOS installs the extension switched off. A mount then opens System Settings at
 
 ## Mirroring test
 
-With the extension installed and enabled, `MirroringFSKitMountTest` mounts directories or a vault interactively. In either mode the JVM logs every request with its response at trace level.
+With the test host app installed and its extension enabled, `MirroringFSKitMountTest` mounts directories or a vault interactively. In either mode the JVM logs every request with its response at trace level.
 
 Mirror one or more directories (prompts for pairs of directory and mount point, and for read-only):
 
@@ -130,7 +132,7 @@ On a Mac without Swift tooling, add `-P'!fskit-native'` to either.
 
 ## Smoke test
 
-With the extension installed and enabled, and built with the default `FS_TYPE_NAME`, the smoke test mounts directories and a throwaway vault, works on them through the shell, and scans the JVM's log for failures:
+With the test host app installed and its extension enabled, the smoke test mounts directories and a throwaway vault, works on them through the shell, and scans the JVM's log for failures:
 
 ```
 fskit/scripts/smoke-test.sh

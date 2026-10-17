@@ -18,6 +18,8 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.build.jdk>25</project.build.jdk>
+        <!-- file system type of the test host's extension, built by fskit/scripts/package.sh. Not cryptomatorfs, so that an app that embeds the published extension cannot serve the test mounts. -->
+        <fskit.test.fsType>cryptomatordev</fskit.test.fsType>
 
         <!-- dependencies -->
         <integrations-api.version>1.10.0</integrations-api.version>
@@ -438,6 +440,7 @@
                                     <classpathScope>test</classpathScope>
                                     <arguments>
                                         <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                        <argument>-Dorg.cryptomator.frontend.fskit.fsType=${fskit.test.fsType}</argument>
                                         <argument>-classpath</argument>
                                         <classpath/>
                                         <argument>${mirror.mainClass}</argument>
@@ -475,6 +478,7 @@
                                     <classpathScope>test</classpathScope>
                                     <arguments>
                                         <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                        <argument>-Dorg.cryptomator.frontend.fskit.fsType=${fskit.test.fsType}</argument>
                                         <argument>-classpath</argument>
                                         <classpath/>
                                         <argument>${mirror.mainClass}</argument>

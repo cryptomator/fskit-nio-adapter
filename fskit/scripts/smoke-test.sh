@@ -4,8 +4,10 @@
 # directories and a throwaway vault on command, works on each volume through
 # the shell, and scans the JVM's log for failures the shell did not see.
 #
-# Needs macOS 27 and the extension, built with the default file system type
-# name, installed and enabled, see the README.
+# Needs macOS 27 and the test host app installed at
+# /Applications/FSKitNioHost.app with its extension enabled, see the README.
+# The volumes get the file system type that extension declares, and the
+# extension process that serves the first mount has to come from that app.
 #
 # Usage: smoke-test.sh [--stop-on-failure] [scenario ...]
 #
@@ -32,6 +34,9 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 FSKIT_DIR="${SCRIPT_DIR:h}"
 REPO_ROOT="${FSKIT_DIR:h}"
+INSTALLED_APPEX=/Applications/FSKitNioHost.app/Contents/Extensions/FSKitNioExtension.appex
+# relative to the appex
+EXTENSION_EXECUTABLE=Contents/MacOS/FSKitNioExtension
 SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only vault)
 # access needs a second account and joins the others only where SMOKE_OTHER_ACCOUNT names one
 OPT_IN_SCENARIOS=(access)
@@ -70,6 +75,10 @@ if (( ${SELECTED[(Ie)access]} )); then
 		echo "error: the scenario access needs SMOKE_OTHER_ACCOUNT to name a second account, not root, that sudo -n -u reaches without a password" >&2
 		exit 2
 	fi
+fi
+if ! FS_TYPE_NAME="$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSShortName" "$INSTALLED_APPEX/Contents/Info.plist" 2> /dev/null)"; then
+	echo "error: the test host app must be installed at ${INSTALLED_APPEX:h:h:h}, see the README" >&2
+	exit 2
 fi
 
 PROGRAM_PID=""
@@ -236,20 +245,20 @@ reply_is() {
 
 # --- the mount table ---
 
-# Prints "<source> on <mount point>" for every cryptomatorfs volume, split off a line of the mount table as MountTable.sourcesOfMountsAt does.
-cryptomatorfs_mounts() {
+# Prints "<source> on <mount point>" for every volume of the type FS_TYPE_NAME, split off a line of the mount table as MountTable.sourcesOfMountsAt does.
+fs_type_mounts() {
 	local line
 	/sbin/mount | while IFS= read -r line; do
-		if [[ "${line##* \(}" == cryptomatorfs,* ]]; then
+		if [[ "${line##* \(}" == "$FS_TYPE_NAME",* ]]; then
 			print -r -- "${line% \(*}"
 		fi
 	done
 }
 
-# Prints the source of the cryptomatorfs volume mounted at a mount point, if there is one.
+# Prints the source of the volume of the type FS_TYPE_NAME mounted at a mount point, if there is one.
 mounted_source() {
 	local mount entry="on ${1:A}"
-	cryptomatorfs_mounts | while IFS= read -r mount; do
+	fs_type_mounts | while IFS= read -r mount; do
 		if [[ "$mount" == *" $entry" ]]; then
 			print -r -- "${mount% $entry}"
 		fi
@@ -271,10 +280,10 @@ mount_options() {
 	done
 }
 
-# Prints the mount points of the cryptomatorfs volumes inside the work directory. The work directory is new for each run, so these are this run's volumes. A path with ".." in it does not count, so that no line of the mount table can lead the cleanup out of the work directory.
+# Prints the mount points of the volumes of the type FS_TYPE_NAME inside the work directory. The work directory is new for each run, so these are this run's volumes. A path with ".." in it does not count, so that no line of the mount table can lead the cleanup out of the work directory.
 own_mount_points() {
 	local mount mount_point
-	cryptomatorfs_mounts | while IFS= read -r mount; do
+	fs_type_mounts | while IFS= read -r mount; do
 		mount_point="${mount#* on }"
 		if [[ "$mount_point" == "${WORK_DIR:A}/"* && "$mount_point" == "${mount_point:a}" ]]; then
 			print -r -- "$mount_point"
@@ -284,18 +293,54 @@ own_mount_points() {
 
 # --- mounting and unmounting ---
 
+# Prints the PIDs of the extension processes, whichever app they come from. Each mount gets a process of its own.
+extension_pids() {
+	pgrep -f "${INSTALLED_APPEX:t}/$EXTENSION_EXECUTABLE" || true
+}
+
+# require_installed_extension [<PID> ...]: ends the script unless the extension processes that are not among the given PIDs all run from the installed test host app. Another copy of an extension that declares the same file system type, in another app or at another path, can serve the mounts instead.
+require_installed_extension() {
+	local pid executable
+	local -a pids_before=("$@") pids_after new_pids
+	# a mount can start more than one process
+	local -aU served_by
+	pids_after=($(extension_pids))
+	new_pids=(${pids_after:|pids_before})
+	if (( ${#new_pids} == 0 )); then
+		echo "error: the first mount started no extension process" >&2
+		exit 2
+	fi
+	for pid in $new_pids; do
+		executable="$(ps -o comm= -p "$pid")"
+		if [[ "$executable" != "$INSTALLED_APPEX/$EXTENSION_EXECUTABLE" ]]; then
+			served_by+=("${executable:-process $pid}")
+		fi
+	done
+	if (( ${#served_by} )); then
+		echo "error: the first mount was served by ${(j:, :)served_by}, not by $INSTALLED_APPEX/$EXTENSION_EXECUTABLE" >&2
+		exit 2
+	fi
+}
+
 # mount_volume <id> <plain|vault> <rw|ro> <backing directory> <mount point>: fails, having recorded the failure, unless the mount table confirms the volume. After a failure, nothing may be written to the mount point.
 mount_volume() {
 	local id="$1" mount_point="$5" source
+	local -a pids_before
 	mkdir -p "$mount_point"
+	if (( FIRST_MOUNT )); then
+		pids_before=($(extension_pids))
+	fi
 	request mount "$@"
 	if [[ "$REPLY_MARKER" != MOUNTED ]]; then
 		if (( FIRST_MOUNT )) && [[ "$REPLY_MESSAGE" == *"Unable to invoke task"* || "$REPLY_MESSAGE" == *"is disabled"* ]]; then
-			echo "error: the extension must be installed and enabled, see the README: $REPLY_MESSAGE" >&2
+			echo "error: the extension of the test host app, which declares the file system type $FS_TYPE_NAME, must be registered and enabled, see the README: $REPLY_MESSAGE" >&2
 			exit 2
 		fi
 		fail "$id is mounted" "$REPLY_MESSAGE"
 		return 1
+	fi
+	if (( FIRST_MOUNT )); then
+		require_installed_extension $pids_before
 	fi
 	FIRST_MOUNT=0
 	source="$(mounted_source "$mount_point")"
@@ -1195,7 +1240,7 @@ mkfifo -m 600 "$PROGRAM_STDIN" || exit 2
 : > "$PROGRAM_LOG" || exit 2
 echo "==> Starting SmokeMountMain"
 # the program writes its log and its replies to standard error
-(cd "$REPO_ROOT" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djava.io.tmpdir=$JVM_TMP" ./mvnw -B -q test -Pmirror -P'!fskit-native' -Dmirror.mainClass=org.cryptomator.frontend.fskit.mount.SmokeMountMain < "$PROGRAM_STDIN" > "$PROGRAM_OUT" 2> "$PROGRAM_LOG") &
+(cd "$REPO_ROOT" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djava.io.tmpdir=$JVM_TMP" ./mvnw -B -q test -Pmirror -P'!fskit-native' -Dfskit.test.fsType="$FS_TYPE_NAME" -Dmirror.mainClass=org.cryptomator.frontend.fskit.mount.SmokeMountMain < "$PROGRAM_STDIN" > "$PROGRAM_OUT" 2> "$PROGRAM_LOG") &
 PROGRAM_PID=$!
 exec 3> "$PROGRAM_STDIN" || exit 2
 if ! await_reply 120; then
