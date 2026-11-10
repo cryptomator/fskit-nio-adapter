@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.5.0...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.5.1...HEAD)
+
+No changes yet.
+
+
+## [0.5.1](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.5.1) - 2026-11-10
 ### Fixed
 * Directory listings that several processes read at once no longer end early without an error when macOS continues one without saying which listing it means, which made `find`, `cp -R` and backup tools miss entries. macOS itself still ends such a listing early now and then, see the README's known limitations
 
