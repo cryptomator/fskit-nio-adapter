@@ -56,12 +56,16 @@ struct InteropTests {
 		let names = try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 0, verifier: 0, wantAttributes: false))
 		#expect(names.verifier != 0)
 		#expect(!names.more)
-		#expect(names.entries.map(\.name).sorted() == [".", "..", "dir", "renamed.txt"])
+		#expect(names.entries.map(\.name) == [".", "..", "dir", "renamed.txt"])
 		let withAttributes = try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 0, verifier: 0, wantAttributes: true))
-		#expect(withAttributes.entries.map(\.name).sorted() == ["dir", "renamed.txt"])
+		#expect(withAttributes.entries.map(\.name) == ["dir", "renamed.txt"])
 		#expect(withAttributes.entries.first { $0.name == "renamed.txt" }?.attributes?.size == 3)
+		// a verifier the directory's names do not give
+		await #expect(throws: StatusError(status: EIO)) {
+			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 1, verifier: names.verifier &+ 100, wantAttributes: false))
+		}
 		await #expect(throws: StatusError(status: Messages.statusInvalidCookie)) {
-			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 1, verifier: names.verifier + 100, wantAttributes: false))
+			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 5, verifier: names.verifier, wantAttributes: false))
 		}
 
 		await #expect(throws: StatusError(status: ENOENT)) {
@@ -81,7 +85,7 @@ struct InteropTests {
 		let listing = try await client.request(CreateRequest(parentId: Self.root, name: "listing", type: .directory, mode: 0o755)).attributes.nodeId
 		let children = try await (0 ..< 10).asyncMap { try await client.request(CreateRequest(parentId: listing, name: "\($0)", type: .directory, mode: 0o755)).attributes.nodeId }
 		let listed = try await DirectoryLister(client: client).listAll(directory: listing, capacity: 4, counting: client)
-		#expect(listed.names.sorted() == ([".", ".."] + (0 ..< 10).map { "\($0)" }).sorted())
+		#expect(listed.names == [".", ".."] + (0 ..< 10).map { "\($0)" })
 		// the two calls that continue the first page are served from what the first call kept, and the last one finds the end
 		#expect(listed.requestsPerCall == [1, 0, 0, 1])
 		for (index, child) in children.enumerated() {

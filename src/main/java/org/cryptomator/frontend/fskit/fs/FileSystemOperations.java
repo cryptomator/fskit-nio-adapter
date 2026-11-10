@@ -79,6 +79,7 @@ import java.text.Normalizer;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -125,7 +126,7 @@ public class FileSystemOperations implements Closeable {
 		this.fileStore = Files.getFileStore(root);
 		this.posix = fileStore.supportsFileAttributeView(PosixFileAttributeView.class);
 		this.nodes = new NodeTable(root);
-		this.snapshots = new DirectorySnapshots(nodes);
+		this.snapshots = new DirectorySnapshots(nodes, listingBudget());
 		this.locks = new PathLocks(root);
 		this.eventLogOptOut = new EventLogOptOut(now());
 	}
@@ -271,10 +272,19 @@ public class FileSystemOperations implements Closeable {
 
 	private ReaddirResponse readdir(ReaddirRequest request) throws IOException {
 		return readingDirectory(request.nodeId(), directory -> {
-			// A listing that starts with attributes gets each entry's type with the attributes its pages read, so only one that starts without them reads the types with the listing.
-			DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? snapshots.add(directory.id, list(directory, !request.wantAttributes())) : snapshots.get(directory.id, request.verifier());
+			DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? null : snapshots.get(directory.id, request.verifier());
 			if (snapshot == null) {
-				throw new StatusException(Messages.STATUS_INVALID_COOKIE);
+				List<String> names = list(directory);
+				long verifier = DirectorySnapshots.verifierOf(names);
+				if (request.cookie() != 0) {
+					// the cache does not hold the listing this request continues. Its cookies mean the same only if the directory still holds the same names.
+					if (verifier != request.verifier()) {
+						LOG.warn("Unable to continue a listing of node {}: it is not cached, and the names the directory holds now do not give its verifier.", directory.id);
+						throw new StatusException(Errno.EIO);
+					}
+					LOG.debug("Restored a listing of node {}.", directory.id);
+				}
+				snapshot = snapshots.add(directory.id, verifier, names);
 			}
 			try {
 				return page(directory, snapshot, request);
@@ -285,21 +295,24 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	private ReaddirResponse page(Node directory, DirectorySnapshots.Snapshot snapshot, ReaddirRequest request) throws IOException {
-		int index = firstIndex(request, snapshot.entries().size());
+		List<String> names = snapshot.names();
+		int index = firstIndex(request, names.size());
 		List<DirectoryEntry> page = new ArrayList<>();
 		int capacity = ReaddirResponse.ENTRIES_CAPACITY;
-		for (; index < snapshot.entries().size(); index++) {
-			DirectorySnapshots.Entry entry = snapshot.entries().get(index);
-			capacity -= DirectoryEntry.maxEncodedLength(entry.name());
-			if (capacity < 0) {
+		for (; index < names.size(); index++) {
+			String name = names.get(index);
+			int length = DirectoryEntry.maxEncodedLength(name);
+			if (length > capacity) {
 				break;
 			}
-			DirectoryEntry resolved = resolve(directory, entry, index, request.wantAttributes());
+			DirectoryEntry resolved = resolve(directory, name, index, request.wantAttributes());
+			// an entry that vanished takes no room, so a page is empty only at the end of the listing
 			if (resolved != null) {
 				page.add(resolved);
+				capacity -= length;
 			}
 		}
-		return new ReaddirResponse(snapshot.verifier(), index < snapshot.entries().size(), page);
+		return new ReaddirResponse(snapshot.verifier(), index < names.size(), page);
 	}
 
 	private CreateResponse create(CreateRequest request) throws IOException {
@@ -336,7 +349,6 @@ public class FileSystemOperations implements Closeable {
 	 * @param channel The channel the entry was created with, or {@code null}
 	 */
 	private <R> R added(Path entry, NodeType type, int mode, long size, Node directory, @Nullable FileChannel channel, AddedReply<R> reply) {
-		snapshots.invalidate(directory.id);
 		Node node = hold(storedPathOrElse(entry), type, directory);
 		try (var _ = lockDataForWriting(node)) {
 			closeLeftoverChannel(node);
@@ -390,7 +402,6 @@ public class FileSystemOperations implements Closeable {
 						Files.delete(node.path);
 					}
 					nodes.unlink(node);
-					snapshots.invalidate(directory.id);
 					return new RemoveResponse(attributes, refreshAfterChange(directory, UnaryOperator.identity()), freeSpace());
 				}
 			}
@@ -471,9 +482,7 @@ public class FileSystemOperations implements Closeable {
 			}
 			// the backing file system decides which spelling it stores, so the name has to be read back
 			nodes.move(node, storedPathOrElse(target), destinationDirectory);
-			// listings of the moved directory and below it hold names, which stay valid, and are resolved against the directory's path when they are served
-			snapshots.invalidate(sourceDirectory.id);
-			snapshots.invalidate(destinationDirectory.id);
+			// listings of the moved directory and below it hold names, which are resolved against the directory's path when they are served
 			Attributes attributes = refreshAfterChange(node, last -> new Attributes(last.type(), last.mode(), last.size(), last.nodeId(), destinationDirectory.id, last.modified(), last.accessed(), last.created(), last.generation()));
 			return new RenameResponse(name(node), attributes, refreshAfterChange(sourceDirectory, UnaryOperator.identity()), refreshAfterChange(destinationDirectory, UnaryOperator.identity()), replaced != null ? replaced.attributes : null, freeSpace());
 		}
@@ -868,26 +877,24 @@ public class FileSystemOperations implements Closeable {
 	/* listings */
 
 	/**
-	 * @param withTypes Whether to read every entry's type, which takes a read of its attributes
+	 * @return "." and "..", then the names in the directory that the volume shows, in the order of their UTF-16 code units. The order must not depend on the backing store, since a listing that is taken again has to give the cookies of the first one the same meaning.
 	 */
-	private List<DirectorySnapshots.Entry> list(Node directory, boolean withTypes) throws IOException {
-		List<DirectorySnapshots.Entry> entries = new ArrayList<>();
+	private List<String> list(Node directory) throws IOException {
+		List<String> names = new ArrayList<>();
+		names.add(".");
+		names.add("..");
 		try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory.path)) {
 			for (Path child : stream) {
 				String name = child.getFileName().toString();
-				if (EventLogOptOut.takes(directory.id, name) || HiddenNames.contains(name)) {
-					continue;
-				}
-				try {
-					entries.add(new DirectorySnapshots.Entry(name, withTypes ? typeOf(readFileAttributes(child)) : null));
-				} catch (NoSuchFileException e) {
-					// vanished while listing
+				if (!EventLogOptOut.takes(directory.id, name) && !HiddenNames.contains(name)) {
+					names.add(name);
 				}
 			}
 		} catch (DirectoryIteratorException e) {
 			throw e.getCause();
 		}
-		return entries;
+		names.subList(FIRST_CHILD_INDEX, names.size()).sort(null);
+		return Collections.unmodifiableList(names);
 	}
 
 	/**
@@ -923,22 +930,22 @@ public class FileSystemOperations implements Closeable {
 		return request.wantAttributes() ? Math.max(index, FIRST_CHILD_INDEX) : index;
 	}
 
-	private @Nullable DirectoryEntry resolve(Node directory, DirectorySnapshots.Entry entry, int index, boolean wantAttributes) throws IOException {
+	/**
+	 * @return The entry of that name as it is now, or {@code null} if it vanished since the listing was taken. A listing holds no types: an entry may have been replaced by one of another type since.
+	 */
+	private @Nullable DirectoryEntry resolve(Node directory, String name, int index, boolean wantAttributes) throws IOException {
 		long nextCookie = index + 1;
 		if (index < FIRST_CHILD_INDEX) {
 			// the root is its own parent here, as FSKit expects of a volume's root
 			boolean self = index == 0 || directory.id == Messages.ROOT_NODE_ID;
-			return new DirectoryEntry(entry.name(), entry.type(), self ? directory.id : directory.parentId, nextCookie, null);
+			return new DirectoryEntry(name, NodeType.DIRECTORY, self ? directory.id : directory.parentId, nextCookie, null);
 		}
-		Path path = directory.path.resolve(entry.name());
-		if (!wantAttributes && entry.type() != null) {
-			return new DirectoryEntry(entry.name(), entry.type(), nodes.list(path, entry.type(), directory).id, nextCookie, null);
-		}
+		Path path = directory.path.resolve(name);
 		try (var _ = locks.sample(path)) {
 			BasicFileAttributes attributes = readFileAttributes(path);
 			Node node = nodes.list(path, typeOf(attributes), directory);
 			Attributes published = publish(node, attributes);
-			return new DirectoryEntry(entry.name(), published.type(), node.id, nextCookie, wantAttributes ? published : null);
+			return new DirectoryEntry(name, published.type(), node.id, nextCookie, wantAttributes ? published : null);
 		} catch (NoSuchFileException e) {
 			return null;
 		}
@@ -967,7 +974,7 @@ public class FileSystemOperations implements Closeable {
 				throw new StatusException(Errno.EIO);
 			}
 			if (!nodes.isHeld(node)) {
-				// a node that was only listed leaves the table with the last listing of its directory, which would drop its channel unclosed
+				// a node that was only listed leaves the table whenever the listings need room, which would drop its channel unclosed
 				throw new StatusException(Errno.ESTALE);
 			}
 			// a channel cannot be upgraded in place, so open one with the widened modes and swap it in
@@ -1154,6 +1161,13 @@ public class FileSystemOperations implements Closeable {
 
 	Node hold(Path storedPath, NodeType type, Node parent) {
 		return nodes.hold(storedPath, type, parent);
+	}
+
+	/**
+	 * @return The bytes the names of the cached listings and the nodes that were only listed may take together. Called from the constructor, so an override cannot use the fields of its class.
+	 */
+	long listingBudget() {
+		return Runtime.getRuntime().maxMemory() / 16;
 	}
 
 	/**

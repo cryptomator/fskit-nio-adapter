@@ -134,6 +134,19 @@ struct DirectoryListerTests {
 		#expect(second.names == Self.names(3 ..< 12))
 	}
 
+	@Test func aPageWithoutEntriesThatAnnouncesMoreFailsTheEnumeration() async throws {
+		let server = try ScriptedServer { frame in
+			Messages.frame(for: ReaddirResponse(verifier: Self.verifier, more: true, entries: []), opcode: .readdir, requestId: frame.requestId)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+		let lister = DirectoryLister(client: client)
+
+		await #expect(throws: StatusError(status: EIO)) {
+			try await lister.list(directory: Self.directory, cookie: 0, verifier: 0, capacity: 3)
+		}
+	}
+
 	@Test(arguments: ["another request", "another verifier", "attributes", "another directory"])
 	func aCallThatContinuesSomethingElseAsksTheServer(difference: String) async throws {
 		let requests = OSAllocatedUnfairLock(initialState: [ReaddirRequest]())

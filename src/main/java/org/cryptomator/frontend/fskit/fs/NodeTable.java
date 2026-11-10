@@ -11,6 +11,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,6 +30,9 @@ final class NodeTable {
 	private final Map<Path, Node> nodesByPath = new HashMap<>();
 	// FSKit sends a SYNC before every FORGET, so a sync that visited every node to find the few with a channel would make an unmount quadratic
 	private final Set<Node> nodesWithChannel = new HashSet<>();
+	// the nodes no lookup holds, by the id of their directory, so that they can be removed without visiting every node. The directory whose latest such node came longest ago comes first.
+	private final LinkedHashMap<Long, Set<Node>> unheldChildren = new LinkedHashMap<>();
+	private int unheldCount;
 	private long nextId = Messages.FIRST_ASSIGNED_NODE_ID;
 
 	NodeTable(Path root) {
@@ -101,8 +106,9 @@ final class NodeTable {
 	 * Returns the node of an entry the kernel is about to reference, and counts that reference.
 	 */
 	synchronized Node hold(Path storedPath, NodeType type, Node parent) {
-		Node node = list(storedPath, type, parent);
+		Node node = nodeOf(storedPath, type, parent);
 		node.lookups++;
+		setParent(node, parent);
 		return node;
 	}
 
@@ -110,12 +116,17 @@ final class NodeTable {
 	 * Returns the node of an entry that is merely reported in a listing.
 	 */
 	synchronized Node list(Path storedPath, NodeType type, Node parent) {
+		Node node = nodeOf(storedPath, type, parent);
+		setParent(node, parent);
+		return node;
+	}
+
+	private Node nodeOf(Path storedPath, NodeType type, Node parent) {
 		Node node = nodesByPath.computeIfAbsent(storedPath, path -> {
 			Node created = new Node(nextId++, parent.id, path, type);
 			nodesById.put(created.id, created);
 			return created;
 		});
-		node.parentId = parent.id;
 		node.type = type;
 		return node;
 	}
@@ -129,6 +140,7 @@ final class NodeTable {
 			if (node.id == Messages.ROOT_NODE_ID || node.lookups > 0 || node.forgotten) {
 				return;
 			}
+			untrack(node);
 			nodesById.remove(node.id, node);
 			nodesByPath.remove(node.path, node);
 			node.forgotten = true;
@@ -158,12 +170,36 @@ final class NodeTable {
 			n.path = storedPath.resolve(oldPath.relativize(n.path));
 			nodesByPath.put(n.path, n);
 		}
-		node.parentId = parent.id;
+		setParent(node, parent);
 	}
 
-	synchronized void removeUnheldChildren(long directoryId) {
-		List<Node> unheld = nodesById.values().stream().filter(n -> n.lookups == 0 && n.parentId == directoryId).toList();
-		unheld.forEach(this::remove);
+	/**
+	 * Removes nodes that exist only because a listing reported them, all of one directory at a time, until at least the given number is removed or only kept directories have any. Directories go in the order of their latest such node, the earliest first.
+	 *
+	 * @param keptDirectories The ids of the directories whose nodes stay
+	 * @return The number of nodes removed
+	 */
+	synchronized long removeUnheld(long count, Set<Long> keptDirectories) {
+		long removed = 0;
+		Iterator<Map.Entry<Long, Set<Node>>> directories = unheldChildren.entrySet().iterator();
+		while (removed < count && directories.hasNext()) {
+			Map.Entry<Long, Set<Node>> directory = directories.next();
+			if (!keptDirectories.contains(directory.getKey())) {
+				Set<Node> unheld = directory.getValue();
+				directories.remove();
+				unheldCount -= unheld.size();
+				removed += unheld.size();
+				unheld.forEach(this::remove);
+			}
+		}
+		return removed;
+	}
+
+	/**
+	 * @return The number of nodes that exist only because a listing reported them
+	 */
+	synchronized int unheldCount() {
+		return unheldCount;
 	}
 
 	/**
@@ -186,10 +222,35 @@ final class NodeTable {
 			nodesById.clear();
 			nodesByPath.clear();
 			nodesWithChannel.clear();
+			unheldChildren.clear();
+			unheldCount = 0;
+		}
+	}
+
+	private void setParent(Node node, Node parent) {
+		untrack(node);
+		node.parentId = parent.id;
+		// a node that left the table meanwhile, as one removed while its rename ran, stays out
+		if (node.lookups == 0 && !node.forgotten) {
+			Set<Node> siblings = unheldChildren.computeIfAbsent(node.parentId, _ -> new HashSet<>());
+			siblings.add(node);
+			unheldCount++;
+			unheldChildren.putLast(node.parentId, siblings);
+		}
+	}
+
+	private void untrack(Node node) {
+		Set<Node> siblings = unheldChildren.get(node.parentId);
+		if (siblings != null && siblings.remove(node)) {
+			unheldCount--;
+			if (siblings.isEmpty()) {
+				unheldChildren.remove(node.parentId);
+			}
 		}
 	}
 
 	private void remove(Node node) {
+		untrack(node);
 		nodesById.remove(node.id);
 		nodesByPath.remove(node.path, node);
 		nodesWithChannel.remove(node);

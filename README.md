@@ -148,7 +148,7 @@ The script's header lists its arguments, scenarios, environment and exit statuse
 
 ## Known limitations
 
-Observed on macOS 27.0.1 with JDK 26.
+Observed on macOS 27.0.1 and 27.2 with JDK 26.
 
 - Another account gets "Permission denied" on a mounted volume, but root reads and changes it like the user who mounted it. An account that can get to the mount point is not kept from everything:
   - It can enter the volume's root and a directory the mounting user has accessed, though not list them. While it stays there, the volume can only be unmounted by force.
@@ -174,6 +174,9 @@ Observed on macOS 27.0.1 with JDK 26.
 - On a plain directory, creating an entry or looking one up by name for the first time takes longer the more entries its directory holds, because the JDK lists that directory to find the name as it is stored. With 5,000 files in one directory, creating them takes 14 s and `ls -l` 9 s, against 8 s and 2 s on a vault.
 - A FIFO or a socket in the mounted `Path` is shown as a regular file. Opening the socket fails with "Input/output error". Opening the FIFO waits until a process opens it for writing in the mounted `Path` itself, not through the volume. Removing the FIFO or renaming a directory above it waits for that writer as well. The rest of the volume stays usable meanwhile.
 - `rm` of a name that another process renames at the same moment can report success although nothing is removed: the entry keeps its new name.
+- A listing in progress holds the names its directory had when the listing started. An entry created or renamed in the directory meanwhile is missing from it under its new name, and one removed meanwhile is left out.
+- The JVM keeps the names of listed directories in memory, within a sixteenth of its heap per volume, and beyond that drops the listings used least recently. On a vault, a directory of 200,000 files with names of 26 characters fits into the share of a 512 MiB heap: its names take about 17 MiB, and listing it took up to 53 MiB of that heap. A directory whose names exceed that share is kept while it is listed and read again whenever a caller returns to it after listing another directory.
+- When a listing was dropped and its directory holds other names by the time the listing continues, the continuation fails with "Input/output error". `find` and `cp -R` print nothing for a failed listing and leave out the rest of that directory. A tool that removes entries while it walks a tree can meet this in a directory whose names exceed the share of the heap for listings. On a vault served with that share cut down, `bfs -delete` left such a directory half removed. `/usr/bin/find -delete` and `rm -rf` removed it.
 - Nothing else may modify the mounted `Path` while it is mounted.
 - The mounted `Path` must not hold two names that differ only in Unicode normalization.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.

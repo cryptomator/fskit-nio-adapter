@@ -92,6 +92,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -105,7 +106,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -181,6 +181,31 @@ public class FileSystemOperationsTest {
 
 	private List<String> names(ReaddirResponse page) {
 		return page.entries().stream().map(DirectoryEntry::name).toList();
+	}
+
+	/**
+	 * @return The names of the given page and of every page after it, to the end of its listing
+	 */
+	private List<String> namesToEnd(long nodeId, ReaddirResponse page, boolean wantAttributes) {
+		List<String> names = new ArrayList<>(names(page));
+		while (page.more()) {
+			page = readdir(nodeId, page.entries().getLast().nextCookie(), page.verifier(), wantAttributes);
+			names.addAll(names(page));
+		}
+		return names;
+	}
+
+	/**
+	 * Replaces the operations by ones whose cache of listings has no room. It then keeps a listing only while a page is built from it or while it is the one used last, and removes the nodes a page listed as soon as the page is done.
+	 */
+	private void serveWithoutListingBudget(Path root) throws IOException {
+		ops.close();
+		ops = new HookedOperations(root, false) {
+			@Override
+			long listingBudget() {
+				return 0;
+			}
+		};
 	}
 
 	private Path backing(String name, String content) throws IOException {
@@ -553,6 +578,21 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("file.txt", response.name());
 			Assertions.assertEquals(backingNames(), List.of(response.name()));
 			Assertions.assertEquals(file, lookup(ROOT, response.name()).nodeId());
+		}
+
+		@Test
+		@DisplayName("a listing that continues after an entry was renamed to a case variant of itself serves the name it started with, which stays absent to a lookup")
+		public void testListingAcrossRenameToOwnCaseVariant() {
+			long file = lookup(ROOT, "File.txt").nodeId();
+			long verifier = readdir(ROOT, 0, 0, false).verifier();
+			ok(new RenameRequest(file, ROOT, "File.txt", ROOT, "file.txt"), RenameResponse.class);
+
+			// the store finds the renamed entry under the old spelling
+			Assertions.assertEquals(List.of("File.txt"), names(readdir(ROOT, 2, verifier, false)));
+
+			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "File.txt"));
+			Assertions.assertEquals(file, lookup(ROOT, "file.txt").nodeId());
+			Assertions.assertEquals(file, getattr(file).nodeId());
 		}
 
 		@Test
@@ -1267,6 +1307,48 @@ public class FileSystemOperationsTest {
 			long file = create(ROOT, name, NodeType.FILE).nodeId();
 			write(file, 0, content);
 			return file;
+		}
+
+		/**
+		 * Creates enough files to need more than one page.
+		 *
+		 * @return Their names in the order of a listing
+		 */
+		private List<String> createManyFiles() throws IOException {
+			List<String> names = new ArrayList<>();
+			for (int i = 0; i < 400; i++) {
+				String name = "x".repeat(120) + i;
+				Files.createFile(vault.getPath("/" + name));
+				names.add(name);
+			}
+			return names.stream().sorted().toList();
+		}
+
+		@Test
+		@DisplayName("a listing is sorted by name, and one in progress shows the names it started with after a create")
+		public void testListingAcrossCreate() throws IOException {
+			List<String> expected = createManyFiles();
+			ReaddirResponse first = readdir(ROOT, 0, 0, true);
+			Assertions.assertTrue(first.more());
+
+			create(ROOT, "created.txt", NodeType.FILE);
+
+			Assertions.assertEquals(expected, namesToEnd(ROOT, first, true));
+		}
+
+		@Test
+		@DisplayName("a listing the cache dropped continues where it was")
+		public void testRestoredListing() throws IOException {
+			serveWithoutListingBudget(vault.getPath("/"));
+			long other = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			List<String> expected = new ArrayList<>(createManyFiles());
+			expected.addFirst("dir");
+			ReaddirResponse first = readdir(ROOT, 0, 0, true);
+			Assertions.assertTrue(first.more());
+
+			readdir(other, 0, 0, false);
+
+			Assertions.assertEquals(expected, namesToEnd(ROOT, first, true));
 		}
 
 		@Test
@@ -2238,98 +2320,192 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("cookie 0 starts a new listing whatever verifier is sent, and no verifier is 0")
-		public void testCookieZero() throws IOException {
-			long first = readdir(ROOT, 0, 0, false).verifier();
-			backing("file.txt", "");
-			ReaddirResponse second = readdir(ROOT, 0, first, false);
-			ReaddirResponse third = readdir(ROOT, 0, 4711, false);
+		@DisplayName("after . and .. a listing is sorted by name in the order of the code units")
+		public void testSorted() throws IOException {
+			// "#x" and "-x" sort before "." in code units, so they show that "." and ".." lead by position, not by sorting
+			for (String name : List.of("b", "\u20ac", "a.b", "-x", "Z", "a", "#x", "a b")) {
+				backing(name, "");
+			}
 
-			Assertions.assertNotEquals(0, first);
-			Assertions.assertNotEquals(0, second.verifier());
-			Assertions.assertNotEquals(first, second.verifier());
-			Assertions.assertNotEquals(second.verifier(), third.verifier());
-			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(second));
+			Assertions.assertEquals(List.of(".", "..", "#x", "-x", "Z", "a", "a b", "a.b", "b", "\u20ac"), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals(List.of("#x", "-x", "Z", "a", "a b", "a.b", "b", "\u20ac"), names(readdir(ROOT, 0, 0, true)));
 		}
 
 		@Test
-		@DisplayName("a stale verifier or a cookie beyond the listing yields the invalid-cookie status")
+		@DisplayName("cookie 0 lists whatever verifier is sent, with the same verifier for the same names and another one for others, and no verifier is 0")
+		public void testCookieZero() throws IOException {
+			long first = readdir(ROOT, 0, 0, false).verifier();
+			long again = readdir(ROOT, 0, 4711, false).verifier();
+			Path file = backing("file.txt", "");
+			ReaddirResponse added = readdir(ROOT, 0, first, false);
+			Files.delete(file);
+			long removed = readdir(ROOT, 0, added.verifier(), false).verifier();
+
+			Assertions.assertNotEquals(0, first);
+			Assertions.assertNotEquals(0, added.verifier());
+			Assertions.assertEquals(first, again);
+			Assertions.assertNotEquals(first, added.verifier());
+			Assertions.assertEquals(first, removed);
+			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(added));
+		}
+
+		@Test
+		@DisplayName("a cookie beyond the listing yields the invalid-cookie status, and a verifier that the directory's names do not give yields EIO")
 		public void testInvalidCookie() throws IOException {
 			backing("file.txt", "");
 			long other = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long verifier = readdir(ROOT, 0, 0, false).verifier();
 
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, verifier + 1, false));
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, 0, false));
 			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 5, verifier, false));
 			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, -1, verifier, false));
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(other, 1, verifier, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 1, verifier + 1, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 1, 0, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(other, 1, verifier, false));
 			Assertions.assertEquals(List.of(), readdir(ROOT, 4, verifier, false).entries());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
 		}
 
 		@Test
-		@DisplayName("create, symlink and remove invalidate the listings of their directory, rename those of its two directories")
-		public void testInvalidation() {
+		@DisplayName("a listing in progress shows the names it started with after a create, a symlink, a remove and a rename in its directory, and leaves out what is gone")
+		public void testListingAcrossChanges() {
 			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
-			long file = create(directory, "file.txt", NodeType.FILE).nodeId();
-
-			long rootVerifier = readdir(ROOT, 0, 0, false).verifier();
-			long verifier = readdir(directory, 0, 0, false).verifier();
-			create(directory, "created.txt", NodeType.FILE);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
-			readdir(ROOT, 1, rootVerifier, false);
-
-			verifier = readdir(directory, 0, 0, false).verifier();
-			ok(new SymlinkRequest(directory, "link", "file.txt"), SymlinkResponse.class);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
-			readdir(ROOT, 1, rootVerifier, false);
-
-			verifier = readdir(directory, 0, 0, false).verifier();
-			ok(new RemoveRequest(file, directory, "file.txt"), RemoveResponse.class);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
-			readdir(ROOT, 1, rootVerifier, false);
-
 			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
-			rootVerifier = readdir(ROOT, 0, 0, false).verifier();
-			verifier = readdir(directory, 0, 0, false).verifier();
-			long otherVerifier = readdir(other, 0, 0, false).verifier();
-			ok(new RenameRequest(lookup(directory, "created.txt").nodeId(), directory, "created.txt", other, "renamed.txt"), RenameResponse.class);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory, 1, verifier, false));
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(other, 1, otherVerifier, false));
-			readdir(ROOT, 1, rootVerifier, false);
-		}
-
-		@Test
-		@DisplayName("holds at most 16 listings and drops the one that was paged through least recently")
-		public void testListingCap() {
-			long first = readdir(ROOT, 0, 0, false).verifier();
-			long second = readdir(ROOT, 0, 0, false).verifier();
-			for (int i = 0; i < 14; i++) {
-				readdir(ROOT, 0, 0, false);
+			Map<String, Long> files = new HashMap<>();
+			for (String name : List.of("moved", "removed", "renamed", "stays")) {
+				files.put(name, create(directory, name, NodeType.FILE).nodeId());
 			}
-			readdir(ROOT, 1, first, false);
+			long verifier = readdir(directory, 0, 0, false).verifier();
 
-			readdir(ROOT, 0, 0, false);
+			create(directory, "created", NodeType.FILE);
+			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			ok(new SymlinkRequest(directory, "link", "stays"), SymlinkResponse.class);
+			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			ok(new RemoveRequest(files.get("removed"), directory, "removed"), RemoveResponse.class);
+			Assertions.assertEquals(List.of("moved", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			ok(new RenameRequest(files.get("renamed"), directory, "renamed", directory, "new name"), RenameResponse.class);
+			Assertions.assertEquals(List.of("moved", "stays"), names(readdir(directory, 2, verifier, false)));
+			ok(new RenameRequest(files.get("moved"), directory, "moved", other, "moved"), RenameResponse.class);
 
-			readdir(ROOT, 1, first, false);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 1, second, false));
+			ReaddirResponse continued = readdir(directory, 2, verifier, false);
+			Assertions.assertEquals(List.of("stays"), names(continued));
+			Assertions.assertEquals(verifier, continued.verifier());
+			Assertions.assertEquals(List.of(".", "..", "created", "link", "new name", "stays"), names(readdir(directory, 0, 0, false)));
 		}
 
 		@Test
-		@DisplayName("invalidating a directory's listings releases the nodes that were only listed")
-		public void testInvalidationReleasesListedNodes() throws IOException {
+		@DisplayName("a listing continues with the same entries after 17 other directories were listed")
+		public void testListingAcrossOtherListings() {
+			List<Long> others = new ArrayList<>();
+			for (int i = 0; i < 17; i++) {
+				others.add(create(ROOT, "dir" + i, NodeType.DIRECTORY).nodeId());
+			}
+			ReaddirResponse first = readdir(ROOT, 0, 0, false);
+
+			others.forEach(other -> readdir(other, 0, 0, false));
+
+			ReaddirResponse continued = readdir(ROOT, 2, first.verifier(), false);
+			Assertions.assertEquals(first.verifier(), continued.verifier());
+			Assertions.assertEquals(first.entries().subList(2, 19), continued.entries());
+		}
+
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("a listing the cache dropped continues with the same verifier and cookies, and reads only the entries of the pages it serves")
+		@ValueSource(booleans = {false, true})
+		public void testRestoredListing(boolean wantAttributes) throws IOException {
+			serveWithoutListingBudget(root);
+			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
+			createManyEntries();
+			List<Path> read = new ArrayList<>();
+			ops.beforeReadingAttributes = read::add;
+			ReaddirResponse first = readdir(ROOT, 0, 0, wantAttributes);
+			int children = first.entries().size() - (wantAttributes ? 0 : 2);
+			Assertions.assertEquals(children, read.size());
+			Assertions.assertTrue(first.more());
+
+			readdir(other, 0, 0, false);
+			read.clear();
+			ReaddirResponse second = readdir(ROOT, first.entries().getLast().nextCookie(), first.verifier(), wantAttributes);
+
+			Assertions.assertEquals(first.verifier(), second.verifier());
+			Assertions.assertEquals(first.entries().getLast().nextCookie() + 1, second.entries().getFirst().nextCookie());
+			Assertions.assertEquals(second.entries().size(), read.size());
+			Assertions.assertTrue(names(first).getLast().compareTo(names(second).getFirst()) < 0);
+			readdir(other, 0, 0, false);
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, ENTRIES + 4, first.verifier(), wantAttributes));
+		}
+
+		@Test
+		@DisplayName("a listing the cache dropped yields EIO once its directory holds other names, and no entries")
+		public void testDroppedListingOfChangedDirectory() throws IOException {
+			serveWithoutListingBudget(root);
+			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
+			backing("file.txt", "");
+			long verifier = readdir(ROOT, 0, 0, false).verifier();
+			readdir(other, 0, 0, false);
+
+			create(ROOT, "created.txt", NodeType.FILE);
+
+			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 2, verifier, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 4, verifier, false));
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("a dropped listing whose directory cannot be listed again yields the status of that failure, and continues once it can")
+		public void testRestoreOfUnreadableDirectory() throws IOException {
+			serveWithoutListingBudget(root);
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			backing("dir/file.txt", "");
+			long verifier = readdir(directory, 0, 0, false).verifier();
+			readdir(ROOT, 0, 0, false);
+			Files.setPosixFilePermissions(root.resolve("dir"), PosixFilePermissions.fromString("-wx------"));
+			try {
+				Assumptions.assumeFalse(Files.isReadable(root.resolve("dir")), "permissions do not apply to this user");
+
+				assertStatus(Errno.EACCES, new ReaddirRequest(directory, 2, verifier, false));
+			} finally {
+				Files.setPosixFilePermissions(root.resolve("dir"), PosixFilePermissions.fromString("rwx------"));
+			}
+
+			Assertions.assertEquals(List.of("file.txt"), names(readdir(directory, 2, verifier, false)));
+		}
+
+		@Test
+		@DisplayName("a node that was only listed is gone once the cache needs its room, and one that was looked up stays")
+		public void testListedNodesAreReleased() throws IOException {
+			serveWithoutListingBudget(root);
 			backing("listed.txt", "");
 			backing("held.txt", "");
 			long held = lookup(ROOT, "held.txt").nodeId();
 			long link = ok(new SymlinkRequest(ROOT, "link", "held.txt"), SymlinkResponse.class).attributes().nodeId();
-			long listed = readdir(ROOT, 0, 0, false).entries().stream().filter(entry -> entry.name().equals("listed.txt")).findFirst().orElseThrow().nodeId();
-			Assertions.assertEquals(listed, getattr(listed).nodeId());
 
-			create(ROOT, "created.txt", NodeType.FILE);
+			long listed = readdir(ROOT, 0, 0, false).entries().stream().filter(entry -> entry.name().equals("listed.txt")).findFirst().orElseThrow().nodeId();
 
 			assertStatus(Errno.ESTALE, new GetattrRequest(listed));
 			Assertions.assertEquals(held, getattr(held).nodeId());
 			Assertions.assertEquals(link, getattr(link).nodeId());
+		}
+
+		@ParameterizedTest(name = "{0} replaced by {1}")
+		@DisplayName("a listing that continues at a name whose entry was replaced by one of another type reports the new entry with its type and its node")
+		@CsvSource({"FILE, DIRECTORY", "DIRECTORY, FILE"})
+		public void testReplacedByOtherType(NodeType before, NodeType after) {
+			long replaced = create(ROOT, "x", before).nodeId();
+			long verifier = readdir(ROOT, 0, 0, false).verifier();
+			ok(new RemoveRequest(replaced, ROOT, "x"), RemoveResponse.class);
+			long replacement = create(ROOT, "x", after).nodeId();
+
+			ReaddirResponse continued = readdir(ROOT, 1, verifier, false);
+
+			Assertions.assertEquals(List.of( //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
+					new DirectoryEntry("x", after, replacement, 3, null)), continued.entries());
+			if (after == NodeType.DIRECTORY) {
+				Assertions.assertEquals(List.of(".", ".."), names(readdir(replacement, 0, 0, false)));
+			} else {
+				ok(new OpenRequest(replacement, READ), OpenResponse.class);
+				Assertions.assertEquals("", read(replacement, 0, 10));
+			}
 		}
 
 		@Test
@@ -2344,32 +2520,40 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of(), ops.openedChannels);
 		}
 
-		@Test
-		@DisplayName("an entry that vanished since the listing was taken is left out of a page with attributes")
-		public void testVanishedEntry() throws IOException {
+		@ParameterizedTest(name = "wantAttributes = {0}")
+		@DisplayName("an entry that vanished since the listing was taken is left out")
+		@ValueSource(booleans = {false, true})
+		public void testVanishedEntry(boolean wantAttributes) throws IOException {
 			backing("stays.txt", "");
 			Path vanishing = backing("vanishes.txt", "");
 			long verifier = readdir(ROOT, 0, 0, false).verifier();
 
 			Files.delete(vanishing);
-			ReaddirResponse page = readdir(ROOT, 2, verifier, true);
+			ReaddirResponse page = readdir(ROOT, 2, verifier, wantAttributes);
 
 			Assertions.assertEquals(List.of("stays.txt"), names(page));
 			Assertions.assertFalse(page.more());
 		}
 
 		@Test
-		@DisplayName("an entry that vanishes while the listing is taken is left out")
-		public void testVanishingWhileListing() throws IOException {
-			backing("stays.txt", "");
-			backing("vanishes.txt", "");
-			ops.beforeReadingAttributes = path -> {
-				if (path.endsWith("vanishes.txt")) {
-					throw new NoSuchFileException(path.toString());
-				}
-			};
+		@DisplayName("a page whose entries have all vanished goes on to the later ones, and is empty only at the end of the listing")
+		public void testVanishedPage() throws IOException {
+			createManyEntries();
+			ReaddirResponse first = readdir(ROOT, 0, 0, true);
+			ReaddirResponse second = readdir(ROOT, first.entries().getLast().nextCookie(), first.verifier(), true);
+			Assertions.assertTrue(first.more());
 
-			Assertions.assertEquals(List.of(".", "..", "stays.txt"), names(readdir(ROOT, 0, 0, false)));
+			for (String name : names(first)) {
+				Files.delete(root.resolve(name));
+			}
+			Assertions.assertEquals(second.entries().getFirst().nextCookie(), readdir(ROOT, 2, first.verifier(), true).entries().getFirst().nextCookie());
+
+			for (String name : backingNames()) {
+				Files.delete(root.resolve(name));
+			}
+			ReaddirResponse end = readdir(ROOT, 2, first.verifier(), true);
+			Assertions.assertEquals(List.of(), end.entries());
+			Assertions.assertFalse(end.more());
 		}
 
 		@ParameterizedTest(name = "wantAttributes = {0}")
@@ -2385,22 +2569,6 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(Set.of(root.resolve("file.txt"), root.resolve("dir")), Set.copyOf(read));
 			Assertions.assertEquals(2, read.size());
-		}
-
-		@Test
-		@DisplayName("a listing that started with attributes reports each entry's type on a page without them")
-		public void testTypesAfterListingWithAttributes() throws IOException {
-			backing("file.txt", "");
-			Files.createDirectory(root.resolve("dir"));
-			long verifier = readdir(ROOT, 0, 0, true).verifier();
-
-			ReaddirResponse page = readdir(ROOT, 2, verifier, false);
-
-			Assertions.assertEquals(Set.of("file.txt", "dir"), Set.copyOf(names(page)));
-			for (DirectoryEntry entry : page.entries()) {
-				Assertions.assertEquals(lookup(ROOT, entry.name()).type(), entry.type());
-				Assertions.assertNull(entry.attributes());
-			}
 		}
 
 		@ParameterizedTest(name = "wantAttributes = {0}")
@@ -2907,7 +3075,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of(new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), 3, file)), withAttributes.entries());
 			Assertions.assertEquals(List.of(), readdir(directory.nodeId(), 3, withAttributes.verifier(), true).entries());
 			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), 4, withAttributes.verifier(), true));
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), 3, withAttributes.verifier() + 1, true));
+			assertStatus(Errno.EIO, new ReaddirRequest(directory.nodeId(), 3, withAttributes.verifier() + 1, true));
 		}
 
 		@Test
@@ -3499,35 +3667,30 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a listing whose page is being built is not dropped to make room for others, and the ids on the page stay valid")
+		@DisplayName("while a page is built, the nodes it has listed stay although other listings need their room, so a lookup meanwhile finds the id the page reports")
 		public void testPinnedListing() throws Exception {
+			serveWithoutListingBudget(root);
 			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
-			for (String name : List.of("a", "b", "c")) {
-				backing("d/" + name, "");
+			long e = create(ROOT, "e", NodeType.DIRECTORY).nodeId();
+			long f = create(ROOT, "f", NodeType.DIRECTORY).nodeId();
+			for (String name : List.of("d/a", "d/b", "d/c", "e/x", "f/y")) {
+				backing(name, "");
 			}
 			CountDownLatch sampling = new CountDownLatch(1);
 			CountDownLatch release = new CountDownLatch(1);
-			AtomicInteger reads = new AtomicInteger();
-			HookedOperations.Hook blocking = HookedOperations.blocking(sampling, release);
-			// the second entry, so that one was reported before
-			ops.afterReadingAttributes = path -> {
-				if (path.getParent().equals(root.resolve("d")) && reads.incrementAndGet() == 2) {
-					blocking.run(path);
-				}
-			};
+			// the second entry, so that one was listed before
+			ops.beforeReadingAttributes = blockingOnce(root.resolve("d/b"), sampling, release);
 
 			Future<Response> listing = async(new ReaddirRequest(directory, 0, 0, true));
 			Assertions.assertTrue(sampling.await(5, TimeUnit.SECONDS));
-			for (int i = 0; i < 16; i++) {
-				readdir(ROOT, 0, 0, false);
-			}
+			readdir(e, 0, 0, false);
+			readdir(f, 0, 0, false);
+			long found = lookup(directory, "a").nodeId();
 			release.countDown();
 
 			ReaddirResponse page = done(listing, ReaddirResponse.class);
-			Assertions.assertEquals(3, page.entries().size());
-			for (DirectoryEntry entry : page.entries()) {
-				Assertions.assertEquals(entry.nodeId(), getattr(entry.nodeId()).nodeId());
-			}
+			Assertions.assertEquals(List.of("a", "b", "c"), names(page));
+			Assertions.assertEquals(found, page.entries().getFirst().nodeId());
 		}
 
 		@Test
@@ -3563,9 +3726,14 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals("new", read(second, 0, 10));
 		}
 
-		@Test
+		@ParameterizedTest(name = "listings are cached: {0}")
 		@DisplayName("random operations from many threads neither deadlock nor fail unexpectedly, and leave every linked node at an entry of its type")
-		public void testStress() throws Exception {
+		@ValueSource(booleans = {true, false})
+		public void testStress(boolean cached) throws Exception {
+			if (!cached) {
+				// so that restored listings and the removal of listed nodes run next to lookups and changes
+				serveWithoutListingBudget(root);
+			}
 			long[] directories = {create(ROOT, "d0", NodeType.DIRECTORY).nodeId(), create(ROOT, "d1", NodeType.DIRECTORY).nodeId()};
 			create(directories[0], "sub", NodeType.DIRECTORY);
 			List<String> names = List.of("a", "b", "c", "sub");
@@ -3573,9 +3741,10 @@ public class FileSystemOperationsTest {
 			List<Future<?>> workers = new ArrayList<>();
 			for (int i = 0; i < 16; i++) {
 				Random random = new Random(i);
+				Map<Long, Long> verifiers = new HashMap<>();
 				workers.add(threads.submit(() -> {
 					while (System.nanoTime() < deadline) {
-						step(random, directories, names);
+						step(random, directories, names, verifiers);
 					}
 					return null;
 				}));
@@ -3593,12 +3762,15 @@ public class FileSystemOperationsTest {
 			}
 		}
 
-		private void step(Random random, long[] directories, List<String> names) {
+		/**
+		 * @param verifiers The verifier of the listing this worker started last in each directory
+		 */
+		private void step(Random random, long[] directories, List<String> names, Map<Long, Long> verifiers) {
 			long directory = directories[random.nextInt(directories.length)];
 			String name = names.get(random.nextInt(names.size()));
 			switch (random.nextInt(4)) {
 				case 0 -> ops.handle(new LookupRequest(directory, name));
-				case 1 -> listAll(directory);
+				case 1 -> list(random, directory, verifiers);
 				case 2 -> ops.handle(new CreateRequest(directory, name, random.nextBoolean() ? NodeType.FILE : NodeType.DIRECTORY, 0755));
 				default -> {
 					if (ops.handle(new LookupRequest(directory, name)) instanceof LookupResponse found) {
@@ -3615,10 +3787,15 @@ public class FileSystemOperationsTest {
 			}
 		}
 
-		private void listAll(long directory) {
-			Response response = ops.handle(new ReaddirRequest(directory, 0, 0, true));
-			while (response instanceof ReaddirResponse page && page.more()) {
-				response = ops.handle(new ReaddirRequest(directory, page.entries().getLast().nextCookie(), page.verifier(), true));
+		/**
+		 * Starts a listing, or continues the one this worker started last in the directory, which other workers may have changed since.
+		 */
+		private void list(Random random, long directory, Map<Long, Long> verifiers) {
+			Long verifier = verifiers.get(directory);
+			if (verifier != null && random.nextBoolean()) {
+				ops.handle(new ReaddirRequest(directory, 2 + random.nextInt(3), verifier, random.nextBoolean()));
+			} else if (ops.handle(new ReaddirRequest(directory, 0, 0, random.nextBoolean())) instanceof ReaddirResponse page) {
+				verifiers.put(directory, page.verifier());
 			}
 		}
 	}

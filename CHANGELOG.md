@@ -6,8 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.4.0...HEAD)
+### Changed
+* A volume lists the entries of a directory sorted by name, where it listed them in the order of the backing store
 
-No changes yet.
+### Fixed
+* Directory listings no longer end early without an error while other directories are listed or the directory changes, which made `find`, `cp -R` and backup tools miss entries ([cryptomator/cryptomator#4390](https://github.com/cryptomator/cryptomator/issues/4390))
 
 
 ## [0.4.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.4.0) - 2026-10-14

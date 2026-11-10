@@ -610,6 +610,58 @@ create_files() {
 	done
 }
 
+# create_tree <directory>: creates the directory with a directory B in it that holds 1,442 files and 300 directories that each hold a file and two empty directories. With the directory itself, these are 2,644 entries.
+create_tree() {
+	local i
+	mkdir -p "$1/B" || return 1
+	for i in {1..1442}; do
+		: > "$1/B/file-$i" || return 1
+	done
+	for i in {1..300}; do
+		mkdir -p "$1/B/dir-$i/empty-1" "$1/B/dir-$i/empty-2" && : > "$1/B/dir-$i/file" || return 1
+	done
+}
+
+# count_tree <directory>: prints the number of entries in the directory and below it, the directory included. Descends into each directory as soon as its parent's listing names it and continues that listing afterwards, as a walk that goes depth-first without reading a directory to its end does. find interleaves listings as well, but not on every run.
+count_tree() {
+	/usr/bin/perl -e '
+		sub count {
+			my ($directory) = @_;
+			opendir(my $handle, $directory) or die "opendir $directory: $!\n";
+			my $count = 1;
+			$! = 0;
+			while (defined(my $name = readdir($handle))) {
+				next if $name eq "." || $name eq "..";
+				$count += -d "$directory/$name" && !-l "$directory/$name" ? count("$directory/$name") : 1;
+				$! = 0;
+			}
+			die "readdir $directory: $!\n" if $!;
+			return $count;
+		}
+		print count($ARGV[0]), "\n";
+	' "$1"
+}
+
+# list_across_changes <directory> <other directory> ...: reads 50 names of the directory, creates a file in it and lists the other directories, then reads the directory to its end. Prints the number of names it read.
+list_across_changes() {
+	/usr/bin/perl -e '
+		my ($directory, @others) = @ARGV;
+		opendir(my $handle, $directory) or die "opendir: $!\n";
+		my $count = 0;
+		for (1 .. 50) {
+			defined(readdir($handle)) or die "the listing ended after $count names\n";
+			$count++;
+		}
+		open(my $file, ">", "$directory/created-meanwhile") or die "create: $!\n";
+		close($file) or die "close: $!\n";
+		system("/bin/sh", "-c", q{ls "$@" > /dev/null}, "sh", @others) == 0 or die "ls failed\n";
+		$! = 0;
+		$count++ while defined(readdir($handle));
+		die "readdir: $!\n" if $!;
+		print "$count\n";
+	' "$@"
+}
+
 # touch_extreme <date> <file> [<seconds>]: sets a date the volume may refuse. touch may fail with "Invalid argument". If it succeeds, stat must show the date, or <seconds>, the time the date is known to be cut down to.
 touch_extreme() {
 	local output shown
@@ -838,6 +890,9 @@ listing() {
 	check "the backing directory holds all of them" test "$(ls "$BACKING/many" | wc -l)" -eq 5000
 	check "ls lists each of them once" lists_backing_names "$MNT/many" "$BACKING/many"
 	check "ls -l lists each of them once" lists_backing_names "$MNT/many" "$BACKING/many" -l
+	check "20 other directories are created" mkdir -p "$MNT/others/"{1..20}
+	# a listing in progress shows the directory as it was when the listing started: the 5,000 files, . and ..
+	check "a listing that continues after a create in its directory and listings of 20 others has every name it started with" test "$(list_across_changes "$MNT/many" "$MNT/others/"{1..20})" = 5002
 	check "rm -r removes the directory" rm -r "$MNT/many"
 	check "the backing directory holds it no longer" test ! -e "$BACKING/many"
 	unmount_volume "$SCENARIO" "$MNT"
@@ -1122,6 +1177,10 @@ vault() {
 	check "ln -s creates a link in the directory" ln -s ../file.txt "$MNT/dir/link"
 	check "readlink shows its target" test "$($READ_LINK "$MNT/dir/link")" = ../file.txt
 	check "cat reads a file through it" test "$(cat "$MNT/dir/link")" = replacement
+	check "a tree of 2,644 entries is created" create_tree "$MNT/t2"
+	check "a walk that lists other directories between the pages of a listing finds every entry" test "$(count_tree "$MNT/t2")" = 2644
+	check "rm -rf removes the tree" /bin/rm -rf "$MNT/t2"
+	check "the volume holds it no longer" test ! -e "$MNT/t2"
 	check "cp writes a file larger than 10 MiB" cp "$large" "$MNT/large.bin"
 	# no operation may come between the write and df, since every reply refreshes the free space the volume reports
 	check "df shows the backing store's free space right after the write" shows_space_of "$MNT" "$BACKING"

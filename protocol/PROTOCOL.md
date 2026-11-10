@@ -42,7 +42,7 @@ A response's control section starts with `i32 status`:
 | --- | --- |
 | 0 | success; the fields listed for the response follow |
 | > 0 | failure; a macOS `errno` value. No further fields follow. |
-| -1 | invalid directory cookie or verifier. No further fields follow. |
+| -1 | invalid directory cookie. No further fields follow. |
 
 Only requests to `WRITE` and responses to `READ` have a payload.
 
@@ -108,7 +108,7 @@ Notes:
 - `REMOVE` and `RENAME`: the `attributes` of an item that is removed or replaced are the ones read just before the change. `replaced` is set when the rename replaced an item the client was given a node id for.
 - `RENAME`: a rename that replaces nothing, or replaces a file with a file, is done in one step. Where the backing file system cannot do that, as across its file stores, the reply is `EXDEV` (18) and nothing has changed. A rename that replaces a directory or a symbolic link, or moves either onto an existing item, removes the target first. A directory cannot be renamed into itself or below itself (`EINVAL`, 22).
 - `OPEN` of a directory or a symbolic link succeeds without opening anything. A `READ` or `WRITE` of a symbolic link is answered with `ENOTSUP` (45).
-- `OPEN`, `READ` and `WRITE` of a file other than `no_log` need a successful `LOOKUP`, `CREATE` or `SYMLINK` response for it that the client has not forgotten yet. For a file known only from a listing they are answered with `ESTALE` (70), since the server keeps its node only while it holds a listing of its directory.
+- `OPEN`, `READ` and `WRITE` of a file other than `no_log` need a successful `LOOKUP`, `CREATE` or `SYMLINK` response for it that the client has not forgotten yet. For a file known only from a listing they are answered with `ESTALE` (70), since the server drops the node of such a file whenever it needs the room for listings.
 - `CLOSE`: `keptModes` are the modes that stay open. With none kept, the server closes the item's channel.
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.
@@ -132,12 +132,15 @@ bool   hasAttributes
        attributes      if hasAttributes
 ```
 
-- A cookie is an index into a listing held by the server and is opaque to the client. Entries 0 and 1 of every listing are `.` and `..`. The root directory's `..` carries the root's own id. With `wantAttributes` set, the server skips those two.
-- Cookie 0 always starts a new listing and returns a new verifier, whatever verifier was sent. Any other cookie must come with the verifier of a listing the server still holds.
-- A verifier is never 0.
+- A listing is the names a directory held when it was listed. A cookie is an index into a listing and is opaque to the client. Entries 0 and 1 of every listing are `.` and `..`. The other names follow, sorted by their UTF-16 code units. The root directory's `..` carries the root's own id. With `wantAttributes` set, the server skips those two.
+- A listing's verifier is a fingerprint of its names: listings of the same names have the same verifier, and listings of other names have another. A verifier is never 0.
+- Cookie 0 lists the directory, whatever verifier was sent. Any other cookie continues the listing of that directory whose verifier the request carries.
+- The server keeps a listing while it has room for it. An entry created since the directory was listed is missing from its listing.
+- A page reads each entry's type and attributes when it is built, and leaves out an entry that is gone.
+- To continue a listing it no longer keeps, the server lists the directory again. If the names give the verifier of the request, the listing continues with the same cookies. If they give another, the directory has changed, and the request is answered with `EIO` (5).
 - A cookie equal to the listing's length is the normal end: the response has status 0, no entries and `more` unset.
-- A larger cookie, or a non-zero cookie with an unknown verifier, yields status -1.
-- A page holds no more entries than fit into the control limit, and may hold fewer. `more` tells whether entries follow the last one of the page.
+- A larger cookie yields status -1.
+- A page holds no more entries than fit into the control limit, and may hold fewer. `more` tells whether entries follow the last one of the page. A response without entries has `more` unset.
 
 ## Manifest
 

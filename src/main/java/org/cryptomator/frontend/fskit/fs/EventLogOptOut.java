@@ -49,7 +49,7 @@ final class EventLogOptOut {
 	// below the ids that NodeTable assigns
 	private static final long DIRECTORY_ID = 3;
 	private static final long FILE_ID = 4;
-	private static final long VERIFIER = 1;
+	private static final long VERIFIER = DirectorySnapshots.verifierOf(List.of(".", "..", FILE_NAME));
 	private static final FreeSpace UNKNOWN_FREE_SPACE = new FreeSpace(Messages.UNKNOWN_USABLE_BYTES, 0);
 
 	private final Attributes directory;
@@ -113,7 +113,8 @@ final class EventLogOptOut {
 				new DirectoryEntry("..", NodeType.DIRECTORY, Messages.ROOT_NODE_ID, 2, null), //
 				new DirectoryEntry(FILE_NAME, NodeType.FILE, FILE_ID, 3, request.wantAttributes() ? file : null));
 		if (request.cookie() != 0 && request.verifier() != VERIFIER) {
-			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
+			// as for a stored directory whose names differ from those the verifier stands for
+			throw new StatusException(Errno.EIO);
 		}
 		return new ReaddirResponse(VERIFIER, false, entries.subList(FileSystemOperations.firstIndex(request, entries.size()), entries.size()));
 	}

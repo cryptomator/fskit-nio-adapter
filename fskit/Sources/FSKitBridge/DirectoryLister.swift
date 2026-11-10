@@ -84,8 +84,12 @@ public final class DirectoryLister: Sendable {
 				}
 				cookie = entries[index].nextCookie
 			}
-			guard more, !entries.isEmpty else {
+			guard more else {
 				return verifier
+			}
+			// the server leaves `more` unset on a page without entries. Going on would ask for the same page again, and ending here would cut the listing short as if it were complete.
+			guard !entries.isEmpty else {
+				throw StatusError(status: EIO)
 			}
 		}
 	}
