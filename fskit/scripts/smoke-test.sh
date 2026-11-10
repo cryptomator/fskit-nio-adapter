@@ -622,6 +622,70 @@ create_tree() {
 	done
 }
 
+# create_directories <directory> <count> <files>: creates the directory with that many directories in it, each with that many files
+create_directories() {
+	local i
+	mkdir "$1" || return 1
+	for i in {1..$2}; do
+		create_files "$1/dir-$i" "$3" || return 1
+	done
+}
+
+# walk_in_parallel <directory> <walkers> <rounds> <files>: in every round, that many find list the files below the directory at once. Fails if a find fails or reports an error, or if a walk names a file twice, more files than there are, or fewer than 99 % of them. macOS itself ends a listing early now and then while several processes list a directory, which leaves a walk a few names short. The number of such walks is left in the file short-walks of the scenario's directory.
+walk_in_parallel() {
+	local directory="$1" output="$SCENARIO_DIR/walks" round walker pid duplicates
+	integer walkers=$2 rounds=$3 files=$4 names short=0 failed=0
+	typeset -a pids
+	mkdir -p "$output" || return 1
+	for round in {1..$rounds}; do
+		pids=()
+		for walker in {1..$walkers}; do
+			/usr/bin/find "$directory" -type f > "$output/$walker.out" 2> "$output/$walker.err" &
+			pids+=($!)
+		done
+		for pid in $pids; do
+			wait $pid || failed=1
+		done
+		for walker in {1..$walkers}; do
+			names=$(wc -l < "$output/$walker.out") || return 1
+			duplicates="$(sort "$output/$walker.out" | uniq -d)" || return 1
+			if [[ -s "$output/$walker.err" ]]; then
+				print -r -- "round $round, walk $walker: $(head -n 3 "$output/$walker.err")"
+				failed=1
+			elif [[ -n "$duplicates" ]]; then
+				print -r -- "round $round, walk $walker named a file twice"
+				failed=1
+			elif (( names > files || names * 100 < files * 99 )); then
+				print -r -- "round $round, walk $walker named $names of $files files"
+				failed=1
+			elif (( names < files )); then
+				short+=1
+			fi
+		done
+	done
+	print -r -- "$short" > "$SCENARIO_DIR/short-walks" || return 1
+	return $failed
+}
+
+# continuations_without_verifier <offset>: reads the requests BridgeSession traced from that offset of the program's log on. Fails if a READDIR that continues a listing without its verifier failed, or if there is no READDIR at all. Leaves the number of such requests that were served in the file served-without-verifier of the scenario's directory.
+continuations_without_verifier() {
+	tail -c +$(( $1 + 1 )) "$PROGRAM_LOG" | LC_ALL=C awk -v served_file="$SCENARIO_DIR/served-without-verifier" '
+		!/BridgeSession - ReaddirRequest\[/ { next }
+		{ listings++ }
+		!/ReaddirRequest\[nodeId=[0-9]+, cookie=[1-9-][0-9]*, verifier=0, / { next }
+		/ -> Failure\[/ { failed++; if (failed <= 3) print }
+		/ -> ReaddirResponse\[/ { served++ }
+		END {
+			if (!listings) {
+				print "the log shows no READDIR"
+				exit 1
+			}
+			print served + 0 > served_file
+			exit failed > 0
+		}
+	'
+}
+
 # count_tree <directory>: prints the number of entries in the directory and below it, the directory included. Descends into each directory as soon as its parent's listing names it and continues that listing afterwards, as a walk that goes depth-first without reading a directory to its end does. find interleaves listings as well, but not on every run.
 count_tree() {
 	/usr/bin/perl -e '
@@ -1181,6 +1245,17 @@ vault() {
 	check "a walk that lists other directories between the pages of a listing finds every entry" test "$(count_tree "$MNT/t2")" = 2644
 	check "rm -rf removes the tree" /bin/rm -rf "$MNT/t2"
 	check "the volume holds it no longer" test ! -e "$MNT/t2"
+	integer directories=40 files=200 walkers=6 rounds=6 walks_start
+	check "$directories directories of $files files are created" create_directories "$MNT/walked" $directories $files
+	# once the program has replied, the log holds every request served before
+	request sync "$SCENARIO"
+	walks_start=$REPLY_END
+	check "$walkers find that walk them at once, $rounds times over, each name every file once, or all but a few that macOS leaves out" walk_in_parallel "$MNT/walked" $walkers $rounds $(( directories * files ))
+	request sync "$SCENARIO"
+	# macOS continues a listing without its verifier now and then while several processes list one directory
+	check "no listing that was continued without its verifier failed" continuations_without_verifier $walks_start
+	print -r -- "        $(cat "$SCENARIO_DIR/short-walks" 2> /dev/null || echo "?") of $(( walkers * rounds )) walks came back short, $(cat "$SCENARIO_DIR/served-without-verifier" 2> /dev/null || echo "?") continuations without a verifier were served"
+	check "rm -rf removes the directories" /bin/rm -rf "$MNT/walked"
 	check "cp writes a file larger than 10 MiB" cp "$large" "$MNT/large.bin"
 	# no operation may come between the write and df, since every reply refreshes the free space the volume reports
 	check "df shows the backing store's free space right after the write" shows_space_of "$MNT" "$BACKING"

@@ -109,11 +109,11 @@ final class EventLogOptOut {
 
 	private ReaddirResponse list(ReaddirRequest request) throws StatusException {
 		List<DirectoryEntry> entries = List.of( //
-				new DirectoryEntry(".", NodeType.DIRECTORY, DIRECTORY_ID, 1, null), //
-				new DirectoryEntry("..", NodeType.DIRECTORY, Messages.ROOT_NODE_ID, 2, null), //
-				new DirectoryEntry(FILE_NAME, NodeType.FILE, FILE_ID, 3, request.wantAttributes() ? file : null));
-		if (request.cookie() != 0 && request.verifier() != VERIFIER) {
-			// as for a stored directory whose names differ from those the verifier stands for
+				new DirectoryEntry(".", NodeType.DIRECTORY, DIRECTORY_ID, DirectorySnapshots.cookieOf(VERIFIER, 1), null), //
+				new DirectoryEntry("..", NodeType.DIRECTORY, Messages.ROOT_NODE_ID, DirectorySnapshots.cookieOf(VERIFIER, 2), null), //
+				new DirectoryEntry(FILE_NAME, NodeType.FILE, FILE_ID, DirectorySnapshots.cookieOf(VERIFIER, 3), request.wantAttributes() ? file : null));
+		if (request.cookie() != 0 && !DirectorySnapshots.continues(request, VERIFIER)) {
+			// as for a stored directory whose names no longer give the listing the request continues
 			throw new StatusException(Errno.EIO);
 		}
 		return new ReaddirResponse(VERIFIER, false, entries.subList(FileSystemOperations.firstIndex(request, entries.size()), entries.size()));

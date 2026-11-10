@@ -60,12 +60,14 @@ struct InteropTests {
 		let withAttributes = try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 0, verifier: 0, wantAttributes: true))
 		#expect(withAttributes.entries.map(\.name) == ["dir", "renamed.txt"])
 		#expect(withAttributes.entries.first { $0.name == "renamed.txt" }?.attributes?.size == 3)
-		// a verifier the directory's names do not give
+		// a verifier the directory's names do not give, which has the tag the cookie carries
 		await #expect(throws: StatusError(status: EIO)) {
-			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 1, verifier: names.verifier &+ 100, wantAttributes: false))
+			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: names.entries[0].nextCookie, verifier: names.verifier ^ 1, wantAttributes: false))
 		}
+		// beyond the end of its listing
+		let beyond = try #require(names.entries.last).nextCookie + 1
 		await #expect(throws: StatusError(status: Messages.statusInvalidCookie)) {
-			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: 5, verifier: names.verifier, wantAttributes: false))
+			try await client.request(ReaddirRequest(nodeId: Self.root, cookie: beyond, verifier: names.verifier, wantAttributes: false))
 		}
 
 		await #expect(throws: StatusError(status: ENOENT)) {
@@ -88,6 +90,11 @@ struct InteropTests {
 		#expect(listed.names == [".", ".."] + (0 ..< 10).map { "\($0)" })
 		// the two calls that continue the first page are served from what the first call kept, and the last one finds the end
 		#expect(listed.requestsPerCall == [1, 0, 0, 1])
+		// FSKit now and then continues a listing without its verifier, which the cookie then stands in for
+		let firstPage = try await client.request(ReaddirRequest(nodeId: listing, cookie: 0, verifier: 0, wantAttributes: false))
+		let continued = try await client.request(ReaddirRequest(nodeId: listing, cookie: firstPage.entries[5].nextCookie, verifier: 0, wantAttributes: false))
+		#expect(continued.entries.map(\.name) == (4 ..< 10).map { "\($0)" })
+		#expect(continued.verifier == firstPage.verifier)
 		for (index, child) in children.enumerated() {
 			_ = try await client.request(RemoveRequest(nodeId: child, parentId: listing, name: "\(index)"))
 		}

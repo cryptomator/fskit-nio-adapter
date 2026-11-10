@@ -1,5 +1,6 @@
 package org.cryptomator.frontend.fskit.fs;
 
+import org.cryptomator.frontend.fskit.protocol.Messages.ReaddirRequest;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +20,7 @@ import java.util.stream.Collectors;
 /**
  * A cache of the directory listings that enumerations page through.
  * <p>
- * A listing is the names its directory held when it was taken, and its verifier is a fingerprint of them. So a listing the cache has dropped can be taken again: if the directory still gives the same verifier, every cookie means what it meant before. A change in a directory leaves its cached listings as they are: a listing in progress shows no entry created since, and leaves out an entry that is gone.
+ * A listing is the names its directory held when it was taken, and its verifier is a fingerprint of them. So a listing the cache has dropped can be taken again: if the directory still gives the same verifier, every cookie means what it meant before. A cookie carries a tag of its listing's verifier above its index, so that a request that continues a listing without its verifier, or with a verifier of another tag, still tells which listing it means. A change in a directory leaves its cached listings as they are: a listing in progress shows no entry created since, and leaves out an entry that is gone.
  * <p>
  * The cache keeps the names of its listings, and the nodes that exist only because a listing reported them, within a budget of bytes. Over it, it first removes such nodes and then drops the listings used least recently. A listing that a page is built from is pinned until the page is done. A pin keeps the listing, and the listed nodes of its directory, whose ids the page reports. The listing used most recently stays as well, whatever its size.
  * <p>
@@ -81,6 +82,47 @@ final class DirectorySnapshots {
 	}
 
 	/**
+	 * @return The tag that the cookies of a listing with that verifier carry: the verifier's upper 31 bits, or 1 if those are all 0. A tag is never 0, so a cookie without one names no listing. It takes 31 bits so that a cookie stays positive, which macOS hands back unchanged.
+	 */
+	static long tagOf(long verifier) {
+		long tag = verifier >>> 33;
+		return tag != 0 ? tag : 1;
+	}
+
+	/**
+	 * @param index Not negative
+	 * @return The cookie that names the entry at that index of the listing with that verifier, which is positive
+	 */
+	static long cookieOf(long verifier, int index) {
+		return tagOf(verifier) << 32 | index;
+	}
+
+	/**
+	 * @return The upper 32 bits of a cookie, which hold its listing's tag. A cookie whose upper bits are 0 or take more than 31 bits names no listing.
+	 */
+	static long tagIn(long cookie) {
+		return cookie >>> 32;
+	}
+
+	static long indexIn(long cookie) {
+		return cookie & 0xffffffffL;
+	}
+
+	/**
+	 * @return Whether the request's verifier tells which listing it continues, which it does if it is not 0 and has the tag of the request's cookie. Otherwise the cookie's tag tells it, since macOS now and then continues a listing without its verifier.
+	 */
+	static boolean namesListingByVerifier(ReaddirRequest request) {
+		return request.verifier() != 0 && tagOf(request.verifier()) == tagIn(request.cookie());
+	}
+
+	/**
+	 * @return Whether a request with a cookie other than 0 continues the listing with that verifier
+	 */
+	static boolean continues(ReaddirRequest request, long verifier) {
+		return namesListingByVerifier(request) ? request.verifier() == verifier : tagIn(request.cookie()) == tagOf(verifier);
+	}
+
+	/**
 	 * Takes a listing into the cache, whether it is new or one the cache had dropped.
 	 *
 	 * @param verifier The {@link #verifierOf(List) fingerprint} of the names
@@ -111,6 +153,19 @@ final class DirectorySnapshots {
 		pin(key);
 		evict();
 		return snapshot;
+	}
+
+	/**
+	 * @return The one listing of that directory whose verifier has that {@link #tagOf(long) tag}, pinned until it is {@link #unpin(Snapshot) unpinned}, or {@code null} if the cache holds none
+	 * @throws StatusException With EIO if the cache holds several, since the tag then does not tell which one is meant. None is pinned.
+	 */
+	synchronized @Nullable Snapshot getByTag(long directoryId, long tag) throws StatusException {
+		List<Key> tagged = snapshots.keySet().stream().filter(key -> key.directoryId() == directoryId && tagOf(key.verifier()) == tag).toList();
+		if (tagged.size() > 1) {
+			LOG.warn("Unable to continue a listing of node {}: {} cached listings have the tag of its cookie.", directoryId, tagged.size());
+			throw new StatusException(Errno.EIO);
+		}
+		return tagged.isEmpty() ? null : get(directoryId, tagged.getFirst().verifier());
 	}
 
 	synchronized void unpin(Snapshot snapshot) {

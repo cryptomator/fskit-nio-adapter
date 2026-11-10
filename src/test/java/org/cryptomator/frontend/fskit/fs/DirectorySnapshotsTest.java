@@ -88,6 +88,58 @@ public class DirectorySnapshotsTest {
 	}
 
 	@Test
+	@DisplayName("a tag is never 0 and takes at most 31 bits, and a cookie is positive and holds the tag above the index")
+	public void testTagAndCookie() {
+		Assertions.assertEquals(0x7fffffffL, DirectorySnapshots.tagOf(-1));
+		Assertions.assertEquals(0x40000000L, DirectorySnapshots.tagOf(Long.MIN_VALUE));
+		Assertions.assertEquals(3, DirectorySnapshots.tagOf(3L << 33 | 0x1ffffffffL));
+		// no bit set among those the tag takes
+		Assertions.assertEquals(1, DirectorySnapshots.tagOf(0x1ffffffffL));
+
+		Assertions.assertEquals(0x7fffffff00000007L, DirectorySnapshots.cookieOf(-1, 7));
+		Assertions.assertEquals(0x1_7fffffffL, DirectorySnapshots.cookieOf(1, Integer.MAX_VALUE));
+	}
+
+	@Test
+	@DisplayName("a listing is found by its tag in its own directory alone, and stays pinned until it is unpinned")
+	public void testGetByTag() throws StatusException {
+		Snapshot listing = add(snapshots, 10, "a");
+		snapshots.unpin(listing);
+		long tag = DirectorySnapshots.tagOf(listing.verifier());
+
+		Assertions.assertNull(snapshots.getByTag(11, tag));
+		Assertions.assertNull(snapshots.getByTag(10, tag ^ 2));
+		Assertions.assertSame(listing, snapshots.getByTag(10, tag));
+
+		snapshots.unpin(add(snapshots, 11, "b"));
+		snapshots.unpin(add(snapshots, 12, "c"));
+		Assertions.assertSame(listing, snapshots.get(10, listing.verifier()));
+
+		snapshots.unpin(listing);
+		snapshots.unpin(listing);
+		snapshots.unpin(add(snapshots, 13, "d"));
+		Assertions.assertNull(snapshots.get(10, listing.verifier()));
+	}
+
+	@Test
+	@DisplayName("two listings of one directory with the same tag yield EIO, and neither is pinned")
+	public void testGetByAmbiguousTag() {
+		long verifier = 5L << 33;
+		Snapshot first = snapshots.add(10, verifier, names("a"));
+		Snapshot second = snapshots.add(10, verifier | 1, names("b"));
+
+		StatusException failure = Assertions.assertThrows(StatusException.class, () -> snapshots.getByTag(10, 5));
+
+		Assertions.assertEquals(Errno.EIO, failure.status);
+		snapshots.unpin(first);
+		snapshots.unpin(second);
+		snapshots.unpin(add(snapshots, 11, "c"));
+		snapshots.unpin(add(snapshots, 12, "d"));
+		Assertions.assertNull(snapshots.get(10, verifier));
+		Assertions.assertNull(snapshots.get(10, verifier | 1));
+	}
+
+	@Test
 	@DisplayName("adding a listing the cache holds returns the held one, pinned once more")
 	public void testAddHeldListing() {
 		Snapshot held = add(snapshots, 10, "a");

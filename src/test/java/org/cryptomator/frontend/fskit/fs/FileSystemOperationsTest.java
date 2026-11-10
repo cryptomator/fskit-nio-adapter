@@ -588,7 +588,7 @@ public class FileSystemOperationsTest {
 			ok(new RenameRequest(file, ROOT, "File.txt", ROOT, "file.txt"), RenameResponse.class);
 
 			// the store finds the renamed entry under the old spelling
-			Assertions.assertEquals(List.of("File.txt"), names(readdir(ROOT, 2, verifier, false)));
+			Assertions.assertEquals(List.of("File.txt"), names(readdir(ROOT, DirectorySnapshots.cookieOf(verifier, 2), verifier, false)));
 
 			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "File.txt"));
 			Assertions.assertEquals(file, lookup(ROOT, "file.txt").nodeId());
@@ -1349,6 +1349,28 @@ public class FileSystemOperationsTest {
 			readdir(other, 0, 0, false);
 
 			Assertions.assertEquals(expected, namesToEnd(ROOT, first, true));
+		}
+
+		@ParameterizedTest(name = "dropped = {0}")
+		@DisplayName("a listing continued without its verifier goes on where it stopped, whether it is cached or was dropped")
+		@ValueSource(booleans = {false, true})
+		public void testContinuationWithoutVerifier(boolean dropped) throws IOException {
+			if (dropped) {
+				serveWithoutListingBudget(vault.getPath("/"));
+			}
+			long other = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			List<String> expected = new ArrayList<>(createManyFiles());
+			expected.addFirst("dir");
+			ReaddirResponse first = readdir(ROOT, 0, 0, true);
+			Assertions.assertTrue(first.more());
+
+			readdir(other, 0, 0, false);
+			ReaddirResponse second = readdir(ROOT, first.entries().getLast().nextCookie(), 0, true);
+
+			Assertions.assertEquals(first.verifier(), second.verifier());
+			List<String> listed = new ArrayList<>(names(first));
+			listed.addAll(namesToEnd(ROOT, second, true));
+			Assertions.assertEquals(expected, listed);
 		}
 
 		@Test
@@ -2224,17 +2246,19 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertFalse(page.more());
 			Assertions.assertEquals(List.of( //
-					new DirectoryEntry(".", NodeType.DIRECTORY, directory, 1, null), //
-					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
-					new DirectoryEntry("file.txt", NodeType.FILE, file, 3, null)), page.entries());
+					new DirectoryEntry(".", NodeType.DIRECTORY, directory, DirectorySnapshots.cookieOf(page.verifier(), 1), null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, DirectorySnapshots.cookieOf(page.verifier(), 2), null), //
+					new DirectoryEntry("file.txt", NodeType.FILE, file, DirectorySnapshots.cookieOf(page.verifier(), 3), null)), page.entries());
 		}
 
 		@Test
 		@DisplayName("the root's .. entry is the root itself")
 		public void testRootDotEntries() {
+			ReaddirResponse page = readdir(ROOT, 0, 0, false);
+
 			Assertions.assertEquals(List.of( //
-					new DirectoryEntry(".", NodeType.DIRECTORY, ROOT, 1, null), //
-					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null)), readdir(ROOT, 0, 0, false).entries());
+					new DirectoryEntry(".", NodeType.DIRECTORY, ROOT, DirectorySnapshots.cookieOf(page.verifier(), 1), null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, DirectorySnapshots.cookieOf(page.verifier(), 2), null)), page.entries());
 		}
 
 		@Test
@@ -2283,8 +2307,9 @@ public class FileSystemOperationsTest {
 			Assertions.assertTrue(pages > 1, "pages");
 			Assertions.assertEquals(expected.size(), listed.size());
 			Assertions.assertEquals(expected, Set.copyOf(listed));
-			Assertions.assertEquals(ENTRIES + 2, page.entries().getLast().nextCookie());
-			ReaddirResponse end = readdir(ROOT, ENTRIES + 2, verifier, wantAttributes);
+			long endCookie = DirectorySnapshots.cookieOf(verifier, ENTRIES + 2);
+			Assertions.assertEquals(endCookie, page.entries().getLast().nextCookie());
+			ReaddirResponse end = readdir(ROOT, endCookie, verifier, wantAttributes);
 			Assertions.assertEquals(List.of(), end.entries());
 			Assertions.assertFalse(end.more());
 		}
@@ -2313,7 +2338,7 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(listed, lookup(ROOT, "file.txt").nodeId());
 			ok(new ForgetRequest(listed, 1), ForgetResponse.class);
 
-			long relisted = readdir(ROOT, 2, page.verifier(), false).entries().getFirst().nodeId();
+			long relisted = readdir(ROOT, page.entries().get(1).nextCookie(), page.verifier(), false).entries().getFirst().nodeId();
 
 			Assertions.assertNotEquals(listed, relisted);
 			Assertions.assertEquals(relisted, lookup(ROOT, "file.txt").nodeId());
@@ -2350,19 +2375,110 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a cookie beyond the listing yields the invalid-cookie status, and a verifier that the directory's names do not give yields EIO")
+		@DisplayName("a cookie whose tag no listing of the directory has yields EIO, as does a verifier with the cookie's tag that the directory's names do not give, and an index beyond the listing yields the invalid-cookie status")
 		public void testInvalidCookie() throws IOException {
 			backing("file.txt", "");
 			long other = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
 			long verifier = readdir(ROOT, 0, 0, false).verifier();
 
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, 5, verifier, false));
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, -1, verifier, false));
-			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 1, verifier + 1, false));
-			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 1, 0, false));
-			assertStatus(Errno.EIO, new ReaddirRequest(other, 1, verifier, false));
-			Assertions.assertEquals(List.of(), readdir(ROOT, 4, verifier, false).entries());
+			for (long sent : List.of(verifier, 0L)) {
+				// without a tag, and with one that takes more than 31 bits
+				assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 1, sent, false));
+				assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 5, sent, false));
+				assertStatus(Errno.EIO, new ReaddirRequest(ROOT, -1, sent, false));
+				// with the listing's tag
+				assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 5), sent, false));
+				Assertions.assertEquals(List.of(), readdir(ROOT, DirectorySnapshots.cookieOf(verifier, 4), sent, false).entries());
+				// an index that is negative as an int
+				assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 0) | 0x80000000L, sent, false));
+				assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 0) | 0x80000000L, sent, true));
+			}
+			// another verifier with the cookie's tag
+			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 1), verifier ^ 1, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(other, DirectorySnapshots.cookieOf(verifier, 1), verifier, false));
+			assertStatus(Errno.EIO, new ReaddirRequest(other, DirectorySnapshots.cookieOf(verifier, 1), 0, false));
 			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@ParameterizedTest(name = "dropped = {0}, wantAttributes = {1}")
+		@DisplayName("a continuation without a verifier returns what one with the verifier returns, whether the listing is cached or was dropped")
+		@CsvSource({"false, false", "false, true", "true, false", "true, true"})
+		public void testContinuationWithoutVerifier(boolean dropped, boolean wantAttributes) throws IOException {
+			if (dropped) {
+				serveWithoutListingBudget(root);
+			}
+			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
+			createManyEntries();
+			ReaddirResponse first = readdir(ROOT, 0, 0, wantAttributes);
+			long cookie = first.entries().getLast().nextCookie();
+
+			// without a budget, a listing is dropped once another directory is listed
+			readdir(other, 0, 0, false);
+			ReaddirResponse withVerifier = readdir(ROOT, cookie, first.verifier(), wantAttributes);
+			readdir(other, 0, 0, false);
+			ReaddirResponse withoutVerifier = readdir(ROOT, cookie, 0, wantAttributes);
+
+			Assertions.assertTrue(first.more());
+			Assertions.assertEquals(first.verifier(), withoutVerifier.verifier());
+			Assertions.assertEquals(names(withVerifier), names(withoutVerifier));
+			Assertions.assertEquals(withVerifier.entries().stream().map(DirectoryEntry::nextCookie).toList(), withoutVerifier.entries().stream().map(DirectoryEntry::nextCookie).toList());
+		}
+
+		@ParameterizedTest(name = "dropped = {0}, with its verifier: {1}")
+		@DisplayName("a listing that was continued is released once the page is done, with the nodes the page listed, whether it was cached or had been dropped")
+		@CsvSource({"false, true", "false, false", "true, true", "true, false"})
+		public void testContinuedListingIsReleased(boolean dropped, boolean withVerifier) throws IOException {
+			serveWithoutListingBudget(root);
+			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
+			backing("listed.txt", "");
+			ReaddirResponse first = readdir(ROOT, 0, 0, false);
+			if (dropped) {
+				readdir(other, 0, 0, false);
+			}
+
+			ReaddirResponse continued = readdir(ROOT, first.entries().get(1).nextCookie(), withVerifier ? first.verifier() : 0, false);
+
+			Assertions.assertEquals(List.of("listed.txt", "other"), names(continued));
+			assertStatus(Errno.ESTALE, new GetattrRequest(continued.entries().getFirst().nodeId()));
+		}
+
+		@Test
+		@DisplayName("a continuation without a verifier, or with the verifier of a later listing of its directory, continues the listing its cookie came from")
+		public void testContinuationByCookie() throws IOException {
+			backing("a", "");
+			backing("c", "");
+			ReaddirResponse first = readdir(ROOT, 0, 0, false);
+			long cookie = first.entries().get(1).nextCookie();
+
+			backing("b", "");
+			Assertions.assertEquals(List.of("a", "c"), names(readdir(ROOT, cookie, 0, false)));
+			ReaddirResponse second = readdir(ROOT, 0, 0, false);
+
+			Assertions.assertNotEquals(DirectorySnapshots.tagOf(first.verifier()), DirectorySnapshots.tagOf(second.verifier()));
+			for (long sent : List.of(0L, second.verifier())) {
+				ReaddirResponse continued = readdir(ROOT, cookie, sent, false);
+				Assertions.assertEquals(first.verifier(), continued.verifier());
+				Assertions.assertEquals(List.of("a", "c"), names(continued));
+			}
+		}
+
+		@Test
+		@DisplayName("a continuation without a verifier yields EIO while two cached listings of its directory have its cookie's tag, and each still continues with its verifier")
+		public void testContinuationByAmbiguousCookie() {
+			long directory = create(ROOT, "dir", NodeType.DIRECTORY).nodeId();
+			// the listings of a directory that holds one or the other of these names have verifiers with the same tag
+			long file = create(directory, "f14518", NodeType.FILE).nodeId();
+			ReaddirResponse first = readdir(directory, 0, 0, false);
+			ok(new RenameRequest(file, directory, "f14518", directory, "f58085"), RenameResponse.class);
+			ReaddirResponse second = readdir(directory, 0, 0, false);
+			long cookie = first.entries().get(1).nextCookie();
+
+			Assertions.assertNotEquals(first.verifier(), second.verifier());
+			Assertions.assertEquals(cookie, second.entries().get(1).nextCookie());
+			assertStatus(Errno.EIO, new ReaddirRequest(directory, cookie, 0, false));
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+			Assertions.assertEquals(List.of(), names(readdir(directory, cookie, first.verifier(), false)));
+			Assertions.assertEquals(List.of("f58085"), names(readdir(directory, cookie, second.verifier(), false)));
 		}
 
 		@Test
@@ -2375,18 +2491,19 @@ public class FileSystemOperationsTest {
 				files.put(name, create(directory, name, NodeType.FILE).nodeId());
 			}
 			long verifier = readdir(directory, 0, 0, false).verifier();
+			long cookie = DirectorySnapshots.cookieOf(verifier, 2);
 
 			create(directory, "created", NodeType.FILE);
-			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, cookie, verifier, false)));
 			ok(new SymlinkRequest(directory, "link", "stays"), SymlinkResponse.class);
-			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			Assertions.assertEquals(List.of("moved", "removed", "renamed", "stays"), names(readdir(directory, cookie, verifier, false)));
 			ok(new RemoveRequest(files.get("removed"), directory, "removed"), RemoveResponse.class);
-			Assertions.assertEquals(List.of("moved", "renamed", "stays"), names(readdir(directory, 2, verifier, false)));
+			Assertions.assertEquals(List.of("moved", "renamed", "stays"), names(readdir(directory, cookie, verifier, false)));
 			ok(new RenameRequest(files.get("renamed"), directory, "renamed", directory, "new name"), RenameResponse.class);
-			Assertions.assertEquals(List.of("moved", "stays"), names(readdir(directory, 2, verifier, false)));
+			Assertions.assertEquals(List.of("moved", "stays"), names(readdir(directory, cookie, verifier, false)));
 			ok(new RenameRequest(files.get("moved"), directory, "moved", other, "moved"), RenameResponse.class);
 
-			ReaddirResponse continued = readdir(directory, 2, verifier, false);
+			ReaddirResponse continued = readdir(directory, cookie, verifier, false);
 			Assertions.assertEquals(List.of("stays"), names(continued));
 			Assertions.assertEquals(verifier, continued.verifier());
 			Assertions.assertEquals(List.of(".", "..", "created", "link", "new name", "stays"), names(readdir(directory, 0, 0, false)));
@@ -2403,7 +2520,7 @@ public class FileSystemOperationsTest {
 
 			others.forEach(other -> readdir(other, 0, 0, false));
 
-			ReaddirResponse continued = readdir(ROOT, 2, first.verifier(), false);
+			ReaddirResponse continued = readdir(ROOT, first.entries().get(1).nextCookie(), first.verifier(), false);
 			Assertions.assertEquals(first.verifier(), continued.verifier());
 			Assertions.assertEquals(first.entries().subList(2, 19), continued.entries());
 		}
@@ -2431,11 +2548,11 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(second.entries().size(), read.size());
 			Assertions.assertTrue(names(first).getLast().compareTo(names(second).getFirst()) < 0);
 			readdir(other, 0, 0, false);
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, ENTRIES + 4, first.verifier(), wantAttributes));
+			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(first.verifier(), ENTRIES + 4), first.verifier(), wantAttributes));
 		}
 
 		@Test
-		@DisplayName("a listing the cache dropped yields EIO once its directory holds other names, and no entries")
+		@DisplayName("a listing the cache dropped yields EIO once its directory holds other names, with and without its verifier")
 		public void testDroppedListingOfChangedDirectory() throws IOException {
 			serveWithoutListingBudget(root);
 			long other = create(ROOT, "other", NodeType.DIRECTORY).nodeId();
@@ -2445,8 +2562,10 @@ public class FileSystemOperationsTest {
 
 			create(ROOT, "created.txt", NodeType.FILE);
 
-			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 2, verifier, false));
-			assertStatus(Errno.EIO, new ReaddirRequest(ROOT, 4, verifier, false));
+			for (long sent : List.of(verifier, 0L)) {
+				assertStatus(Errno.EIO, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 2), sent, false));
+				assertStatus(Errno.EIO, new ReaddirRequest(ROOT, DirectorySnapshots.cookieOf(verifier, 4), sent, false));
+			}
 			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
 		}
 
@@ -2462,12 +2581,12 @@ public class FileSystemOperationsTest {
 			try {
 				Assumptions.assumeFalse(Files.isReadable(root.resolve("dir")), "permissions do not apply to this user");
 
-				assertStatus(Errno.EACCES, new ReaddirRequest(directory, 2, verifier, false));
+				assertStatus(Errno.EACCES, new ReaddirRequest(directory, DirectorySnapshots.cookieOf(verifier, 2), verifier, false));
 			} finally {
 				Files.setPosixFilePermissions(root.resolve("dir"), PosixFilePermissions.fromString("rwx------"));
 			}
 
-			Assertions.assertEquals(List.of("file.txt"), names(readdir(directory, 2, verifier, false)));
+			Assertions.assertEquals(List.of("file.txt"), names(readdir(directory, DirectorySnapshots.cookieOf(verifier, 2), verifier, false)));
 		}
 
 		@Test
@@ -2495,11 +2614,11 @@ public class FileSystemOperationsTest {
 			ok(new RemoveRequest(replaced, ROOT, "x"), RemoveResponse.class);
 			long replacement = create(ROOT, "x", after).nodeId();
 
-			ReaddirResponse continued = readdir(ROOT, 1, verifier, false);
+			ReaddirResponse continued = readdir(ROOT, DirectorySnapshots.cookieOf(verifier, 1), verifier, false);
 
 			Assertions.assertEquals(List.of( //
-					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
-					new DirectoryEntry("x", after, replacement, 3, null)), continued.entries());
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, DirectorySnapshots.cookieOf(verifier, 2), null), //
+					new DirectoryEntry("x", after, replacement, DirectorySnapshots.cookieOf(verifier, 3), null)), continued.entries());
 			if (after == NodeType.DIRECTORY) {
 				Assertions.assertEquals(List.of(".", ".."), names(readdir(replacement, 0, 0, false)));
 			} else {
@@ -2529,7 +2648,7 @@ public class FileSystemOperationsTest {
 			long verifier = readdir(ROOT, 0, 0, false).verifier();
 
 			Files.delete(vanishing);
-			ReaddirResponse page = readdir(ROOT, 2, verifier, wantAttributes);
+			ReaddirResponse page = readdir(ROOT, DirectorySnapshots.cookieOf(verifier, 2), verifier, wantAttributes);
 
 			Assertions.assertEquals(List.of("stays.txt"), names(page));
 			Assertions.assertFalse(page.more());
@@ -2546,12 +2665,12 @@ public class FileSystemOperationsTest {
 			for (String name : names(first)) {
 				Files.delete(root.resolve(name));
 			}
-			Assertions.assertEquals(second.entries().getFirst().nextCookie(), readdir(ROOT, 2, first.verifier(), true).entries().getFirst().nextCookie());
+			Assertions.assertEquals(second.entries().getFirst().nextCookie(), readdir(ROOT, DirectorySnapshots.cookieOf(first.verifier(), 2), first.verifier(), true).entries().getFirst().nextCookie());
 
 			for (String name : backingNames()) {
 				Files.delete(root.resolve(name));
 			}
-			ReaddirResponse end = readdir(ROOT, 2, first.verifier(), true);
+			ReaddirResponse end = readdir(ROOT, DirectorySnapshots.cookieOf(first.verifier(), 2), first.verifier(), true);
 			Assertions.assertEquals(List.of(), end.entries());
 			Assertions.assertFalse(end.more());
 		}
@@ -3067,15 +3186,26 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(List.of(".", "..", "file.txt"), names(readdir(ROOT, 0, 0, false)));
 			Assertions.assertEquals(List.of("file.txt"), names(readdir(ROOT, 0, 0, true)));
+			ReaddirResponse listing = readdir(directory.nodeId(), 0, 0, false);
+			long verifier = listing.verifier();
+			long end = DirectorySnapshots.cookieOf(verifier, 3);
 			Assertions.assertEquals(List.of( //
-					new DirectoryEntry(".", NodeType.DIRECTORY, directory.nodeId(), 1, null), //
-					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, 2, null), //
-					new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), 3, null)), readdir(directory.nodeId(), 0, 0, false).entries());
+					new DirectoryEntry(".", NodeType.DIRECTORY, directory.nodeId(), DirectorySnapshots.cookieOf(verifier, 1), null), //
+					new DirectoryEntry("..", NodeType.DIRECTORY, ROOT, DirectorySnapshots.cookieOf(verifier, 2), null), //
+					new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), end, null)), listing.entries());
 			ReaddirResponse withAttributes = readdir(directory.nodeId(), 0, 0, true);
-			Assertions.assertEquals(List.of(new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), 3, file)), withAttributes.entries());
-			Assertions.assertEquals(List.of(), readdir(directory.nodeId(), 3, withAttributes.verifier(), true).entries());
-			assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), 4, withAttributes.verifier(), true));
-			assertStatus(Errno.EIO, new ReaddirRequest(directory.nodeId(), 3, withAttributes.verifier() + 1, true));
+			Assertions.assertEquals(verifier, withAttributes.verifier());
+			Assertions.assertEquals(List.of(new DirectoryEntry("no_log", NodeType.FILE, file.nodeId(), end, file)), withAttributes.entries());
+			// with its verifier, without one, and with one of another tag
+			for (long sent : List.of(verifier, 0L, verifier ^ Long.MIN_VALUE)) {
+				Assertions.assertEquals(List.of("no_log"), names(readdir(directory.nodeId(), DirectorySnapshots.cookieOf(verifier, 2), sent, false)));
+				Assertions.assertEquals(List.of(), readdir(directory.nodeId(), end, sent, true).entries());
+				assertStatus(Messages.STATUS_INVALID_COOKIE, new ReaddirRequest(directory.nodeId(), DirectorySnapshots.cookieOf(verifier, 4), sent, true));
+				// without a tag, and with the tag of another listing
+				assertStatus(Errno.EIO, new ReaddirRequest(directory.nodeId(), 3, sent, true));
+				assertStatus(Errno.EIO, new ReaddirRequest(directory.nodeId(), DirectorySnapshots.cookieOf(verifier ^ Long.MIN_VALUE, 3), sent, true));
+			}
+			assertStatus(Errno.EIO, new ReaddirRequest(directory.nodeId(), end, verifier ^ 1, true));
 		}
 
 		@Test
@@ -3793,7 +3923,7 @@ public class FileSystemOperationsTest {
 		private void list(Random random, long directory, Map<Long, Long> verifiers) {
 			Long verifier = verifiers.get(directory);
 			if (verifier != null && random.nextBoolean()) {
-				ops.handle(new ReaddirRequest(directory, 2 + random.nextInt(3), verifier, random.nextBoolean()));
+				ops.handle(new ReaddirRequest(directory, DirectorySnapshots.cookieOf(verifier, 2 + random.nextInt(3)), verifier, random.nextBoolean()));
 			} else if (ops.handle(new ReaddirRequest(directory, 0, 0, random.nextBoolean())) instanceof ReaddirResponse page) {
 				verifiers.put(directory, page.verifier());
 			}

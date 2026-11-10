@@ -272,19 +272,12 @@ public class FileSystemOperations implements Closeable {
 
 	private ReaddirResponse readdir(ReaddirRequest request) throws IOException {
 		return readingDirectory(request.nodeId(), directory -> {
-			DirectorySnapshots.Snapshot snapshot = request.cookie() == 0 ? null : snapshots.get(directory.id, request.verifier());
-			if (snapshot == null) {
+			DirectorySnapshots.Snapshot snapshot;
+			if (request.cookie() == 0) {
 				List<String> names = list(directory);
-				long verifier = DirectorySnapshots.verifierOf(names);
-				if (request.cookie() != 0) {
-					// the cache does not hold the listing this request continues. Its cookies mean the same only if the directory still holds the same names.
-					if (verifier != request.verifier()) {
-						LOG.warn("Unable to continue a listing of node {}: it is not cached, and the names the directory holds now do not give its verifier.", directory.id);
-						throw new StatusException(Errno.EIO);
-					}
-					LOG.debug("Restored a listing of node {}.", directory.id);
-				}
-				snapshot = snapshots.add(directory.id, verifier, names);
+				snapshot = snapshots.add(directory.id, DirectorySnapshots.verifierOf(names), names);
+			} else {
+				snapshot = continued(directory, request);
 			}
 			try {
 				return page(directory, snapshot, request);
@@ -292,6 +285,29 @@ public class FileSystemOperations implements Closeable {
 				snapshots.unpin(snapshot);
 			}
 		});
+	}
+
+	/**
+	 * @return The listing a request with a cookie other than 0 continues, pinned
+	 */
+	private DirectorySnapshots.Snapshot continued(Node directory, ReaddirRequest request) throws IOException {
+		boolean byVerifier = DirectorySnapshots.namesListingByVerifier(request);
+		DirectorySnapshots.Snapshot snapshot = byVerifier ? snapshots.get(directory.id, request.verifier()) : snapshots.getByTag(directory.id, DirectorySnapshots.tagIn(request.cookie()));
+		if (snapshot == null) {
+			// the cache does not hold the listing this request continues. Its cookies mean the same only if the directory still holds the same names. Where the cookie's tag names the listing, only those 31 bits of the verifier are compared.
+			List<String> names = list(directory);
+			long verifier = DirectorySnapshots.verifierOf(names);
+			if (!DirectorySnapshots.continues(request, verifier)) {
+				LOG.warn("Unable to continue a listing of node {}: it is not cached, and the names the directory holds now give another verifier.", directory.id);
+				throw new StatusException(Errno.EIO);
+			}
+			LOG.debug("Restored a listing of node {}.", directory.id);
+			snapshot = snapshots.add(directory.id, verifier, names);
+		}
+		if (!byVerifier && request.verifier() != 0) {
+			LOG.warn("Continued a listing of node {} by the tag of its cookie, although the request carried the verifier of another listing.", directory.id);
+		}
+		return snapshot;
 	}
 
 	private ReaddirResponse page(Node directory, DirectorySnapshots.Snapshot snapshot, ReaddirRequest request) throws IOException {
@@ -305,7 +321,7 @@ public class FileSystemOperations implements Closeable {
 			if (length > capacity) {
 				break;
 			}
-			DirectoryEntry resolved = resolve(directory, name, index, request.wantAttributes());
+			DirectoryEntry resolved = resolve(directory, name, index, DirectorySnapshots.cookieOf(snapshot.verifier(), index + 1), request.wantAttributes());
 			// an entry that vanished takes no room, so a page is empty only at the end of the listing
 			if (resolved != null) {
 				page.add(resolved);
@@ -920,21 +936,21 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	/**
-	 * @return The index of the first entry a request asks for in a listing of that length
+	 * @return The index of the first entry a request asks for in a listing of that length. Only the cookie's index counts here: the caller has already found the listing.
 	 */
 	static int firstIndex(ReaddirRequest request, int listingLength) throws StatusException {
-		if (Long.compareUnsigned(request.cookie(), listingLength) > 0) {
+		long cookieIndex = DirectorySnapshots.indexIn(request.cookie());
+		if (cookieIndex > listingLength) {
 			throw new StatusException(Messages.STATUS_INVALID_COOKIE);
 		}
-		int index = (int) request.cookie();
+		int index = (int) cookieIndex;
 		return request.wantAttributes() ? Math.max(index, FIRST_CHILD_INDEX) : index;
 	}
 
 	/**
 	 * @return The entry of that name as it is now, or {@code null} if it vanished since the listing was taken. A listing holds no types: an entry may have been replaced by one of another type since.
 	 */
-	private @Nullable DirectoryEntry resolve(Node directory, String name, int index, boolean wantAttributes) throws IOException {
-		long nextCookie = index + 1;
+	private @Nullable DirectoryEntry resolve(Node directory, String name, int index, long nextCookie, boolean wantAttributes) throws IOException {
 		if (index < FIRST_CHILD_INDEX) {
 			// the root is its own parent here, as FSKit expects of a volume's root
 			boolean self = index == 0 || directory.id == Messages.ROOT_NODE_ID;
