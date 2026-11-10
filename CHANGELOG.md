@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.4.0...HEAD)
+## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.5.0...HEAD)
+
+No changes yet.
+
+
+## [0.5.0](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.5.0) - 2026-11-10
 ### Changed
 * A volume lists the entries of a directory sorted by name, where it listed them in the order of the backing store
 
