@@ -94,7 +94,7 @@ A broken seal fails opaquely: `fskitd` does not launch a bundle whose signature 
 
 ## Embed the extension in an app
 
-An app that offers the provider embeds the extension. Next to the jar `org.cryptomator:fskit-nio-adapter`, each release publishes the extension as a zip with the classifier `appex` (`fskit-nio-adapter-<version>-appex.zip`). The jar holds `libFSKitNioSupport.dylib`. Both are built for Apple silicon and carry no signature but the linker's ad-hoc one.
+An app that offers the provider embeds the extension. Next to the jar `org.cryptomator:fskit-nio-adapter`, each release publishes the extension as a zip with the classifier `appex` (`fskit-nio-adapter-<version>-appex.zip`). The extension works only with the jar of the same version, since the protocol between them can change with any version before 1.0.0. The jar holds `libFSKitNioSupport.dylib`. Both are built for Apple silicon and carry no signature but the linker's ad-hoc one.
 
 The app:
 

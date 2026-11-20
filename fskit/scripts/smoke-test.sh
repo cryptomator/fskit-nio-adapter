@@ -1227,8 +1227,7 @@ busy-unmount() {
 	close_window
 	check "a forced unmount succeeds" reply_is UNMOUNTED
 	check_unmounted "$SCENARIO" "$MNT"
-	kill $holder 2> /dev/null
-	BACKGROUND_PIDS=(${BACKGROUND_PIDS:#$holder})
+	stop_background $holder
 }
 
 read-only() {
@@ -1344,7 +1343,7 @@ outside() {
 # outside_rounds <plain|vault> <backing directory>
 outside_rounds() {
 	local kind="$1" sig="$SCENARIO_DIR/sig-$1" node kept read written
-	integer offset
+	integer offset holder
 	mkdir -p "$sig"
 	mount_volume "$SCENARIO-$kind" "$kind" rw "$2" "$MNT" || return 0
 	cat "$MNT/event.txt" > /dev/null
@@ -1357,6 +1356,7 @@ outside_rounds() {
 	check "$kind: a CHANGES response named the file with its new size" changes_reported "$node" $offset 11
 	check "$kind: cat then shows the new content" content_is "$MNT/event.txt" "version one"
 	holder_read "$MNT/held.txt" "$sig"
+	holder=$!
 	await_file "$sig/ready" || return 0
 	request sync "$SCENARIO"
 	node="$(node_of held.txt Lookup)"
@@ -1365,6 +1365,8 @@ outside_rounds() {
 	change_outside "$kind" held.txt
 	# a vault reports the size of its open file, so the record may carry the old one
 	check "$kind: a CHANGES response names a file a process holds open" await_changes_reported "$node" $offset
+	# BridgeSession traces the response before it sends it, and FSKit answers an open from its cache until the extension has received the response and revoked the file
+	sleep 0.5
 	mark "held-1-$kind"
 	if [[ "$kind" == plain ]]; then
 		# FSKit passes on a later open of a revoked item, one for reading as an upgrade, which the volume refuses
@@ -1381,15 +1383,18 @@ outside_rounds() {
 	check "$kind: the descriptor it holds keeps reading" test "$(sed -n 2p "$sig/holder.out")" = "second (28): version two, which is longer"
 	: > "$sig/go2"
 	await_file "$sig/closed"
+	stop_background $holder
 	# FSKit reclaims the revoked item right after the close
 	check "$kind: once it is closed, stat shows the new size" shows_size_within "$MNT/held.txt" 11 2
 	check "$kind: and cat the new content" content_is "$MNT/held.txt" "version one"
 	holder_write "$MNT/writer.txt" "$sig"
+	holder=$!
 	await_file "$sig/written" || return 0
 	# the writer's cached pages would go back over a change made in place
 	change_outside "$kind" writer.txt replace
 	: > "$sig/go3"
 	await_file "$sig/writer-closed"
+	stop_background $holder
 	# a vault reports the size of its open file until the writer's close reaches it
 	check "$kind: a writer open since before a change made outside leaves the new size when it closes" shows_size_within "$MNT/writer.txt" 11 3
 	check "$kind: and the new content" content_is "$MNT/writer.txt" "version one"
@@ -1441,10 +1446,13 @@ outside_rounds() {
 	if [[ "$kind" == plain ]]; then
 		check "$kind: cat reads truncated.txt" content_is "$MNT/truncated.txt" "version two, which is longer"
 		holder_truncate "$MNT/truncated.txt" 11 "$sig"
+		holder=$!
 		await_file "$sig/opened" || return 0
 		change_outside "$kind" truncated.txt
 		: > "$sig/go"
-		await_file "$sig/truncated" || return 0
+		await_file "$sig/truncated"
+		stop_background $holder
+		[[ -e "$sig/truncated" ]] || return 0
 		check "$kind: a process truncates a file it holds to the length a change outside left" test ! -s "$sig/truncate.out"
 		# the server leaves the length as it is, and the reply shows the change, whose revoke takes effect once the file is closed
 		sleep 0.5
@@ -1588,6 +1596,7 @@ holder_read() {
 		touch("reread"); await("go2");
 		close($h) or print "close: $!\n"; touch("closed");
 	' "$1" "$2" > "$2/holder.out" 2>&1 &
+	BACKGROUND_PIDS+=($!)
 }
 
 # holder_write <file> <signal directory>: opens the file for writing in the background, overwrites its start, and closes it once go3 exists
@@ -1601,6 +1610,7 @@ holder_write() {
 		touch("written"); select(undef, undef, undef, 0.1) until -e "$d/go3";
 		close($h) or die "close: $!"; touch("writer-closed");
 	' "$1" "$2" > "$2/writer.out" 2>&1 &
+	BACKGROUND_PIDS+=($!)
 }
 
 # holder_truncate <file> <size> <signal directory>: opens the file for writing in the background, creates "opened" in the signal directory, waits for "go" there, truncates the file through its descriptor to the size, closes it and creates "truncated". Prints its errors to truncate.out there.
@@ -1616,6 +1626,13 @@ holder_truncate() {
 		close($h) or print "close: $!\n";
 		touch("truncated");
 	' "$1" "$2" "$3" > "$3/truncate.out" 2>&1 &
+	BACKGROUND_PIDS+=($!)
+}
+
+# stop_background <pid>: stops a background process if it still runs, so that it holds nothing open on the volume, and takes it off the list that the cleanup stops
+stop_background() {
+	kill $1 2> /dev/null
+	BACKGROUND_PIDS=(${BACKGROUND_PIDS:#$1})
 }
 
 # own_changes <directory>: writes, appends, changes the mode to one the file cannot have been created with under any umask, renames and removes
@@ -1635,6 +1652,10 @@ cleanup() {
 	fi
 	CLEANED_UP=1
 	trap '' HUP INT TERM
+	# a process that holds a file open would make the program's unmount fail
+	if (( ${#BACKGROUND_PIDS} )); then
+		kill $BACKGROUND_PIDS 2> /dev/null
+	fi
 	if [[ -n "$PROGRAM_PID" ]]; then
 		print -u3 quit 2> /dev/null
 		exec 3>&-
@@ -1647,9 +1668,6 @@ cleanup() {
 	own_mount_points | while IFS= read -r mount_point; do
 		/sbin/umount -f "$mount_point"
 	done
-	if (( ${#BACKGROUND_PIDS} )); then
-		kill $BACKGROUND_PIDS 2> /dev/null
-	fi
 	# with it go the manifest directories the program could no longer delete
 	rm -rf "$JVM_TMP"
 	# a directory that may not be read cannot be removed

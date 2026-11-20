@@ -173,4 +173,4 @@ Each file in `vectors/` holds one example: its decoded field values, a line `hex
 
 Values are written as follows: integers in decimal, strings as raw text, byte strings and payloads in lowercase hexadecimal, booleans as `true` or `false`, enumerations in lowercase. Fields of a nested record are prefixed with the record's name and a dot, list elements with the list's name and an index in brackets. An absent optional record has no lines. No example uses an integer of 2^63 or more.
 
-Until the first release, an example changes together with this document and both codecs. From then on, one changes only together with a bump of `protocolVersion`.
+Until version 1.0.0, an example changes together with this document and both codecs. From then on, one changes only together with a bump of `protocolVersion`.

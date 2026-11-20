@@ -1407,7 +1407,14 @@ public class FileSystemOperationsTest {
 				if (signal) {
 					source.signal();
 				}
-				return Assertions.assertInstanceOf(ChangesResponse.class, changes.get(10, TimeUnit.SECONDS));
+				try {
+					return Assertions.assertInstanceOf(ChangesResponse.class, changes.get(10, TimeUnit.SECONDS));
+				} finally {
+					// the request waits until closeChanges ends it, and the executor's close waits for the request
+					if (!changes.isDone()) {
+						ops.closeChanges();
+					}
+				}
 			}
 		}
 
