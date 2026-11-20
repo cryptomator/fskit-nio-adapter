@@ -156,6 +156,10 @@ public class HookedOperations extends FileSystemOperations {
 		super(root, readOnly);
 	}
 
+	public HookedOperations(Path root, boolean readOnly, @Nullable OutsideChanges source) throws IOException {
+		super(root, readOnly, source);
+	}
+
 	@Override
 	public void close() {
 		super.close();

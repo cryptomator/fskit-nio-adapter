@@ -5,11 +5,13 @@ import os
 
 /// Forwards the operations it supports to the server of the mount.
 ///
-/// Handlers run concurrently, each awaiting its own requests. One lock guards the volume's state: the items handed to FSKit with their lookups, the newest attributes and free space seen, and the volume's statistics. No request is sent while it is held.
+/// Handlers run concurrently, each awaiting its own requests. One lock guards the volume's state: the items handed to FSKit with their lookups, the newest attributes and free space seen, what FSKit's cache of each file holds, and the volume's statistics. No request is sent and no cache state is set while it is held.
 ///
 /// - Attributes and free space are populated under it, from the newest record by the server's generation, so that FSKit never takes an older record for the newest.
 /// - The handlers that hand out an item reply under it, and a reclaim tries the item under it, so that a reclaim never comes between handing out an item and FSKit counting it.
 /// - Every handler that sends a request holds a ticket of the attribute ledger from its start until it has populated, which keeps the records it may still populate.
+/// - Every record of a file goes to its `CacheValidity` under it. A file that changed outside the volume is revoked: FSKit drops what it cached and looks the item up again once nothing holds it open.
+/// - A revoke is claimed under the lock and runs outside it: from a task of its own that the handler which found it does not wait for, in the task that watches for changes, or within the open or upgrade that found it. An open or upgrade replies with its grant under the lock, in the section that finds no revoke of the item due, running or done, so that no revoke starts between that check and the grant.
 final class BridgeVolume: FSVolume, @unchecked Sendable {
 	private struct Statistics {
 		var totalBytes: UInt64 = 0
@@ -20,12 +22,14 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		var items = ItemTable(make: BridgeItem.init(nodeId:))
 		var ledger = AttributeLedger()
 		var statistics = Statistics()
+		var validity = CacheValidity<BridgeItem>()
 		/// Replies to an unmount, made once no handler holds a ticket.
 		var awaitingIdle: [@Sendable () -> Void] = []
 	}
 
 	private static let blockSize = 4096
 
+	private let logger = Logger(subsystem: "org.cryptomator.fskit", category: "BridgeVolume")
 	private let client: BridgeClient
 	private let lister: DirectoryLister
 	private let state = OSAllocatedUnfairLock(uncheckedState: State())
@@ -64,15 +68,28 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		awaitingIdle.forEach { $0() }
 	}
 
-	/// Runs an operation under a ticket of the ledger and maps what it throws to the error FSKit expects.
-	private func serve<Result>(_ operation: () async throws -> Result) async throws -> Result {
+	/// Runs an operation under a ticket of the ledger and maps what it throws to the error FSKit expects. Then starts the revokes that are due.
+	///
+	/// - Parameter item: The item the operation is for. If the server no longer finds it, its revoke is due.
+	private func serve<Result>(for item: FSItem? = nil, _ operation: () async throws -> Result) async throws -> Result {
 		let ticket = begin()
-		defer { finish(ticket) }
+		defer {
+			finish(ticket)
+			revokeDue()
+		}
 		do {
 			return try await operation()
 		} catch {
-			throw fsError(error)
+			throw failure(error, for: item as? BridgeItem)
 		}
+	}
+
+	/// Maps what an operation threw to the error FSKit expects. If the server no longer finds the item the operation was for, its revoke is due.
+	private func failure(_ error: any Error, for item: BridgeItem?) -> any Error {
+		if let item, (error as? StatusError)?.status == ENOENT {
+			state.withLockUnchecked { $0.validity.missing(item.nodeId) }
+		}
+		return fsError(error)
 	}
 
 	/// Serves a handler that hands out an item. It replies under the state lock, which only the reply-handler form allows. FSKit counts a returned item once the reply is made, so neither a reclaim of the item nor a lookup of it may come between.
@@ -91,7 +108,10 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 			return
 		}
 		Task {
-			defer { self.finish(ticket) }
+			defer {
+				self.finish(ticket)
+				self.revokeDue()
+			}
 			do {
 				let build = try await operation(prepared)
 				try self.state.withLockUnchecked { state in
@@ -127,10 +147,14 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 	}
 
 	private func nodeId(_ item: FSItem) throws -> UInt64 {
+		try bridgeItem(item).nodeId
+	}
+
+	private func bridgeItem(_ item: FSItem) throws -> BridgeItem {
 		guard let item = item as? BridgeItem else {
 			throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
 		}
-		return item.nodeId
+		return item
 	}
 
 	private func string(_ name: FSFileName) throws -> String {
@@ -140,11 +164,70 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		return string
 	}
 
+	// MARK: - Revokes
+
+	/// Runs the revokes that are due, from a task of their own, so that the handler that found them does not wait for them.
+	private func revokeDue() {
+		let claimed = state.withLockUnchecked { $0.validity.claimDue() }
+		guard !claimed.isEmpty else {
+			return
+		}
+		Task.detached {
+			claimed.forEach(self.revoke)
+		}
+	}
+
+	/// Drops what FSKit cached of a file whose revoke was claimed. FSKit reclaims the item once nothing holds it open, and looks its name up again. Called without the state lock.
+	private func revoke(_ item: BridgeItem) {
+		let error = setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .revoke)
+		if let error {
+			logger.debug("Failed to revoke node \(item.nodeId, privacy: .public): \(String(describing: error), privacy: .public)")
+		}
+		state.withLockUnchecked { $0.validity.revokeEnded(item, nodeId: item.nodeId, success: error == nil) }
+	}
+
+	/// Asks the server for changes made outside the volume, and revokes the files they concern. Ends once the server has no source of them or the connection is lost, as at every unmount. Holds no ticket of the ledger, since it populates nothing.
+	private func watchChanges() async {
+		while true {
+			do {
+				let response = try await client.request(ChangesRequest())
+				let claimed = state.withLockUnchecked { state in
+					response.attributes.forEach { state.validity.compare($0, .locked) }
+					return state.validity.claimDue()
+				}
+				claimed.forEach(revoke)
+			} catch let failure as StatusError where failure.status != ENOTSUP && client.isConnected {
+				// an unexpected failure of the server, which the next attempt may not meet
+				try? await Task.sleep(for: .seconds(1))
+			} catch {
+				return
+			}
+		}
+	}
+
 	// MARK: - Projections
 
-	/// Populates FSKit's attributes from the newest record of the item. Called under the state lock.
-	private func fsAttributes(_ received: Attributes, _ state: inout State) -> FSItem.Attributes {
+	/// Populates FSKit's attributes from the newest record of the item, and compares the received record with what FSKit's cache holds. Called under the state lock.
+	///
+	/// - Parameter reading: How the server read the record. A reply that does not name it may have been sampled.
+	private func fsAttributes(_ received: Attributes, _ state: inout State, _ reading: CacheValidity<BridgeItem>.Reading = .sampled) -> FSItem.Attributes {
+		state.validity.compare(received, reading)
+		return populated(received, &state)
+	}
+
+	/// Populates FSKit's attributes from the newest record of the item, for a reply whose record the caller has given to `CacheValidity` itself. Called under the state lock.
+	private func populated(_ received: Attributes, _ state: inout State) -> FSItem.Attributes {
+		fsItemAttributes(state.ledger.newest(received))
+	}
+
+	/// Populates FSKit's attributes for a reply that hands out an item, and gives `CacheValidity` what FSKit is handed: the newest record of the item, since a newer one may have arrived meanwhile. Called under the state lock.
+	private func handedOut(_ item: BridgeItem, _ received: Attributes, _ state: inout State) -> FSItem.Attributes {
 		let attributes = state.ledger.newest(received)
+		state.validity.handedOut(item, attributes)
+		return fsItemAttributes(attributes)
+	}
+
+	private func fsItemAttributes(_ attributes: Attributes) -> FSItem.Attributes {
 		let result = FSItem.Attributes()
 		result.fileID = FSItem.Identifier(attributes.nodeId)
 		result.parentID = FSItem.Identifier(attributes.parentId)
@@ -272,7 +355,7 @@ extension BridgeVolume: FSVolume.Handler {
 	}
 
 	func activateVolume(options: FSTaskOptions) async throws -> FSActivateResult {
-		try await serve {
+		let result = try await serve {
 			let response = try await client.request(StatfsRequest())
 			return try state.withLockUnchecked { state in
 				state.statistics.totalBytes = response.totalBytes
@@ -280,6 +363,10 @@ extension BridgeVolume: FSVolume.Handler {
 				return try required(FSActivateResult(rootItem: state.items.item(for: Messages.rootNodeId)))
 			}
 		}
+		Task.detached {
+			await self.watchChanges()
+		}
+		return result
 	}
 
 	func deactivateVolume(options: FSDeactivateOptions = []) async throws {}
@@ -325,7 +412,7 @@ extension BridgeVolume: FSVolume.Handler {
 			let response = try await self.client.request(request)
 			return { state in
 				let item = state.items.item(for: response.attributes.nodeId)
-				return FSLookupItemResult(foundItem: item, itemName: FSFileName(string: response.name), itemAttributes: self.fsAttributes(response.attributes, &state))
+				return FSLookupItemResult(foundItem: item, itemName: FSFileName(string: response.name), itemAttributes: self.handedOut(item, response.attributes, &state))
 			}
 		}
 	}
@@ -340,7 +427,11 @@ extension BridgeVolume: FSVolume.Handler {
 				guard item.tryReclaim({}) else {
 					return nil
 				}
-				return state.items.removeIfCurrent(item, nodeId: item.nodeId)
+				let lookups = state.items.removeIfCurrent(item, nodeId: item.nodeId)
+				if lookups != nil {
+					state.validity.reclaimed(item.nodeId)
+				}
+				return lookups
 			}
 			guard let lookups else {
 				return
@@ -376,7 +467,7 @@ extension BridgeVolume: FSVolume.Handler {
 				return FSCreateItemResult(
 					newItem: item,
 					newItemName: FSFileName(string: response.name),
-					newItemAttributes: self.fsAttributes(response.attributes, &state),
+					newItemAttributes: self.handedOut(item, response.attributes, &state),
 					directoryAttributes: self.fsAttributes(response.directoryAttributes, &state),
 					freeSpace: self.fsFreeSpace(response.freeSpace, &state)
 				)
@@ -416,10 +507,10 @@ extension BridgeVolume: FSVolume.Handler {
 			return try state.withLockUnchecked { state in
 				try required(FSRenameItemResult(
 					newName: FSFileName(string: response.name),
-					renamedItemAttributes: fsAttributes(response.attributes, &state),
+					renamedItemAttributes: fsAttributes(response.attributes, &state, .locked),
 					sourceDirectoryAttributes: fsAttributes(response.sourceDirectoryAttributes, &state),
 					destinationDirectoryAttributes: fsAttributes(response.destinationDirectoryAttributes, &state),
-					overItemAttributes: overItem == nil ? nil : response.replacedAttributes.map { fsAttributes($0, &state) },
+					overItemAttributes: overItem == nil ? nil : response.replacedAttributes.map { fsAttributes($0, &state, .locked) },
 					freeSpace: fsFreeSpace(response.freeSpace, &state)
 				))
 			}
@@ -432,7 +523,7 @@ extension BridgeVolume: FSVolume.Handler {
 			let response = try await client.request(RemoveRequest(nodeId: nodeId(item), parentId: nodeId(directory), name: string(name)))
 			return try state.withLockUnchecked { state in
 				try required(FSRemoveItemResult(
-					itemAttributes: fsAttributes(response.attributes, &state),
+					itemAttributes: fsAttributes(response.attributes, &state, .locked),
 					directoryAttributes: fsAttributes(response.directoryAttributes, &state),
 					freeSpace: fsFreeSpace(response.freeSpace, &state)
 				))
@@ -441,34 +532,58 @@ extension BridgeVolume: FSVolume.Handler {
 	}
 
 	func attributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext) async throws -> FSGetAttributesResult {
-		try await serve {
+		try await serve(for: item) {
 			try authorize(context)
 			let response = try await client.request(GetattrRequest(nodeId: nodeId(item)))
 			return try state.withLockUnchecked { state in
-				try required(FSGetAttributesResult(attributes: fsAttributes(response.attributes, &state)))
+				try required(FSGetAttributesResult(attributes: fsAttributes(response.attributes, &state, .locked)))
 			}
 		}
 	}
 
 	func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext) async throws -> FSSetAttributesResult {
-		try await serve {
+		try await serve(for: item) {
 			try authorize(context)
 			let settable: [(FSItem.Attribute, UInt8)] = [(.size, Messages.attributeSize), (.mode, Messages.attributeMode), (.accessTime, Messages.attributeAccessed), (.modifyTime, Messages.attributeModified)]
 			let valid = settable.filter { newAttributes.isValid($0.0) }.reduce(0) { $0 | $1.1 }
-			let response = try await client.request(SetattrRequest(
+			let request = try SetattrRequest(
 				nodeId: nodeId(item),
 				valid: valid,
 				size: newAttributes.size,
 				mode: UInt16(newAttributes.mode & 0o777),
 				accessed: newAttributes.isValid(.accessTime) ? timestamp(newAttributes.accessTime) : Timestamp(seconds: 0, nanos: 0),
 				modified: newAttributes.isValid(.modifyTime) ? timestamp(newAttributes.modifyTime) : Timestamp(seconds: 0, nanos: 0)
-			))
-			for (attribute, bit) in settable where response.applied & bit != 0 {
+			)
+			let response = try await ownChange(of: request.nodeId, setting: valid) {
+				try await client.request(request)
+			} applied: { response in
+				// a reply whose size differs from the one requested shows a change outside: the server resized a channel whose file was replaced meanwhile. That size is judged rather than adopted.
+				let adopted = response.attributes.size == request.size ? response.applied : response.applied & ~Messages.attributeSize
+				return .setattr(applied: adopted, response.attributes)
+			}
+			// the server leaves out a size a file already had, which took effect all the same
+			let tookEffect = response.applied | (valid & Messages.attributeSize != 0 && response.attributes.type == .file && response.attributes.size == request.size ? Messages.attributeSize : 0)
+			for (attribute, bit) in settable where tookEffect & bit != 0 {
 				newAttributes.consumedAttributes.insert(attribute)
 			}
 			return try state.withLockUnchecked { state in
-				try required(FSSetAttributesResult(attributes: fsAttributes(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
+				try required(FSSetAttributesResult(attributes: populated(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
 			}
+		}
+	}
+
+	/// Sends a request that changes a file, and tells `CacheValidity` what it applied, so that the change is not taken for one made outside the volume.
+	///
+	/// - Parameter fields: The fields the request may set, as bits of `Messages`.
+	private func ownChange<Response>(of nodeId: UInt64, setting fields: UInt8, _ send: () async throws -> Response, applied: (Response) -> CacheValidity<BridgeItem>.OwnChange) async throws -> Response {
+		state.withLockUnchecked { $0.validity.ownChangeBegan(nodeId, setting: fields) }
+		do {
+			let response = try await send()
+			state.withLockUnchecked { $0.validity.ownChangeEnded(nodeId, applied(response)) }
+			return response
+		} catch {
+			state.withLockUnchecked { $0.validity.ownChangeEnded(nodeId, nil) }
+			throw error
 		}
 	}
 
@@ -493,63 +608,168 @@ extension BridgeVolume: FSVolume.Handler {
 	}
 
 	func readSymbolicLink(_ item: FSItem, context: FSContext) async throws -> FSReadSymlinkResult {
-		try await serve {
+		try await serve(for: item) {
 			try authorize(context)
 			let response = try await client.request(ReadlinkRequest(nodeId: nodeId(item)))
 			return try state.withLockUnchecked { state in
-				try required(FSReadSymlinkResult(contents: FSFileName(string: response.target), symlinkAttributes: fsAttributes(response.attributes, &state)))
+				try required(FSReadSymlinkResult(contents: FSFileName(string: response.target), symlinkAttributes: fsAttributes(response.attributes, &state, .locked)))
 			}
 		}
 	}
 }
 
-extension BridgeVolume: FSVolume.OpenCloseHandler {
+/// Opens and closes items, and grants the kernel caching.
+///
+/// FSKit closes an item once its last descriptor is closed. An open that finds its file changed outside the volume revokes it and fails with `ESTALE`: an open for reading would be served from pages of the old version, or with new bytes cut to the old size where none were cached, and one for writing could put stale pages back over the new version.
+extension BridgeVolume: FSVolume.DataCacheHandler {
 	private func modes(_ modes: FSVolume.OpenModes) -> UInt8 {
 		(modes.contains(.read) ? Messages.modeRead : 0) | (modes.contains(.write) ? Messages.modeWrite : 0)
 	}
 
-	func openItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext) async throws {
-		try await serve {
-			try authorize(context)
-			let openedByCreate = state.withLockUnchecked { _ in (item as? BridgeItem)?.openedByCreate == true }
-			if openedByCreate {
-				return
-			}
-			_ = try await client.request(OpenRequest(nodeId: nodeId(item), modes: self.modes(modes)))
+	/// The coherency granted for a cache mode.
+	private func coherency(_ cacheMode: FSVolume.DataCacheMode) -> FSVolume.KernelCacheCoherencyType {
+		switch cacheMode {
+		case .readWithCache: .readCache
+		// writers cache as well: a page written before a change outside in place goes back over it, which a revoke does not prevent, but a change that replaces the file stays intact, on a vault as well. Without the cache every write waits for its reply, which makes a large write more than twice as slow.
+		case .readWriteWithCache: .writeBack
+		default: .noCache
 		}
 	}
 
-	func closeItem(_ item: FSItem, modes: FSVolume.OpenModes, context: FSContext) async throws {
-		try await serve {
-			// no caller is refused here: a close that does not reach the server leaves its channel open
-			let keptModes = self.modes(modes)
-			if keptModes == 0 {
-				// before the CLOSE is sent, so that an open from then on is forwarded and reopens the channel
-				state.withLockUnchecked { _ in (item as? BridgeItem)?.openedByCreate = false }
+	/// Serves an open or an upgrade, which grants the kernel a cache of an item. The grant is replied under the state lock, in the section that finds the item current, which only the reply-handler form allows. A revoke that section finds due becomes the caller's: it runs the revoke outside the lock and refuses with `ESTALE`, as it does while a revoke of the item runs or after one ran.
+	///
+	/// - Parameters:
+	///   - prepare: Runs at once: checks the caller and returns the item, since the handler's arguments cannot go to the task that serves it.
+	///   - send: Sends what the grant needs, and runs only for an item that is current. If the item is no longer current once it returned, the server's channel it may have opened is closed, unless an overlapping open was granted.
+	private func serveGrant<Result>(_ reply: @escaping @Sendable (Result?, (any Error)?) -> Void, prepare: () throws -> BridgeItem, send: (@Sendable (BridgeItem) async throws -> Void)? = nil, granted: @escaping @Sendable () -> Result) {
+		let ticket = begin()
+		let item: BridgeItem
+		do {
+			item = try prepare()
+		} catch {
+			reply(nil, fsError(error))
+			finish(ticket)
+			return
+		}
+		Task {
+			defer {
+				self.finish(ticket)
+				self.revokeDue()
 			}
-			try await record(client.request(CloseRequest(nodeId: nodeId(item), keptModes: keptModes)).freeSpace)
+			let stale = fs_errorForPOSIXError(POSIXError.ESTALE.rawValue)
+			do {
+				if let send {
+					// FSKit passes on later opens of a revoked item that a process holds open: refuse them before an OPEN can touch the channel that process reads through
+					guard self.admit(item) == .grant else {
+						throw stale
+					}
+					try await send(item)
+				}
+				let admission = self.admit(item) {
+					item.isOpen = true
+					reply(granted(), nil)
+				}
+				guard admission == .grant else {
+					// first opens of an item overlap, and one that was granted holds the same channel
+					if send != nil, !self.state.withLockUnchecked({ _ in item.isOpen }) {
+						try? await self.closeChannel(of: item)
+					}
+					throw stale
+				}
+			} catch {
+				reply(nil, self.failure(error, for: item))
+			}
+		}
+	}
+
+	/// Decides whether the kernel may cache the item, and runs the revoke that became the caller's.
+	///
+	/// - Parameter grant: Replies with the grant. It runs under the state lock if the kernel may cache the item.
+	private func admit(_ item: BridgeItem, grant: () -> Void = {}) -> CacheValidity<BridgeItem>.Admission {
+		let admission = state.withLockUnchecked { state in
+			let admission = state.validity.admit(item, nodeId: item.nodeId)
+			if admission == .grant {
+				grant()
+			}
+			return admission
+		}
+		if admission == .revoke {
+			revoke(item)
+		}
+		return admission
+	}
+
+	/// Closes the server's channel of an item. Clears `openedByCreate` and `isOpen` before the `CLOSE` is sent, so that an open from then on is forwarded and reopens the channel.
+	private func closeChannel(of item: BridgeItem) async throws {
+		state.withLockUnchecked { _ in
+			item.openedByCreate = false
+			item.isOpen = false
+		}
+		try await record(client.request(CloseRequest(nodeId: item.nodeId, keptModes: 0)).freeSpace)
+	}
+
+	func open(_ item: FSItem, modes: FSVolume.OpenModes, cacheMode: FSVolume.DataCacheMode, context: FSContext, replyHandler reply: @escaping @Sendable (FSOpenItemResult?, (any Error)?) -> Void) {
+		let requested = self.modes(modes)
+		let granting = coherency(cacheMode)
+		serveGrant(reply) {
+			try authorize(context)
+			return try bridgeItem(item)
+		} send: { item in
+			// the server opened a file created through the volume for reading and writing
+			if !self.state.withLockUnchecked({ _ in item.openedByCreate }) {
+				let response = try await self.client.request(OpenRequest(nodeId: item.nodeId, modes: requested))
+				self.state.withLockUnchecked { $0.validity.compare(response.attributes, .locked) }
+			}
+		} granted: {
+			FSOpenItemResult(grantedCoherency: granting)
+		}
+	}
+
+	func close(_ item: FSItem, context: FSContext) async {
+		// no caller is refused here: a close that does not reach the server leaves its channel open
+		guard let item = item as? BridgeItem else {
+			return
+		}
+		_ = try? await serve {
+			try await closeChannel(of: item)
+		}
+	}
+
+	func upgrade(_ item: FSItem, cacheMode: FSVolume.DataCacheMode, context: FSContext, replyHandler reply: @escaping @Sendable (FSUpgradeItemResult?, (any Error)?) -> Void) {
+		let granting = coherency(cacheMode)
+		// observed only for an open for reading of a revoked item that a process holds open, which is refused. FSKit's header describes an open that asks an open item for more caching, whose channel is open already, so nothing is sent.
+		serveGrant(reply) {
+			try authorize(context)
+			return try bridgeItem(item)
+		} granted: {
+			FSUpgradeItemResult(grantedCoherency: granting)
 		}
 	}
 }
 
 extension BridgeVolume: FSVolume.ReadWriteHandler {
 	func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> FSReadFileResult {
-		try await serve {
+		try await serve(for: item) {
 			let response = try await client.read(nodeId: nodeId(item), offset: UInt64(offset), length: min(length, buffer.length))
 			_ = buffer.withUnsafeMutableBytes { destination in
 				response.data.copyBytes(to: destination)
 			}
 			return try state.withLockUnchecked { state in
-				try required(FSReadFileResult(bytesRead: response.data.count, itemAttributes: fsAttributes(response.attributes, &state)))
+				try required(FSReadFileResult(bytesRead: response.data.count, itemAttributes: fsAttributes(response.attributes, &state, .locked)))
 			}
 		}
 	}
 
 	func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
-		try await serve {
-			let response = try await client.write(nodeId: nodeId(item), offset: UInt64(offset), data: contents)
+		try await serve(for: item) {
+			let nodeId = try nodeId(item)
+			let response = try await ownChange(of: nodeId, setting: Messages.attributeSize | Messages.attributeModified) {
+				try await client.write(nodeId: nodeId, offset: UInt64(offset), data: contents)
+			} applied: { response in
+				.write(end: UInt64(offset) + UInt64(response.written), response.attributes)
+			}
 			return try state.withLockUnchecked { state in
-				try required(FSWriteFileResult(bytesWritten: Int(response.written), itemAttributes: fsAttributes(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
+				try required(FSWriteFileResult(bytesWritten: Int(response.written), itemAttributes: populated(response.attributes, &state), freeSpace: fsFreeSpace(response.freeSpace, &state)))
 			}
 		}
 	}

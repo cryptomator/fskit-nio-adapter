@@ -2,6 +2,20 @@ kind = response
 opcode = open
 requestId = 15
 status = 0
+attributes.type = file
+attributes.mode = 445
+attributes.size = 21007
+attributes.nodeId = 85
+attributes.parentId = 65
+attributes.modified.seconds = 1700002100
+attributes.modified.nanos = 100000021
+attributes.accessed.seconds = 1700002101
+attributes.accessed.nanos = 200000021
+attributes.created.seconds = 1700002102
+attributes.created.nanos = 300000021
+attributes.generation = 521
 hex:
-00000013 01 000b 000000000000000f 00000004
-00000000
+0000005a 01 000b 000000000000000f 0000004b
+000000000101bd000000000000520f0000000000000055000000000000004100
+0000006553f93405f5e115000000006553f9350bebc215000000006553f93611
+e1a3150000000000000209

@@ -17,7 +17,8 @@ public enum Opcode {
 	WRITE(14),
 	SYNC(15),
 	READLINK(16),
-	SYMLINK(17);
+	SYMLINK(17),
+	CHANGES(18);
 
 	private final int wireValue;
 

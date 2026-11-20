@@ -56,7 +56,7 @@ public class FSKitMountProvider implements MountService {
 	private static final int MIN_OS_MAJOR_VERSION = 27;
 	private static final String FS_TYPE_PROPERTY = "org.cryptomator.frontend.fskit.fsType";
 	private static final String DEFAULT_FS_TYPE = "cryptomatorfs";
-	private static final Duration SESSION_CLOSE_TIMEOUT = Duration.ofSeconds(10);
+	static final Duration SESSION_CLOSE_TIMEOUT = Duration.ofSeconds(10);
 	private static final Duration KILLED_MOUNT_TIMEOUT = Duration.ofSeconds(10);
 	static final int MOUNT_TIMEOUT_SECONDS = 30;
 
@@ -70,7 +70,7 @@ public class FSKitMountProvider implements MountService {
 	}
 
 	static BridgeSession createSession(Path fileSystemRoot, boolean readOnly) throws IOException {
-		return new BridgeSession(new FileSystemOperations(fileSystemRoot, readOnly), SESSION_CLOSE_TIMEOUT);
+		return new BridgeSession(new FileSystemOperations(fileSystemRoot, readOnly, NativeOutsideChanges.of(NativeLibrary.SHARED, fileSystemRoot)), SESSION_CLOSE_TIMEOUT);
 	}
 
 	FSKitMountProvider(ProcessHelper.Starter processStarter, SessionFactory sessionFactory, ExtensionCheck extensionCheck, VolumeMounter volumeMounter) {

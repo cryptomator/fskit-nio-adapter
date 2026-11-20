@@ -89,7 +89,7 @@ final class EventLogOptOut {
 				if ((r.modes() & Messages.MODE_WRITE) != 0) {
 					throw new StatusException(Errno.EPERM);
 				}
-				yield new OpenResponse();
+				yield new OpenResponse(r.nodeId() == DIRECTORY_ID ? directory : file);
 			}
 			case ReadRequest r when r.nodeId() == FILE_ID -> new ReadResponse(file, ByteBuffer.allocate(0));
 			case ReadlinkRequest r when shows(r.nodeId()) -> throw new StatusException(Errno.EINVAL);

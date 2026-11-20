@@ -10,6 +10,8 @@ import org.cryptomator.frontend.fskit.protocol.FrameCodec;
 import org.cryptomator.frontend.fskit.protocol.FrameCodecTest;
 import org.cryptomator.frontend.fskit.protocol.Messages;
 import org.cryptomator.frontend.fskit.protocol.Messages.Attributes;
+import org.cryptomator.frontend.fskit.protocol.Messages.ChangesRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ChangesResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
@@ -1373,6 +1375,87 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(expected, listed);
 		}
 
+		/**
+		 * Writes a file to the vault, and returns the ciphertext the vault stores it in.
+		 */
+		private Path writeThroughVault(String name, String content) throws IOException {
+			Files.writeString(vault.getPath("/" + name), content);
+			try (Stream<Path> files = Files.walk(root.resolve("d"))) {
+				return files.filter(file -> file.getFileName().toString().endsWith(".c9r") && !Set.of("dir.c9r", "dirid.c9r").contains(file.getFileName().toString())).findFirst().orElseThrow();
+			}
+		}
+
+		/**
+		 * Replaces a ciphertext with another through a rename, as a sync client does.
+		 */
+		private static void replaceCiphertext(Path ciphertext, Path replacement) throws IOException {
+			Path temporary = ciphertext.resolveSibling(".tmp");
+			Files.copy(replacement, temporary);
+			Files.move(temporary, ciphertext, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		}
+
+		private SignaledSource serveWithSource() throws IOException {
+			SignaledSource source = new SignaledSource(true);
+			ops.close();
+			ops = new HookedOperations(vault.getPath("/"), false, source);
+			return source;
+		}
+
+		private ChangesResponse changes(SignaledSource source, boolean signal) throws Exception {
+			try (ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor()) {
+				Future<Response> changes = threads.submit(() -> ops.handle(new ChangesRequest()));
+				if (signal) {
+					source.signal();
+				}
+				try {
+					return Assertions.assertInstanceOf(ChangesResponse.class, changes.get(10, TimeUnit.SECONDS));
+				} finally {
+					// the request waits until closeChanges ends it, and the executor's close waits for the request
+					if (!changes.isDone()) {
+						ops.closeChanges();
+					}
+				}
+			}
+		}
+
+		@Test
+		@DisplayName("a ciphertext replaced outside is reported with the size of its content")
+		public void testChangedCiphertext() throws Exception {
+			SignaledSource source = serveWithSource();
+			Path ciphertext = writeThroughVault("file.txt", "version one");
+			Path versionOne = Files.copy(ciphertext, root.resolve("version-one"));
+			Files.writeString(vault.getPath("/file.txt"), "version two, which is longer");
+			long file = lookup(ROOT, "file.txt").nodeId();
+
+			replaceCiphertext(ciphertext, versionOne);
+
+			ChangesResponse response = changes(source, true);
+			Assertions.assertEquals(List.of(file), response.attributes().stream().map(Attributes::nodeId).toList());
+			Assertions.assertEquals(11, response.attributes().getFirst().size());
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced while it was open, which the vault reports unchanged until it is closed, is reported again on its own once it is closed")
+		public void testChangedCiphertextOfOpenFile() throws Exception {
+			SignaledSource source = serveWithSource();
+			Path ciphertext = writeThroughVault("file.txt", "version one");
+			Path versionOne = Files.copy(ciphertext, root.resolve("version-one"));
+			Files.writeString(vault.getPath("/file.txt"), "version two, which is longer");
+			Files.writeString(vault.getPath("/other.txt"), "");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			lookup(ROOT, "other.txt");
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+
+			replaceCiphertext(ciphertext, versionOne);
+			Attributes whileOpen = changes(source, true).attributes().stream().filter(record -> record.nodeId() == file).findFirst().orElseThrow();
+			Assertions.assertEquals(28, whileOpen.size());
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			ChangesResponse afterClose = changes(source, false);
+			Assertions.assertEquals(List.of(file), afterClose.attributes().stream().map(Attributes::nodeId).toList());
+			Assertions.assertEquals(11, afterClose.attributes().getFirst().size());
+		}
+
 		@Test
 		@DisplayName("replacing a file that is open yields EBUSY")
 		public void testRenameOverOpenFile() {
@@ -1560,6 +1643,20 @@ public class FileSystemOperationsTest {
 			ok(new CloseRequest(file, 0), CloseResponse.class);
 			ok(new ForgetRequest(file, 1), ForgetResponse.class);
 			assertStatus(Errno.ENOENT, new LookupRequest(ROOT, "file.txt"));
+		}
+
+		@Test
+		@DisplayName("leaves a size the open file already has out of the applied attributes, and its time as it is")
+		public void testSizeUnchangedThroughOpenChannel() {
+			long file = createFile("file.txt", "0123456789");
+			Timestamp modified = getattr(file).modified();
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 10, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals(10, response.attributes().size());
+			Assertions.assertEquals(modified, response.attributes().modified());
+			Assertions.assertEquals("0123456789", read(file, 0, 100));
 		}
 
 		@Test
@@ -1801,6 +1898,39 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("an open replies with the attributes read after it")
+		public void testOpenReplyAttributes() throws IOException {
+			Files.writeString(root.resolve("file.txt"), "changed outside");
+
+			Attributes attributes = ok(new OpenRequest(file, READ), OpenResponse.class).attributes();
+
+			Assertions.assertEquals(file, attributes.nodeId());
+			Assertions.assertEquals(15, attributes.size());
+			Assertions.assertEquals(state(getattr(file)), state(attributes));
+		}
+
+		@Test
+		@DisplayName("an open whose attributes cannot be read closes the channel it opened, and leaves one opened before")
+		public void testOpenWithUnreadableAttributes() {
+			ops.afterReadingAttributes = path -> {
+				if (path.equals(root.resolve("file.txt"))) {
+					throw new AccessDeniedException(path.toString());
+				}
+			};
+
+			assertStatus(Errno.EACCES, new OpenRequest(file, READ));
+			Assertions.assertFalse(ops.openedChannels.getFirst().isOpen());
+
+			ops.afterReadingAttributes = _ -> {};
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ops.afterReadingAttributes = _ -> {
+				throw new AccessDeniedException("x");
+			};
+			assertStatus(Errno.EACCES, new OpenRequest(file, READ));
+			Assertions.assertTrue(ops.openedChannels.get(1).isOpen());
+		}
+
+		@Test
 		@DisplayName("widening the open modes swaps in a new channel and closes the old one")
 		public void testWidenModes() {
 			ok(new OpenRequest(file, READ), OpenResponse.class);
@@ -1968,6 +2098,20 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("leaves a size the file already has out of the applied attributes, and the file's time as it is")
+		public void testSizeUnchanged() throws IOException {
+			FileTime modified = FileTime.from(Instant.ofEpochSecond(1700000000));
+			Files.setLastModifiedTime(root.resolve("file.txt"), modified);
+
+			SetattrResponse response = setSize(10);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals(10, response.attributes().size());
+			Assertions.assertEquals(modified, Files.getLastModifiedTime(root.resolve("file.txt")));
+			Assertions.assertEquals(new Timestamp(1700000000, 0), response.attributes().modified());
+		}
+
+		@Test
 		@DisplayName("extends a file with zeros")
 		public void testExtend() throws IOException {
 			SetattrResponse response = setSize(10000);
@@ -1990,6 +2134,20 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(1, ops.openedChannels.size());
 			Assertions.assertEquals("0123", read(file, 0, 100));
+		}
+
+		@Test
+		@DisplayName("leaves a size the file already has out of the applied attributes also through its writable channel")
+		public void testSizeUnchangedThroughWritableChannel() throws IOException {
+			FileTime modified = FileTime.from(Instant.ofEpochSecond(1700000000));
+			Files.setLastModifiedTime(root.resolve("file.txt"), modified);
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+
+			SetattrResponse response = setSize(10);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals(modified, Files.getLastModifiedTime(root.resolve("file.txt")));
+			Assertions.assertEquals(1, ops.openedChannels.size());
 		}
 
 		@Test
@@ -2992,6 +3150,20 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("a truncation to the size the file has replies with that size when the file's attributes cannot be read")
+		public void testTruncateToItsSize() throws IOException {
+			backing("file.txt", "0123456789");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			Files.writeString(root.resolve("file.txt"), "0123456789a");
+			ops.beforeReadingAttributes = failing;
+
+			SetattrResponse response = ok(new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 11, 0, EPOCH, EPOCH), SetattrResponse.class);
+
+			Assertions.assertEquals(0, response.applied());
+			Assertions.assertEquals(11, response.attributes().size());
+		}
+
+		@Test
 		@DisplayName("a create still succeeds, with the type and mode it established")
 		public void testCreate() throws IOException {
 			Attributes directory = getattr(ROOT);
@@ -3221,10 +3393,10 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("both can be opened, no_log can be read, and both are still there after a close and a forget")
+		@DisplayName("both can be opened with their records, no_log can be read, and both are still there after a close and a forget")
 		public void testReading() {
-			ok(new OpenRequest(directory.nodeId(), READ), OpenResponse.class);
-			ok(new OpenRequest(file.nodeId(), READ), OpenResponse.class);
+			Assertions.assertEquals(directory, ok(new OpenRequest(directory.nodeId(), READ), OpenResponse.class).attributes());
+			Assertions.assertEquals(file, ok(new OpenRequest(file.nodeId(), READ), OpenResponse.class).attributes());
 
 			Assertions.assertEquals("", read(file.nodeId(), 0, 100));
 			ok(new CloseRequest(file.nodeId(), 0), CloseResponse.class);
@@ -3409,6 +3581,297 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals(List.of("file.txt", "target"), backingNames());
 			Assertions.assertEquals(List.of(".DS_Store"), backingNames(root.resolve("target")));
+		}
+	}
+
+	/**
+	 * A source of outside changes that a test signals.
+	 */
+	static final class SignaledSource implements OutsideChanges {
+
+		private final boolean starts;
+		private volatile Runnable onChange;
+		volatile boolean closed;
+
+		SignaledSource(boolean starts) {
+			this.starts = starts;
+		}
+
+		@Override
+		public boolean start(Runnable onChange) {
+			this.onChange = onChange;
+			return starts;
+		}
+
+		void signal() {
+			onChange.run();
+		}
+
+		@Override
+		public void close() {
+			closed = true;
+		}
+	}
+
+	@Nested
+	@DisplayName("changes made outside the volume")
+	@Timeout(60)
+	public class OutsideChangesReported {
+
+		private final ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor();
+		private SignaledSource source;
+
+		@BeforeEach
+		public void setup() throws IOException {
+			source = new SignaledSource(true);
+			ops.close();
+			ops = new HookedOperations(root, false, source);
+		}
+
+		@AfterEach
+		public void stopThreads() {
+			ops.closeChanges();
+			threads.shutdownNow();
+		}
+
+		private Future<Response> changes() {
+			return threads.submit(() -> ops.handle(new ChangesRequest()));
+		}
+
+		private static Map<Long, Attributes> records(Future<Response> changes) throws Exception {
+			ChangesResponse response = Assertions.assertInstanceOf(ChangesResponse.class, changes.get(10, TimeUnit.SECONDS));
+			Map<Long, Attributes> records = new HashMap<>();
+			response.attributes().forEach(record -> records.put(record.nodeId(), record));
+			Assertions.assertEquals(response.attributes().size(), records.size(), "a node is reported once per response");
+			return records;
+		}
+
+		private static void assertWaits(Future<?> future) {
+			Assertions.assertThrows(TimeoutException.class, () -> future.get(300, TimeUnit.MILLISECONDS));
+		}
+
+		@Test
+		@DisplayName("without a source, or with one that does not start, a CHANGES request yields ENOTSUP")
+		public void testWithoutSource() throws IOException {
+			ops.close();
+			ops = new HookedOperations(root, false);
+			assertStatus(Errno.ENOTSUP, new ChangesRequest());
+
+			ops.close();
+			ops = new HookedOperations(root, false, new SignaledSource(false));
+			assertStatus(Errno.ENOTSUP, new ChangesRequest());
+		}
+
+		@Test
+		@DisplayName("waits for a signal, then reports every held file and link, changed or not, and no directory and nothing only listed")
+		public void testReportsHeldFiles() throws Exception {
+			backing("changed.txt", "one");
+			backing("unchanged.txt", "one");
+			backing("listed.txt", "one");
+			Files.createDirectory(root.resolve("dir"));
+			long changed = lookup(ROOT, "changed.txt").nodeId();
+			long unchanged = lookup(ROOT, "unchanged.txt").nodeId();
+			long link = ok(new SymlinkRequest(ROOT, "link", "changed.txt"), SymlinkResponse.class).attributes().nodeId();
+			lookup(ROOT, "dir");
+			readdir(ROOT, 0, 0, true);
+			Future<Response> changes = changes();
+			assertWaits(changes);
+
+			backing("changed.txt", "two, longer");
+			source.signal();
+
+			Map<Long, Attributes> records = records(changes);
+			Assertions.assertEquals(Set.of(changed, unchanged, link), records.keySet());
+			Assertions.assertEquals(11, records.get(changed).size());
+			Assertions.assertEquals(3, records.get(unchanged).size());
+			Assertions.assertEquals(state(getattr(changed)), state(records.get(changed)));
+			assertWaits(changes());
+		}
+
+		@Test
+		@DisplayName("reports a held file that became a link as a link, and leaves out one removed or forgotten")
+		public void testTypeChangeAndGoneNodes() throws Exception {
+			backing("swapped.txt", "one");
+			backing("removed.txt", "one");
+			backing("forgotten.txt", "one");
+			long swapped = lookup(ROOT, "swapped.txt").nodeId();
+			lookup(ROOT, "removed.txt");
+			long forgotten = lookup(ROOT, "forgotten.txt").nodeId();
+			ok(new ForgetRequest(forgotten, 1), ForgetResponse.class);
+			Files.delete(root.resolve("swapped.txt"));
+			Files.createSymbolicLink(root.resolve("swapped.txt"), Path.of("removed.txt"));
+			Files.delete(root.resolve("removed.txt"));
+			Future<Response> changes = changes();
+
+			source.signal();
+
+			Map<Long, Attributes> records = records(changes);
+			Assertions.assertEquals(Set.of(swapped), records.keySet());
+			Assertions.assertEquals(NodeType.SYMLINK, records.get(swapped).type());
+		}
+
+		@Test
+		@DisplayName("a signal during a sweep leads to another sweep after it, and none follows without a signal")
+		public void testSignalDuringSweep() throws Exception {
+			backing("file.txt", "one");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeReadingAttributes = HookedOperations.blocking(entered, release);
+			Future<Response> first = changes();
+			source.signal();
+			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
+
+			source.signal();
+			release.countDown();
+
+			Assertions.assertEquals(Set.of(file), records(first).keySet());
+			Assertions.assertEquals(Set.of(file), records(changes()).keySet());
+			assertWaits(changes());
+		}
+
+		@Test
+		@DisplayName("a sweep that the session's close meets stops after the sample underway")
+		public void testCloseDuringSweep() throws Exception {
+			backing("first.txt", "one");
+			backing("second.txt", "one");
+			lookup(ROOT, "first.txt");
+			lookup(ROOT, "second.txt");
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			HookedOperations.Hook blocking = HookedOperations.blocking(entered, release);
+			Set<Path> sampled = ConcurrentHashMap.newKeySet();
+			ops.beforeReadingAttributes = path -> {
+				if (sampled.add(path) && sampled.size() == 1) {
+					blocking.run(path);
+				}
+			};
+			Future<Response> changes = changes();
+			source.signal();
+			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
+
+			ops.closeChanges();
+			release.countDown();
+
+			Assertions.assertEquals(new Failure(Errno.EIO), changes.get(10, TimeUnit.SECONDS));
+			Assertions.assertEquals(1, sampled.size(), sampled.toString());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("a response holds no more records than fit into a frame, and the rest follow at once")
+		public void testPages() throws Exception {
+			Set<Long> held = new HashSet<>();
+			for (int i = 0; i <= ChangesResponse.CAPACITY; i++) {
+				backing("file-" + i, "");
+				held.add(lookup(ROOT, "file-" + i).nodeId());
+			}
+			Future<Response> first = changes();
+			source.signal();
+
+			Map<Long, Attributes> firstPage = records(first);
+			Map<Long, Attributes> secondPage = records(changes());
+
+			Assertions.assertEquals(ChangesResponse.CAPACITY, firstPage.size());
+			Assertions.assertEquals(1, secondPage.size());
+			Set<Long> reported = new HashSet<>(firstPage.keySet());
+			reported.addAll(secondPage.keySet());
+			Assertions.assertEquals(held, reported);
+			Frame frame = FrameCodecTest.read(FrameCodecTest.write(new ChangesResponse(List.copyOf(firstPage.values())).toFrame(Opcode.CHANGES, 1)));
+			Assertions.assertEquals(Opcode.CHANGES, frame.opcode());
+		}
+
+		@ParameterizedTest(name = "unchecked: {0}")
+		@ValueSource(booleans = {false, true})
+		@DisplayName("a file that cannot be sampled is left out until the next signal")
+		public void testFailedSample(boolean unchecked) throws Exception {
+			backing("failing.txt", "one");
+			backing("other.txt", "one");
+			long failing = lookup(ROOT, "failing.txt").nodeId();
+			long other = lookup(ROOT, "other.txt").nodeId();
+			ops.beforeReadingAttributes = path -> {
+				if (path.equals(root.resolve("failing.txt"))) {
+					IOException failure = new IOException("disk on fire");
+					if (unchecked) {
+						throw new UncheckedIOException(failure);
+					}
+					throw failure;
+				}
+			};
+			Future<Response> first = changes();
+			source.signal();
+
+			Assertions.assertEquals(Set.of(other), records(first).keySet());
+			Future<Response> second = changes();
+			assertWaits(second);
+			ops.beforeReadingAttributes = _ -> {};
+			source.signal();
+			Assertions.assertEquals(Set.of(failing, other), records(second).keySet());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("a file renamed while a sweep is about to sample it is sampled at its new path")
+		public void testRenameDuringSweep() throws Exception {
+			backing("file.txt", "one");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = onlyOnceAt(root.resolve("file.txt"), HookedOperations.blocking(entered, release));
+			Future<Response> changes = changes();
+			source.signal();
+			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
+
+			ok(new RenameRequest(file, ROOT, "file.txt", ROOT, "renamed.txt"), RenameResponse.class);
+			backing("renamed.txt", "two, longer");
+			release.countDown();
+
+			Assertions.assertEquals(11, records(changes).get(file).size());
+		}
+
+		@Test
+		@DisplayName("a file forgotten while a sweep is about to sample it is left out")
+		public void testForgetDuringSweep() throws Exception {
+			backing("forgotten.txt", "one");
+			backing("other.txt", "one");
+			long forgotten = lookup(ROOT, "forgotten.txt").nodeId();
+			long other = lookup(ROOT, "other.txt").nodeId();
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeLocking = onlyOnceAt(root.resolve("forgotten.txt"), HookedOperations.blocking(entered, release));
+			Future<Response> changes = changes();
+			source.signal();
+			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
+
+			ok(new ForgetRequest(forgotten, 1), ForgetResponse.class);
+			release.countDown();
+
+			Assertions.assertEquals(Set.of(other), records(changes).keySet());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("closing ends a waiting request with EIO and answers later ones at once, and closing the operations stops the source")
+		public void testClose() throws Exception {
+			Future<Response> changes = changes();
+			assertWaits(changes);
+
+			ops.closeChanges();
+
+			Assertions.assertEquals(new Failure(Errno.EIO), changes.get(10, TimeUnit.SECONDS));
+			assertStatus(Errno.EIO, new ChangesRequest());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+			ops.close();
+			Assertions.assertTrue(source.closed);
+		}
+
+		private static HookedOperations.Hook onlyOnceAt(Path path, HookedOperations.Hook hook) {
+			AtomicBoolean ran = new AtomicBoolean();
+			return candidate -> {
+				if (candidate.equals(path) && ran.compareAndSet(false, true)) {
+					hook.run(candidate);
+				}
+			};
 		}
 	}
 

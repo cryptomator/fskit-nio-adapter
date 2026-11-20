@@ -67,6 +67,13 @@ final class NodeTable {
 	}
 
 	/**
+	 * @return The files and links that the kernel references and whose entries exist. Taking the snapshot adds no reference.
+	 */
+	synchronized List<Node> heldSnapshot() {
+		return nodesById.values().stream().filter(node -> node.lookups > 0 && node.type != NodeType.DIRECTORY && !node.unlinked).toList();
+	}
+
+	/**
 	 * @return Whether the kernel references the node. A referenced node stays in the table until the forget that drops its last reference, which closes its channel. Only a forget lowers the count, and it takes the node's data lock, so the answer holds while the caller has that lock.
 	 */
 	synchronized boolean isHeld(Node node) {

@@ -21,6 +21,11 @@ import java.util.stream.Stream;
 
 public class MessagesTest {
 
+	/**
+	 * A valid control section of an {@code OPEN} response: status 0 and a record of a file.
+	 */
+	private static final String OPEN_RESPONSE_CONTROL = "00000000 01 01a4 0000000000000000 0000000000000040 0000000000000002" + "00".repeat(3 * 12 + 8);
+
 	static Stream<Vector> vectors() throws IOException {
 		return Vector.messages();
 	}
@@ -125,7 +130,7 @@ public class MessagesTest {
 	@DisplayName("rejects a payload on a message that has none")
 	public void testDecodeUnexpectedPayload() {
 		Assertions.assertThrows(ProtocolException.class, () -> Messages.decodeRequest(frame(Frame.Kind.REQUEST, Opcode.GETATTR, "0000000000000040", "00")));
-		Assertions.assertThrows(ProtocolException.class, () -> Messages.decodeResponse(frame(Frame.Kind.RESPONSE, Opcode.OPEN, "00000000", "00")));
+		Assertions.assertThrows(ProtocolException.class, () -> Messages.decodeResponse(frame(Frame.Kind.RESPONSE, Opcode.OPEN, OPEN_RESPONSE_CONTROL, "00")));
 		Assertions.assertThrows(ProtocolException.class, () -> Messages.decodeResponse(frame(Frame.Kind.RESPONSE, Opcode.READ, "00000005", "00")));
 	}
 

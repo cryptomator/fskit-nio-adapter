@@ -63,7 +63,7 @@ public class NativeVolumeMounterTest {
 		NativeLibrary library = new NativeLibrary("substituted.dylib") {
 			@Override
 			synchronized Functions functions() {
-				return new Functions(mount, mount, mount, mount);
+				return new Functions(mount, mount, mount, mount, mount, mount);
 			}
 		};
 

@@ -18,6 +18,7 @@ public enum Opcode: UInt16, CaseIterable, Sendable {
 	case sync = 15
 	case readlink = 16
 	case symlink = 17
+	case changes = 18
 }
 
 public struct Frame: Equatable, Sendable {

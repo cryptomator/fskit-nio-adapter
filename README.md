@@ -19,7 +19,7 @@ flowchart LR
 - `mount()` starts a session on an ephemeral loopback port, and writes the port and a random token into a manifest in an owner-only directory under the temp directory. With a mount point set, it runs `/sbin/mount -F -t cryptomatorfs <that directory> <mountpoint>`. Without one, it asks FSKit through `libFSKitNioSupport.dylib` to mount that directory (`FSClient.mountSingleVolume`), and the system creates the mount point in `/Volumes`.
 - `fskitd` names a mount point in `/Volumes` after the volume, appends ` 1` to a name that is taken, and refuses a name that is not ASCII. So the extension starts the volume under its name transliterated to ASCII, and gives it its real name once it is mounted.
 - The extension reads the manifest, connects and presents the token. From then on it forwards the operations it supports and refuses every caller but root and the user who mounted.
-- The extension answers what needs no round trip itself: extended attributes, lookups of hidden names, a sync with nothing written since the last one, the open of a file it created, and the continuation of a listing page. Apart from what these answers need, it holds only a map from node ids to FSKit items with the number of lookups of each, the volume's size, and the newest free space it has seen. While requests overlap, it also keeps the newest attributes of their items.
+- The extension answers what needs no round trip itself: extended attributes, lookups of hidden names, a sync with nothing written since the last one, the open of a file it created, and the continuation of a listing page. Apart from what these answers need, it holds only a map from node ids to FSKit items with the number of lookups of each, the volume's size, and the newest free space it has seen. While requests overlap, it also keeps the newest attributes of their items. For each file it handed out, it keeps the attributes of the version FSKit may have cached, so that it can make FSKit drop that cache once the file changed outside the volume.
 - The table of nodes and their paths, name handling, directory listings and open channels live in Java (`org.cryptomator.frontend.fskit.fs`).
 - Each volume serves its requests concurrently. Requests on the same entries wait for each other where they would conflict, as a rename waits for the requests in flight below what it moves. Separate mounts are independent.
 - The wire format is specified in [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md).
@@ -34,7 +34,7 @@ Java (JDK 25, on macOS or Linux):
 ./mvnw verify
 ```
 
-The build fails on a compiler warning. On macOS it also runs `swift build` (macOS 27 SDK). It puts `libFSKitNioSupport.dylib`, through which the provider checks the app and mounts without a mount point, into the jar and zips the extension into `target/fskit-nio-adapter-<version>-appex.zip`. `-P'!fskit-native'` leaves both out and needs no Swift tooling, as on Linux.
+The build fails on a compiler warning. On macOS it also runs `swift build` (macOS 27 SDK). It puts `libFSKitNioSupport.dylib`, through which the provider checks the app, mounts without a mount point and learns of changes made outside a volume, into the jar and zips the extension into `target/fskit-nio-adapter-<version>-appex.zip`. `-P'!fskit-native'` leaves both out and needs no Swift tooling, as on Linux.
 
 Swift (macOS 27 SDK, Swift 6.2 or later):
 
@@ -94,7 +94,7 @@ A broken seal fails opaquely: `fskitd` does not launch a bundle whose signature 
 
 ## Embed the extension in an app
 
-An app that offers the provider embeds the extension. Next to the jar `org.cryptomator:fskit-nio-adapter`, each release publishes the extension as a zip with the classifier `appex` (`fskit-nio-adapter-<version>-appex.zip`). The jar holds `libFSKitNioSupport.dylib`. Both are built for Apple silicon and carry no signature but the linker's ad-hoc one.
+An app that offers the provider embeds the extension. Next to the jar `org.cryptomator:fskit-nio-adapter`, each release publishes the extension as a zip with the classifier `appex` (`fskit-nio-adapter-<version>-appex.zip`). The extension works only with the jar of the same version, since the protocol between them can change with any version before 1.0.0. The jar holds `libFSKitNioSupport.dylib`. Both are built for Apple silicon and carry no signature but the linker's ad-hoc one.
 
 The app:
 
@@ -144,6 +144,8 @@ It does not cover Finder, mounting without a mount point, a disabled extension, 
 SMOKE_OTHER_ACCOUNT=<account> fskit/scripts/smoke-test.sh
 ```
 
+The smoke test needs the library `FSKitNioSupport`, which reports changes made outside a volume. The script builds it with the Swift toolchain. Where that is missing, as in a VM without developer tools, `SMOKE_NATIVE_LIBRARY` names a built `libFSKitNioSupport.dylib` instead.
+
 The script's header lists its arguments, scenarios, environment and exit statuses.
 
 ## Known limitations
@@ -153,6 +155,7 @@ Observed on macOS 27.0.1 and 27.2 with JDK 26.
 - Another account gets "Permission denied" on a mounted volume, but root reads and changes it like the user who mounted it. An account that can get to the mount point is not kept from everything:
   - It can enter the volume's root and a directory the mounting user has accessed, though not list them. While it stays there, the volume can only be unmounted by force.
   - For an entry the mounting user has accessed, `stat` answers with the entry's attributes, such as its size, from the kernel's cache.
+  - While the mounting user holds a file open, the account can read it, and while the mounting user holds it open for writing, it can also write to it. macOS passes on an open of a file that is already open only if it asks for more access than the file is open with, or once a change outside made the volume drop what macOS cached of the file. Only this way of handling opens lets the volume show changes made outside it.
   - Removing such an entry reports success, although nothing is removed.
   - Extended attribute calls by path on such an entry are not refused. They reveal nothing, and what they set is discarded.
   - An FSEvents stream on the mount point reports the paths of entries as they change.
@@ -178,7 +181,15 @@ Observed on macOS 27.0.1 and 27.2 with JDK 26.
 - The JVM keeps the names of listed directories in memory, within a sixteenth of its heap per volume, and beyond that drops the listings used least recently. On a vault, a directory of 200,000 files with names of 26 characters fits into the share of a 512 MiB heap: its names take about 17 MiB, and listing it took up to 53 MiB of that heap. A directory whose names exceed that share is kept while it is listed and read again whenever a caller returns to it after listing another directory.
 - When a listing was dropped and its directory holds other names by the time the listing continues, the continuation fails with "Input/output error". `find` and `cp -R` print nothing for a failed listing and leave out the rest of that directory. A tool that removes entries while it walks a tree can meet this in a directory whose names exceed the share of the heap for listings. On a vault served with that share cut down, `bfs -delete` left such a directory half removed. `/usr/bin/find -delete` and `rm -rf` removed it.
 - When several processes walk the same tree of a volume at once, macOS now and then ends one of their listings early without an error. The adapter is not asked for the entries left out. On a vault, six `/usr/bin/find` walked a tree of 40 directories with 200 files each at the same time. In 9 of 1,068 such walks, a `find` missed the last five entries of one directory and exited with status 0.
-- Nothing else may modify the mounted `Path` while it is mounted.
+- FSKit tells a volume nothing about changes made to its files elsewhere, and keeps what it has read of a file (Apple r.177724575). The adapter therefore watches the mounted `Path`, or the directory of a vault, through FSEvents and makes macOS read a changed file again. This needs the library `FSKitNioSupport` that the jar carries on macOS:
+  - A file that another process, such as a sync client, changes in the mounted `Path` shows its new size and content within about a second. Without the library it does so only once its folder is listed, or after an open of it failed as described below. A Finder window open on the folder keeps showing the old size until it is opened again.
+  - A file that a process holds open while it changes keeps showing that process what it has read of the old version until the last descriptor is closed. What it has not read yet comes from the file as it is now. After a change in place on a plain directory, that is the new version, so the process can see parts of both. Opening it again meanwhile fails with "Stale NFS file handle" on a plain directory and shows the old version on a vault. After the last close, the next access shows the new version, on a vault a few milliseconds later.
+  - The open that finds a file changed fails with "Stale NFS file handle", whether for reading or for writing. The next open shows the new version.
+  - A change that replaces a file is kept while a process holds the file open for writing, on a vault as well. A change made in place to a file in a plain directory can be overwritten in part by what such a process wrote before it.
+  - A file removed outside still answers `stat` with its old attributes until it is opened. The open fails with "No such file or directory", and `stat` finds no file from then on.
+  - A file replaced by one of the same size and modification time is not noticed, nor one replaced by one of the same size while a process writes to it.
+  - A name that macOS looked up while no entry had it stays missing until macOS drops the folder from its cache, also after something else created an entry under that name. An open Finder window shows the new entry only once it is opened again.
+  - Replacing a directory of the mounted `Path` with a file or a link from outside, while it is mounted, is not supported.
 - The mounted `Path` must not hold two names that differ only in Unicode normalization.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.
 - Replacing a file that is open (`mv` onto it) fails with "Resource busy" on a vault, because cryptofs refuses to replace an open file. It works on a plain directory.

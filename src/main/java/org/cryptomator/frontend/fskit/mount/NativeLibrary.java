@@ -21,7 +21,7 @@ import static java.lang.foreign.ValueLayout.JAVA_INT;
 
 /**
  * The library that {@code fskit/Sources/FSKitNioSupport} builds, loaded on first use.
- * It calls FSKit from within this process, so FSKit sees the app's signature: its team and its entitlements.
+ * It calls FSKit from within this process, so FSKit sees the app's signature: its team and its entitlements. It also watches the backing store of a volume through FSEvents.
  */
 class NativeLibrary {
 
@@ -56,15 +56,29 @@ class NativeLibrary {
 			try {
 				functions = Functions.load(resourceName);
 			} catch (IOException | RuntimeException e) {
-				LOG.warn("Failed to load {}, so the FSKit extension can neither be checked nor mount without a mount point", resourceName, e);
+				LOG.warn("Failed to load {}, so the FSKit extension can neither be checked nor mount without a mount point, and changes made outside a volume are not reported", resourceName, e);
 			}
 		}
 		return functions;
 	}
 
+	/**
+	 * @return The library's functions, or {@code null} if this build does not contain the library, which is not logged. A library that fails to load is logged as {@link #functions()} logs it.
+	 */
+	@Nullable Functions functionsIfBuiltIn() {
+		return NativeLibrary.class.getResource(resourceName) != null ? functions() : null;
+	}
+
 	static int invoke(MethodHandle function, Object... arguments) {
+		return (int) call(function, arguments);
+	}
+
+	/**
+	 * @return What the function returns, or {@code null} for a function that returns nothing
+	 */
+	static @Nullable Object call(MethodHandle function, Object... arguments) {
 		try {
-			return (int) function.invokeWithArguments(arguments);
+			return function.invokeWithArguments(arguments);
 		} catch (RuntimeException | Error e) {
 			throw e;
 		} catch (Throwable e) {
@@ -72,7 +86,7 @@ class NativeLibrary {
 		}
 	}
 
-	record Functions(MethodHandle embedded, MethodHandle status, MethodHandle openSettings, MethodHandle mount) {
+	record Functions(MethodHandle embedded, MethodHandle status, MethodHandle openSettings, MethodHandle mount, MethodHandle watchStart, MethodHandle watchStop) {
 
 		@SuppressWarnings("restricted")
 		static Functions load(String resourceName) throws IOException {
@@ -90,7 +104,9 @@ class NativeLibrary {
 					linker.downcallHandle(symbols.findOrThrow("fskitnio_embedded_extension"), FunctionDescriptor.of(JAVA_INT, ADDRESS)), //
 					linker.downcallHandle(symbols.findOrThrow("fskitnio_extension_status"), FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT)), //
 					linker.downcallHandle(symbols.findOrThrow("fskitnio_open_extension_settings"), FunctionDescriptor.of(JAVA_INT)), //
-					linker.downcallHandle(symbols.findOrThrow("fskitnio_mount"), FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT)));
+					linker.downcallHandle(symbols.findOrThrow("fskitnio_mount"), FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT)), //
+					linker.downcallHandle(symbols.findOrThrow("fskitnio_watch_start"), FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS)), //
+					linker.downcallHandle(symbols.findOrThrow("fskitnio_watch_stop"), FunctionDescriptor.ofVoid(ADDRESS)));
 		}
 	}
 }

@@ -63,6 +63,7 @@ public final class Messages {
 				case SYNC -> new SyncRequest();
 				case READLINK -> ReadlinkRequest.decode(control);
 				case SYMLINK -> SymlinkRequest.decode(control);
+				case CHANGES -> new ChangesRequest();
 			};
 			assertConsumed(control, frame.opcode() == Opcode.WRITE ? EMPTY : payload);
 			return request;
@@ -94,13 +95,14 @@ public final class Messages {
 				case CREATE -> CreateResponse.decode(control);
 				case REMOVE -> RemoveResponse.decode(control);
 				case RENAME -> RenameResponse.decode(control);
-				case OPEN -> new OpenResponse();
+				case OPEN -> OpenResponse.decode(control);
 				case CLOSE -> CloseResponse.decode(control);
 				case READ -> ReadResponse.decode(control, payload);
 				case WRITE -> WriteResponse.decode(control);
 				case SYNC -> SyncResponse.decode(control);
 				case READLINK -> ReadlinkResponse.decode(control);
 				case SYMLINK -> SymlinkResponse.decode(control);
+				case CHANGES -> ChangesResponse.decode(control);
 			};
 			assertConsumed(control, frame.opcode() == Opcode.READ ? EMPTY : payload);
 			return response;
@@ -541,6 +543,14 @@ public final class Messages {
 		}
 	}
 
+	public record ChangesRequest() implements Request {
+
+		@Override
+		public Opcode opcode() {
+			return Opcode.CHANGES;
+		}
+	}
+
 	/* responses */
 
 	public sealed interface Response {
@@ -721,7 +731,16 @@ public final class Messages {
 		}
 	}
 
-	public record OpenResponse() implements Response {
+	public record OpenResponse(Attributes attributes) implements Response {
+
+		@Override
+		public void encode(ByteBuffer control) {
+			attributes.encode(control);
+		}
+
+		static OpenResponse decode(ByteBuffer control) throws ProtocolException {
+			return new OpenResponse(Attributes.decode(control));
+		}
 	}
 
 	public record CloseResponse(FreeSpace freeSpace) implements Response {
@@ -804,6 +823,29 @@ public final class Messages {
 
 		static SymlinkResponse decode(ByteBuffer control) throws ProtocolException {
 			return new SymlinkResponse(Attributes.decode(control), Wire.getString(control), Attributes.decode(control), FreeSpace.decode(control));
+		}
+	}
+
+	public record ChangesResponse(List<Attributes> attributes) implements Response {
+
+		/**
+		 * The most records a response holds, so that it fits into a control section.
+		 */
+		public static final int CAPACITY = (FrameCodec.MAX_CONTROL_LENGTH - (4 + 2)) / Attributes.ENCODED_LENGTH;
+
+		@Override
+		public void encode(ByteBuffer control) {
+			control.putShort((short) attributes.size());
+			attributes.forEach(record -> record.encode(control));
+		}
+
+		static ChangesResponse decode(ByteBuffer control) throws ProtocolException {
+			int count = Short.toUnsignedInt(control.getShort());
+			List<Attributes> attributes = new ArrayList<>();
+			for (int i = 0; i < count; i++) {
+				attributes.add(Attributes.decode(control));
+			}
+			return new ChangesResponse(attributes);
 		}
 	}
 }
