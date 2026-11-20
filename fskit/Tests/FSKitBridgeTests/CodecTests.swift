@@ -86,6 +86,7 @@ struct MessagesTests {
 		case .sync: try roundTrip(SyncRequest.self, frame)
 		case .readlink: try roundTrip(ReadlinkRequest.self, frame)
 		case .symlink: try roundTrip(SymlinkRequest.self, frame)
+		case .changes: try roundTrip(ChangesRequest.self, frame)
 		}
 	}
 
@@ -101,6 +102,9 @@ struct MessagesTests {
 			return (["status = \(failure.status)"], Messages.frame(forFailure: failure.status, opcode: frame.opcode, requestId: frame.requestId))
 		}
 	}
+
+	/// A valid control section of an `OPEN` response: status 0 and a record of a file.
+	private static let openResponseControl = "00000000 01 01a4 0000000000000000 0000000000000040 0000000000000002" + String(repeating: "00", count: 3 * 12 + 8)
 
 	private static func frame(_ kind: Frame.Kind, _ opcode: Opcode, control: String, payload: String = "") -> Frame {
 		Frame(kind: kind, opcode: opcode, requestId: 1, control: Data(hex: control)!, payload: Data(hex: payload)!)
@@ -193,7 +197,7 @@ struct MessagesTests {
 			try Messages.decodeRequest(GetattrRequest.self, from: Self.frame(.request, .getattr, control: "0000000000000040", payload: "00"))
 		}
 		#expect(throws: ProtocolError.self) {
-			try Messages.decodeResponse(OpenResponse.self, from: Self.frame(.response, .open, control: "00000000", payload: "00"))
+			try Messages.decodeResponse(OpenResponse.self, from: Self.frame(.response, .open, control: Self.openResponseControl, payload: "00"))
 		}
 		#expect(throws: ProtocolError.self) {
 			try Messages.decodeResponse(ReadResponse.self, from: Self.frame(.response, .read, control: "00000005", payload: "00"))

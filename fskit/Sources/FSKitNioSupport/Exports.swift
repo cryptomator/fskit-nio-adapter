@@ -94,6 +94,23 @@ public func mount(shortName: UnsafePointer<CChar>, rendezvousDir: UnsafePointer<
 	}
 }
 
+/// Watches a directory tree for changes that other processes make, through FSEvents.
+///
+/// - Parameters:
+///   - callback: Runs on a thread of the watch whenever something in the tree may have changed.
+/// - Returns: A handle for `fskitnio_watch_stop`, or `nil` if watching could not start.
+@_cdecl("fskitnio_watch_start")
+public func watchStart(path: UnsafePointer<CChar>, callback: @convention(c) () -> Void) -> UnsafeMutableRawPointer? {
+	ChangeWatch(path: String(cString: path), callback: callback).map { Unmanaged.passRetained($0).toOpaque() }
+}
+
+/// Stops a watch and releases its handle. Once this returns, its callback no longer runs.
+@_cdecl("fskitnio_watch_stop")
+public func watchStop(handle: UnsafeMutableRawPointer) {
+	let watch = Unmanaged<ChangeWatch>.fromOpaque(handle).takeRetainedValue()
+	watch.stop()
+}
+
 private let lateMountLogger = Logger(subsystem: "org.cryptomator.fskit", category: "LateMount")
 
 private func holdsMountEntitlement() -> Bool {

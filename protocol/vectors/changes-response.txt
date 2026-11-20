@@ -1,0 +1,35 @@
+kind = response
+opcode = changes
+requestId = 22
+status = 0
+attributes[0].type = file
+attributes[0].mode = 454
+attributes[0].size = 22007
+attributes[0].nodeId = 86
+attributes[0].parentId = 68
+attributes[0].modified.seconds = 1700002200
+attributes[0].modified.nanos = 100000022
+attributes[0].accessed.seconds = 1700002201
+attributes[0].accessed.nanos = 200000022
+attributes[0].created.seconds = 1700002202
+attributes[0].created.nanos = 300000022
+attributes[0].generation = 522
+attributes[1].type = file
+attributes[1].mode = 463
+attributes[1].size = 23007
+attributes[1].nodeId = 87
+attributes[1].parentId = 71
+attributes[1].modified.seconds = 1700002300
+attributes[1].modified.nanos = 100000023
+attributes[1].accessed.seconds = 1700002301
+attributes[1].accessed.nanos = 200000023
+attributes[1].created.seconds = 1700002302
+attributes[1].created.nanos = 300000023
+attributes[1].generation = 523
+hex:
+000000a3 01 0012 0000000000000016 00000094
+0000000000020101c600000000000055f7000000000000005600000000000000
+44000000006553f99805f5e116000000006553f9990bebc216000000006553f9
+9a11e1a316000000000000020a0101cf00000000000059df0000000000000057
+0000000000000047000000006553f9fc05f5e117000000006553f9fd0bebc217
+000000006553f9fe11e1a317000000000000020b

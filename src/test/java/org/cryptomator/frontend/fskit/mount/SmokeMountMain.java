@@ -4,6 +4,8 @@ import org.cryptomator.cryptofs.CryptoFileSystemProperties;
 import org.cryptomator.cryptofs.CryptoFileSystemProvider;
 import org.cryptomator.cryptolib.api.Masterkey;
 import org.cryptomator.cryptolib.api.MasterkeyLoader;
+import org.cryptomator.frontend.fskit.BridgeSession;
+import org.cryptomator.frontend.fskit.fs.FileSystemOperations;
 import org.cryptomator.integrations.mount.Mount;
 import org.cryptomator.integrations.mount.MountFailedException;
 import org.cryptomator.integrations.mount.UnmountFailedException;
@@ -26,7 +28,7 @@ import java.util.Set;
 /**
  * Mounts and unmounts directories and throwaway vaults on command, see {@code fskit/scripts/smoke-test.sh}.
  * <p>
- * Reads one command per line from standard input, its fields separated by tabs, and answers each with one log line whose message starts with {@code REPLY}. The replies are logged, so that they share one ordered stream with the log lines of the sessions.
+ * Reads one command per line from standard input, its fields separated by tabs, and answers each with one log line whose message starts with {@code REPLY}. A mount whose command ends with the field {@code nosource} serves its volume without reporting changes made outside it. The replies are logged, so that they share one ordered stream with the log lines of the sessions.
  * <p>
  * Once a mount has terminated, for whatever reason, a log line whose message starts with {@code TERMINATED} says so. That line answers no command.
  */
@@ -43,34 +45,19 @@ public class SmokeMountMain {
 		LOG = LoggerFactory.getLogger(SmokeMountMain.class);
 	}
 
-	// smoke-test.sh builds without the native library. The provider would then warn on every mount, which the script's log scan reports. Outside an app, the library would answer NOT_IN_APP anyway.
-	private final FSKitMountProvider provider = new FSKitMountProvider(ProcessBuilder::start, FSKitMountProvider::createSession, new OutsideApp(), (_, _, _) -> {
+	private static final VolumeMounter NO_MOUNTER = (_, _, _) -> {
 		throw new MountFailedException("every smoke mount sets a mount point");
-	});
+	};
+
+	// smoke-test.sh runs with the native library, which reports changes made outside a volume. Outside an app, its extension check answers NOT_IN_APP.
+	private final FSKitMountProvider provider = new FSKitMountProvider(ProcessBuilder::start, FSKitMountProvider::createSession, NativeExtensionCheck.SHARED, NO_MOUNTER);
+	private final FSKitMountProvider providerWithoutSource = new FSKitMountProvider(ProcessBuilder::start, (root, readOnly) -> new BridgeSession(new FileSystemOperations(root, readOnly), FSKitMountProvider.SESSION_CLOSE_TIMEOUT), NativeExtensionCheck.SHARED, NO_MOUNTER);
 	private final Map<String, Mounted> mounted = new LinkedHashMap<>();
 
 	/**
 	 * @param vault The vault whose root is mounted, or {@code null} if a plain directory is
 	 */
 	private record Mounted(Mount mount, @Nullable FileSystem vault) {
-	}
-
-	private static class OutsideApp implements ExtensionCheck {
-
-		@Override
-		public Status embedded(String fsType) {
-			return Status.NOT_IN_APP;
-		}
-
-		@Override
-		public Status status(String fsType) {
-			return Status.NOT_IN_APP;
-		}
-
-		@Override
-		public boolean openSettings() {
-			throw new AssertionError("only asked for a switched-off extension");
-		}
 	}
 
 	public static void main(String[] args) throws IOException {
@@ -98,8 +85,8 @@ public class SmokeMountMain {
 	private void handle(String command) {
 		String[] fields = command.split("\t", -1);
 		String id = fields.length > 1 ? fields[1] : "-";
-		if (fields[0].equals("mount") && fields.length == 6 && Set.of("plain", "vault").contains(fields[2]) && Set.of("rw", "ro").contains(fields[3]) && !mounted.containsKey(id)) {
-			mount(id, fields[2].equals("vault"), fields[3].equals("ro"), fields[4], fields[5]);
+		if (fields[0].equals("mount") && (fields.length == 6 || fields.length == 7 && fields[6].equals("nosource")) && Set.of("plain", "vault").contains(fields[2]) && Set.of("rw", "ro").contains(fields[3]) && !mounted.containsKey(id)) {
+			mount(fields.length == 6 ? provider : providerWithoutSource, id, fields[2].equals("vault"), fields[3].equals("ro"), fields[4], fields[5]);
 		} else if (fields[0].equals("unmount") && fields.length == 2 && mounted.containsKey(id)) {
 			unmount(id, false);
 		} else if (fields[0].equals("unmount-forced") && fields.length == 2 && mounted.containsKey(id)) {
@@ -111,7 +98,7 @@ public class SmokeMountMain {
 		}
 	}
 
-	private void mount(String id, boolean isVault, boolean readOnly, String backingDir, String mountPoint) {
+	private void mount(FSKitMountProvider provider, String id, boolean isVault, boolean readOnly, String backingDir, String mountPoint) {
 		try {
 			FileSystem vault = isVault ? openVault(Path.of(backingDir)) : null;
 			try {

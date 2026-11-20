@@ -8,13 +8,24 @@ final class ScriptedServer: Sendable {
 	/// After this many requests the server closes the connection, so that a client that never stops asking fails its test instead of hanging it.
 	private static let maxRequests = 16
 
+	/// The connection, and the requests the server holds back.
+	private struct Held: Sendable {
+		var connection: Int32 = -1
+		var requests: [Frame] = []
+	}
+
 	let manifest: Manifest
 	private let listener: Int32
+	private let respond: @Sendable (Frame) throws -> Frame?
+	private let held = OSAllocatedUnfairLock(initialState: Held())
+	/// Held while a response is sent, so that `release` and the server's thread do not interleave frames.
+	private let sending = NSLock()
 
 	/// - Parameters:
 	///   - batches: One number per batch: how many requests the server reads before it answers them, which it does in reverse order. Requests after the last batch are answered one at a time.
+	///   - holding: Requests with this opcode are answered only by `release`.
 	///   - respond: Returns the response to a request, or `nil` to close the connection instead of answering.
-	init(batches: [Int] = [], respond: @escaping @Sendable (Frame) throws -> Frame?) throws {
+	init(batches: [Int] = [], holding: Opcode? = nil, respond: @escaping @Sendable (Frame) throws -> Frame?) throws {
 		let listener = socket(AF_INET, SOCK_STREAM, 0)
 		var address = sockaddr_in()
 		address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -28,37 +39,74 @@ final class ScriptedServer: Sendable {
 		}
 		try #require(bound)
 		self.listener = listener
+		self.respond = respond
 		self.manifest = Manifest(protocolVersion: Messages.protocolVersion, port: UInt16(bigEndian: address.sin_port), token: Data(count: Messages.tokenLength), volumeName: "Scripted")
+		let held = held
+		let sending = sending
 		Thread.detachNewThread {
-			let connection = accept(listener, nil, nil)
-			guard connection >= 0 else {
-				return
+			Self.serve(listener: listener, batches: batches, holding: holding, held: held, sending: sending, respond: respond)
+		}
+	}
+
+	/// Accepts one connection, answers its handshake and then its requests.
+	// swiftlint:disable:next function_parameter_count
+	private static func serve(listener: Int32, batches: [Int], holding: Opcode?, held: OSAllocatedUnfairLock<Held>, sending: NSLock, respond: @Sendable (Frame) throws -> Frame?) {
+		let connection = accept(listener, nil, nil)
+		guard connection >= 0 else {
+			return
+		}
+		held.withLock { $0.connection = connection }
+		defer {
+			sending.withLock {
+				held.withLock { $0.connection = -1 }
+				close(connection)
 			}
-			defer { close(connection) }
-			do {
-				let hello = try FrameCodec.decode { try Self.receive(connection, $0) }
-				try Self.send(connection, FrameCodec.encode(Messages.frame(for: HelloResponse(), opcode: .hello, requestId: hello.requestId)))
-				var batches = batches[...]
-				var answered = 0
-				while answered < Self.maxRequests {
-					let size = batches.popFirst() ?? 1
-					let requests = try (0 ..< size).map { _ in try FrameCodec.decode { try Self.receive(connection, $0) } }
-					for request in requests.reversed() {
-						guard let response = try respond(request) else {
-							return
-						}
-						try Self.send(connection, FrameCodec.encode(response))
+		}
+		do {
+			let hello = try FrameCodec.decode { try receive(connection, $0) }
+			try send(connection, FrameCodec.encode(Messages.frame(for: HelloResponse(), opcode: .hello, requestId: hello.requestId)))
+			var batches = batches[...]
+			var answered = 0
+			while answered < maxRequests {
+				let size = batches.popFirst() ?? 1
+				let requests = try (0 ..< size).map { _ in try FrameCodec.decode { try receive(connection, $0) } }
+				for request in requests.reversed() {
+					if request.opcode == holding {
+						held.withLock { $0.requests.append(request) }
+						continue
 					}
-					answered += size
+					guard let response = try respond(request) else {
+						return
+					}
+					try sending.withLock { try send(connection, FrameCodec.encode(response)) }
 				}
-			} catch {
-				// the client is gone
+				answered += size
 			}
+		} catch {
+			// the client is gone
 		}
 	}
 
 	deinit {
 		close(listener)
+	}
+
+	var heldCount: Int {
+		held.withLock { $0.requests.count }
+	}
+
+	/// Answers the requests held back.
+	func release() throws {
+		let requests = held.withLock { held in
+			defer { held.requests = [] }
+			return held.requests
+		}
+		for request in requests {
+			let response = try #require(try respond(request))
+			try sending.withLock {
+				try Self.send(held.withLock { $0.connection }, FrameCodec.encode(response))
+			}
+		}
 	}
 
 	private static func receive(_ connection: Int32, _ count: Int) throws -> Data {
@@ -231,6 +279,38 @@ struct BridgeClientTests {
 		#expect(!client.canAnswerSyncItself)
 		_ = try await client.request(SyncRequest())
 		#expect(client.canAnswerSyncItself)
+	}
+
+	@Test func aChangesRequestInFlightCountsNeitherAsSentNorKeepsAListingFromReusingItsPage() async throws {
+		let server = try ScriptedServer(holding: .changes) { frame in
+			guard frame.opcode == .readdir else {
+				return Messages.frame(for: ChangesResponse(attributes: [Self.attributes(size: 3)]), opcode: .changes, requestId: frame.requestId)
+			}
+			// 12 entries named by their index, at most 8 per page
+			let request = try Messages.decodeRequest(ReaddirRequest.self, from: frame)
+			let start = min(Int(request.cookie), 12)
+			let end = min(start + 8, 12)
+			let entries = (start ..< end).map { DirectoryEntry(name: "\($0)", type: .file, nodeId: 100 + UInt64($0), nextCookie: UInt64($0 + 1), attributes: nil) }
+			return Messages.frame(for: ReaddirResponse(verifier: 7, more: end < 12, entries: entries), opcode: .readdir, requestId: frame.requestId)
+		}
+		let client = try BridgeClient(manifest: server.manifest)
+		defer { client.disconnect() }
+
+		async let changes = client.request(ChangesRequest())
+		while server.heldCount == 0 {
+			try await Task.sleep(for: .milliseconds(1))
+		}
+		let listed = try await DirectoryLister(client: client).listAll(directory: 64, capacity: 5, counting: client)
+
+		#expect(listed.names == (0 ..< 12).map { "\($0)" })
+		// the second call continues in the first page, the third in the second
+		#expect(listed.requestsPerCall == [1, 1, 0, 1])
+		#expect(client.requestCounts.isQuiet)
+		#expect(client.requestCounts.sent == 3)
+		try server.release()
+		#expect(try await changes.attributes == [Self.attributes(size: 3)])
+		#expect(client.requestCounts.isQuiet)
+		#expect(client.requestCounts.sent == 3)
 	}
 
 	@Test func concurrentRequestsEachGetTheirOwnResponse() async throws {

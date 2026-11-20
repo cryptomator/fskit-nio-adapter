@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.5.1...HEAD)
-
-No changes yet.
+### Fixed
+* A file that another process, such as a sync client, changes in the mounted `Path` shows its new size and content within about a second, where it kept its old ones as long as macOS remembered the file. Writing to such a file after the change no longer puts its old content back. See the README's known limitations for what remains
 
 
 ## [0.5.1](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.5.1) - 2026-11-10

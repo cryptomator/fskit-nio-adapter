@@ -101,6 +101,7 @@ struct InteropTests {
 		_ = try await client.request(RemoveRequest(nodeId: listing, parentId: Self.root, name: "listing"))
 
 		try await concurrentRequestsAreEachAnswered(client)
+		try await openRepliesWithAttributesAndChangesAreUnsupported(client)
 
 		#expect(try await client.request(RemoveRequest(nodeId: file, parentId: Self.root, name: "renamed.txt")).attributes.size == 3)
 		_ = try await client.request(RemoveRequest(nodeId: directory.attributes.nodeId, parentId: Self.root, name: "dir"))
@@ -152,6 +153,27 @@ struct InteropTests {
 		_ = try await client.request(RemoveRequest(nodeId: reading, parentId: directory, name: "reading"))
 		_ = try await client.request(RemoveRequest(nodeId: changing, parentId: directory, name: "changing"))
 		_ = try await client.request(RemoveRequest(nodeId: directory, parentId: Self.root, name: "concurrent"))
+	}
+}
+
+extension InteropTests {
+	/// In a directory of its own, opens a file, whose response carries its attributes, and asks for changes made outside the volume, which this server has no source of.
+	private func openRepliesWithAttributesAndChangesAreUnsupported(_ client: BridgeClient) async throws {
+		let directory = try await client.request(CreateRequest(parentId: Self.root, name: "opened", type: .directory, mode: 0o755)).attributes.nodeId
+		let file = try await client.request(CreateRequest(parentId: directory, name: "file", type: .file, mode: 0o644)).attributes.nodeId
+		_ = try await client.write(nodeId: file, offset: 0, data: Data("abc".utf8))
+		_ = try await client.request(CloseRequest(nodeId: file, keptModes: 0))
+
+		let opened = try await client.request(OpenRequest(nodeId: file, modes: Messages.modeRead))
+		#expect(opened.attributes.nodeId == file)
+		#expect(opened.attributes.size == 3)
+		await #expect(throws: StatusError(status: ENOTSUP)) {
+			try await client.request(ChangesRequest())
+		}
+
+		_ = try await client.request(CloseRequest(nodeId: file, keptModes: 0))
+		_ = try await client.request(RemoveRequest(nodeId: file, parentId: directory, name: "file"))
+		_ = try await client.request(RemoveRequest(nodeId: directory, parentId: Self.root, name: "opened"))
 	}
 }
 

@@ -3,6 +3,8 @@ package org.cryptomator.frontend.fskit.fs;
 import org.cryptomator.frontend.fskit.protocol.FrameCodec;
 import org.cryptomator.frontend.fskit.protocol.Messages;
 import org.cryptomator.frontend.fskit.protocol.Messages.Attributes;
+import org.cryptomator.frontend.fskit.protocol.Messages.ChangesRequest;
+import org.cryptomator.frontend.fskit.protocol.Messages.ChangesResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
@@ -98,9 +100,9 @@ import static org.cryptomator.frontend.fskit.fs.PathLocks.Requirement.writePath;
 /**
  * Serves the operations of one mounted volume against a root {@link Path}.
  * <p>
- * Requests run concurrently. Each operation takes the lock set of {@link PathLocks} that its entries need, then the data locks of its nodes, in ascending node id where it needs several. An operation reads its nodes' paths before it takes the set. Once it holds the set, it checks that they are unchanged, and otherwise starts again. An entry's attributes are read, stamped with a generation and published under its sampling lock, and every operation that changes them samples them again afterwards, so that a higher generation always means a later state.
+ * Requests run concurrently. Each operation takes the lock set of {@link PathLocks} that its entries need, then the data locks of its nodes, in ascending node id where it needs several. An operation reads its nodes' paths before it takes the set. Once it holds the set, it checks that they are unchanged, and otherwise starts again. An entry's attributes are read, stamped with a generation and published under its sampling lock, and every operation that changes them samples them again afterwards, so that a higher generation always means a later state. Which responses also read them under the node's data lock is part of the protocol (see its generation note).
  * <p>
- * Lock order, outermost first: the lock set, data locks, a sampling lock or the monitor of an unlinked node, the monitor of {@link DirectorySnapshots}, the monitor of {@link NodeTable}.
+ * Lock order, outermost first: the lock set, data locks, a sampling lock or the monitor of an unlinked node, the monitor of {@link DirectorySnapshots} or of {@link ChangeTracker}, the monitor of {@link NodeTable}.
  */
 @SuppressWarnings("OctalInteger")
 public class FileSystemOperations implements Closeable {
@@ -118,10 +120,19 @@ public class FileSystemOperations implements Closeable {
 	private final DirectorySnapshots snapshots;
 	private final PathLocks locks;
 	private final EventLogOptOut eventLogOptOut;
+	private final @Nullable OutsideChanges source;
+	private final @Nullable ChangeTracker changes;
 	// 0 is left to records that never change and to an unknown usable space
 	private final AtomicLong generations = new AtomicLong();
 
 	public FileSystemOperations(Path root, boolean readOnly) throws IOException {
+		this(root, readOnly, null);
+	}
+
+	/**
+	 * @param source Reports changes that something else makes to the backing store, which {@code CHANGES} requests then report. These operations close it.
+	 */
+	public FileSystemOperations(Path root, boolean readOnly, @Nullable OutsideChanges source) throws IOException {
 		this.readOnly = readOnly;
 		this.fileStore = Files.getFileStore(root);
 		this.posix = fileStore.supportsFileAttributeView(PosixFileAttributeView.class);
@@ -129,6 +140,9 @@ public class FileSystemOperations implements Closeable {
 		this.snapshots = new DirectorySnapshots(nodes, listingBudget());
 		this.locks = new PathLocks(root);
 		this.eventLogOptOut = new EventLogOptOut(now());
+		this.source = source;
+		ChangeTracker tracker = new ChangeTracker(nodes);
+		this.changes = source != null && source.start(tracker::signal) ? tracker : null;
 	}
 
 	public Response handle(Request request) {
@@ -155,6 +169,7 @@ public class FileSystemOperations implements Closeable {
 				case SyncRequest _ -> sync();
 				case ReadlinkRequest r -> readlink(r);
 				case SymlinkRequest r -> symlink(r);
+				case ChangesRequest _ -> changes();
 			};
 		} catch (IOException | RuntimeException e) {
 			int status = Errno.of(e);
@@ -166,10 +181,22 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	/**
-	 * Closes every open channel and forgets every node. Called once no request is running anymore.
+	 * Ends a {@code CHANGES} request that waits, and answers every later one at once. Called once no further request will arrive, so that the requests in flight can return.
+	 */
+	public void closeChanges() {
+		if (changes != null) {
+			changes.close();
+		}
+	}
+
+	/**
+	 * Stops the source of outside changes, closes every open channel and forgets every node. Called once no request is running anymore.
 	 */
 	@Override
 	public void close() {
+		if (source != null) {
+			source.close();
+		}
 		nodes.clear();
 	}
 
@@ -235,10 +262,14 @@ public class FileSystemOperations implements Closeable {
 			// the backing file system may need the owner's read permission to set times, so they go ahead of a mode without it and after a mode with it
 			boolean timesFirst = setsMode && (request.mode() & 0400) == 0;
 			int applied = 0;
+			boolean sizeEstablished = false;
 			try {
 				if ((request.valid() & Messages.ATTRIBUTE_SIZE) != 0 && node.type == NodeType.FILE) {
-					truncateOrExpand(node, request.size());
-					applied |= Messages.ATTRIBUTE_SIZE;
+					// a size the file already has changes neither it nor its time, which a client that compares the reply relies on
+					if (truncateOrExpand(node, request.size())) {
+						applied |= Messages.ATTRIBUTE_SIZE;
+					}
+					sizeEstablished = true;
 				}
 				if (setsTimes && timesFirst) {
 					setTimes(node.path, modified, accessed);
@@ -258,7 +289,7 @@ public class FileSystemOperations implements Closeable {
 				}
 				FailureLog.warn(LOG, "Unable to apply every attribute requested for node " + node.id + ". Replying with the ones that took effect.", e);
 			}
-			int established = applied;
+			int established = sizeEstablished ? applied | Messages.ATTRIBUTE_SIZE : applied;
 			Attributes attributes = refreshAfterChange(node, last -> new Attributes(last.type(), //
 					(established & Messages.ATTRIBUTE_MODE) != 0 ? request.mode() : last.mode(), //
 					(established & Messages.ATTRIBUTE_SIZE) != 0 ? request.size() : last.size(), //
@@ -383,6 +414,14 @@ public class FileSystemOperations implements Closeable {
 			setPermissions(created, permissions);
 		} catch (IOException | RuntimeException e) {
 			FailureLog.warn(LOG, "Unable to set the permissions of a created entry.", e);
+		}
+	}
+
+	private void closeQuietly(Node node, Exception failure) {
+		try {
+			nodes.closeChannel(node);
+		} catch (IOException | RuntimeException e) {
+			failure.addSuppressed(e);
 		}
 	}
 
@@ -521,11 +560,20 @@ public class FileSystemOperations implements Closeable {
 
 	private OpenResponse open(OpenRequest request) throws IOException {
 		return onNode(request.nodeId(), true, node -> {
+			boolean opened = node.channel == null;
 			// macOS opens a link itself to copy it. Like a directory, a link gets no channel, so nothing is followed.
 			if (node.type == NodeType.FILE) {
 				ensureOpen(node, request.modes() & (Messages.MODE_READ | Messages.MODE_WRITE));
 			}
-			return new OpenResponse();
+			try {
+				return new OpenResponse(refresh(node));
+			} catch (IOException | RuntimeException e) {
+				// the client takes a failed open for none and never closes what it opened
+				if (opened) {
+					closeQuietly(node, e);
+				}
+				throw e;
+			}
 		});
 	}
 
@@ -533,6 +581,9 @@ public class FileSystemOperations implements Closeable {
 		return onNode(request.nodeId(), true, node -> {
 			if ((request.keptModes() & (Messages.MODE_READ | Messages.MODE_WRITE)) == 0) {
 				nodes.closeChannel(node);
+				if (changes != null) {
+					changes.channelClosed(node);
+				}
 			}
 			return new CloseResponse(freeSpace());
 		});
@@ -606,6 +657,54 @@ public class FileSystemOperations implements Closeable {
 			throw firstFailure;
 		}
 		return new SyncResponse(freeSpace());
+	}
+
+	/**
+	 * Waits until outside changes are reported, and samples the nodes they may concern.
+	 */
+	private ChangesResponse changes() throws IOException {
+		if (changes == null) {
+			throw new StatusException(Errno.ENOTSUP);
+		}
+		while (true) {
+			List<Attributes> sampled = new ArrayList<>();
+			for (Node node : changes.next(ChangesResponse.CAPACITY)) {
+				// a session that closes waits only for the sample underway
+				if (changes.isClosed()) {
+					throw new StatusException(Errno.EIO);
+				}
+				Attributes attributes = sampleChange(node);
+				if (attributes != null) {
+					sampled.add(attributes);
+				}
+			}
+			if (!sampled.isEmpty()) {
+				return new ChangesResponse(sampled);
+			}
+		}
+	}
+
+	/**
+	 * @return The node's attributes as a getattr reads them, or {@code null} if the node is gone or cannot be read now. The client learns of a removal from the next request for the node.
+	 */
+	private @Nullable Attributes sampleChange(Node node) {
+		if (node.unlinked || node.forgotten) {
+			return null;
+		}
+		try {
+			return onNode(node.id, false, held -> {
+				if (held.channel != null) {
+					Objects.requireNonNull(changes).sampledWhileOpen(held);
+				}
+				return refresh(held);
+			});
+		} catch (IOException e) {
+			// sampled again on the next report
+			return null;
+		} catch (RuntimeException e) {
+			FailureLog.warn(LOG, "Unable to sample node " + node.id + " for changes made outside the volume.", e);
+			return null;
+		}
 	}
 
 	private ReadlinkResponse readlink(ReadlinkRequest request) throws IOException {
@@ -1016,16 +1115,27 @@ public class FileSystemOperations implements Closeable {
 		return options;
 	}
 
-	private void truncateOrExpand(Node node, long size) throws IOException {
+	/**
+	 * @return {@code true} if the file had another size
+	 */
+	private boolean truncateOrExpand(Node node, long size) throws IOException {
 		if (node.channel != null && (node.modes & Messages.MODE_WRITE) != 0) {
-			FileChannelUtil.truncateOrExpand(node.channel, size);
+			return resize(node.channel, size);
 		} else if (node.unlinked) {
 			throw new StatusException(Errno.EINVAL);
 		} else {
 			try (FileChannel channel = openChannel(node.path, openOptions(Messages.MODE_WRITE))) {
-				FileChannelUtil.truncateOrExpand(channel, size);
+				return resize(channel, size);
 			}
 		}
+	}
+
+	private static boolean resize(FileChannel channel, long size) throws IOException {
+		if (channel.size() == size) {
+			return false;
+		}
+		FileChannelUtil.truncateOrExpand(channel, size);
+		return true;
 	}
 
 	/* attributes */

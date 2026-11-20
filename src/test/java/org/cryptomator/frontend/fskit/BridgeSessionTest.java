@@ -5,6 +5,8 @@ import org.cryptomator.frontend.fskit.fs.HookedOperations;
 import org.cryptomator.frontend.fskit.fs.HookedOperations.ChannelCall;
 import org.cryptomator.frontend.fskit.protocol.Frame;
 import org.cryptomator.frontend.fskit.protocol.Messages;
+import org.cryptomator.frontend.fskit.fs.OutsideChanges;
+import org.cryptomator.frontend.fskit.protocol.Messages.ChangesRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseRequest;
 import org.cryptomator.frontend.fskit.protocol.Messages.CloseResponse;
 import org.cryptomator.frontend.fskit.protocol.Messages.CreateRequest;
@@ -514,6 +516,35 @@ public class BridgeSessionTest {
 
 			Assertions.assertFalse(operations.openedChannels.getFirst().isOpen());
 			Assertions.assertThrows(IOException.class, () -> client.request(new SyncRequest()));
+		}
+	}
+
+	@Test
+	@DisplayName("closing while a CHANGES request waits ends it, the session and the source, without an unexpected failure")
+	public void testCloseWithChangesOutstanding() throws IOException {
+		session.close();
+		CountDownLatch sourceClosed = new CountDownLatch(1);
+		operations = new HookedOperations(root, false, new OutsideChanges() {
+			@Override
+			public boolean start(Runnable onChange) {
+				return true;
+			}
+
+			@Override
+			public void close() {
+				sourceClosed.countDown();
+			}
+		});
+		session = new BridgeSession(operations, SHORT_CLOSE_TIMEOUT);
+		try (TestBridgeClient client = connect()) {
+			client.send(new ChangesRequest());
+			ok(client.request(new StatfsRequest()), StatfsResponse.class);
+
+			session.close();
+
+			Assertions.assertTrue(session.hasEnded());
+			Assertions.assertEquals(0, sourceClosed.getCount());
+			Assertions.assertEquals(List.of(), operations.unexpectedFailures);
 		}
 	}
 

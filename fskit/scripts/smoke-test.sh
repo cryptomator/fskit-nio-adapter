@@ -18,13 +18,16 @@
 # Scenarios:
 #   basics io listing modes renames names links unreadable-directory
 #   open-unlinked backend-failure parallel two-mounts occupied external-unmount
-#   busy-unmount read-only vault
+#   busy-unmount read-only outside vault
 #   access, which joins them only where SMOKE_OTHER_ACCOUNT is set
 #
 # Environment:
 #   SMOKE_OTHER_ACCOUNT  a second account, not root. The scenario access works
 #                        on a volume as that account, which `sudo -n -u` has
 #                        to reach without a password.
+#   SMOKE_NATIVE_LIBRARY a built libFSKitNioSupport.dylib, which reports changes
+#                        made outside a volume. Without it the build makes the
+#                        library, which needs the Swift toolchain.
 #
 # Exit status: 0 if every check passed, 1 if checks failed, 2 if the test could
 # not run, 129, 130 or 143 if a signal ended it.
@@ -37,7 +40,7 @@ REPO_ROOT="${FSKIT_DIR:h}"
 INSTALLED_APPEX=/Applications/FSKitNioHost.app/Contents/Extensions/FSKitNioExtension.appex
 # relative to the appex
 EXTENSION_EXECUTABLE=Contents/MacOS/FSKitNioExtension
-SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only vault)
+SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only outside vault)
 # access needs a second account and joins the others only where SMOKE_OTHER_ACCOUNT names one
 OPT_IN_SCENARIOS=(access)
 
@@ -78,6 +81,18 @@ if (( ${SELECTED[(Ie)access]} )); then
 fi
 if ! FS_TYPE_NAME="$(/usr/libexec/PlistBuddy -c "Print :EXAppExtensionAttributes:FSShortName" "$INSTALLED_APPEX/Contents/Info.plist" 2> /dev/null)"; then
 	echo "error: the test host app must be installed at ${INSTALLED_APPEX:h:h:h}, see the README" >&2
+	exit 2
+fi
+
+# the provider reports changes made outside a volume only with the native library, which it loads from its package
+LIBRARY_RESOURCE="$REPO_ROOT/target/classes/org/cryptomator/frontend/fskit/mount/libFSKitNioSupport.dylib"
+if [[ -n "${SMOKE_NATIVE_LIBRARY:-}" ]]; then
+	mkdir -p "${LIBRARY_RESOURCE:h}" && cp "$SMOKE_NATIVE_LIBRARY" "$LIBRARY_RESOURCE" || exit 2
+	NATIVE_PROFILE=-P'!fskit-native'
+elif xcode-select -p > /dev/null 2>&1; then
+	NATIVE_PROFILE=-Pfskit-native
+else
+	echo "error: the native library is needed: set SMOKE_NATIVE_LIBRARY to a built libFSKitNioSupport.dylib, or install the Swift toolchain" >&2
 	exit 2
 fi
 
@@ -322,7 +337,7 @@ require_installed_extension() {
 	fi
 }
 
-# mount_volume <id> <plain|vault> <rw|ro> <backing directory> <mount point>: fails, having recorded the failure, unless the mount table confirms the volume. After a failure, nothing may be written to the mount point.
+# mount_volume <id> <plain|vault> <rw|ro> <backing directory> <mount point> [nosource]: fails, having recorded the failure, unless the mount table confirms the volume. With nosource, the volume's server has no source of changes made outside it. After a failure, nothing may be written to the mount point.
 mount_volume() {
 	local id="$1" mount_point="$5" source
 	local -a pids_before
@@ -1299,7 +1314,8 @@ access() {
 	check "the mounting user reads a file" test "$(cat "$MNT/fixture.txt")" = fixture
 	check_fails "the other account cannot list the volume after that" "Permission denied" as_other ls "$MNT"
 	check_fails "it cannot read the file" "Permission denied" as_other cat "$MNT/fixture.txt"
-	check_fails "it cannot read a file the mounting user holds open" "Permission denied" holding_open "$MNT/held.txt" as_other cat "$MNT/held.txt"
+	# FSKit passes on only the first open of a file to a volume that negotiates the kernel's caching, which revoking files changed outside needs
+	check "it reads a file the mounting user holds open" holding_open "$MNT/held.txt" as_other cat "$MNT/held.txt"
 	# a mode the file cannot have under any umask: one it already has would not reach the volume
 	check_fails "it cannot change the file's mode" "Permission denied" as_other chmod 700 "$MNT/fixture.txt"
 	check_fails "it cannot rename the file" "Permission denied" as_other mv "$MNT/fixture.txt" "$MNT/renamed.txt"
@@ -1310,6 +1326,301 @@ access() {
 	check "the mounting user creates a file" echo_to mine "$MNT/mine.txt"
 	check "the mounting user removes it" rm "$MNT/mine.txt"
 	unmount_volume "$SCENARIO" "$MNT"
+}
+
+# Changes the backing store while the volume is mounted, against the rule for fixtures, as a sync client does. A plain directory is changed in place, except the file a writer holds, which is replaced through a rename. A vault is changed by replacing a file's ciphertext through a rename.
+outside() {
+	local name names=(event listed read write removed held writer)
+	for name in $names truncated; do
+		print -n "version two, which is longer" > "$BACKING/$name.txt"
+	done
+	outside_rounds plain "$BACKING"
+	BACKING="$SCENARIO_DIR/vault"
+	mkdir "$BACKING"
+	prepare_vault_versions $names || return 0
+	outside_rounds vault "$BACKING"
+}
+
+# outside_rounds <plain|vault> <backing directory>
+outside_rounds() {
+	local kind="$1" sig="$SCENARIO_DIR/sig-$1" node kept read written
+	integer offset
+	mkdir -p "$sig"
+	mount_volume "$SCENARIO-$kind" "$kind" rw "$2" "$MNT" || return 0
+	cat "$MNT/event.txt" > /dev/null
+	request sync "$SCENARIO"
+	node="$(node_of event.txt Lookup)"
+	check "$kind: the program's log shows event.txt looked up" test -n "$node"
+	offset=$(wc -c < "$PROGRAM_LOG")
+	change_outside "$kind" event.txt
+	check "$kind: stat shows a change made outside within 3 s" shows_size_within "$MNT/event.txt" 11 3
+	check "$kind: a CHANGES response named the file with its new size" changes_reported "$node" $offset 11
+	check "$kind: cat then shows the new content" content_is "$MNT/event.txt" "version one"
+	holder_read "$MNT/held.txt" "$sig"
+	await_file "$sig/ready" || return 0
+	request sync "$SCENARIO"
+	node="$(node_of held.txt Lookup)"
+	check "$kind: the program's log shows held.txt looked up" test -n "$node"
+	offset=$(wc -c < "$PROGRAM_LOG")
+	change_outside "$kind" held.txt
+	# a vault reports the size of its open file, so the record may carry the old one
+	check "$kind: a CHANGES response names a file a process holds open" await_changes_reported "$node" $offset
+	mark "held-1-$kind"
+	if [[ "$kind" == plain ]]; then
+		# FSKit passes on a later open of a revoked item, one for reading as an upgrade, which the volume refuses
+		check_fails "$kind: another open while it is held fails" "Stale NFS file handle" cat "$MNT/held.txt"
+		check_fails "$kind: an open for writing while it is held fails" "NFS file handle" append_to stale "$MNT/held.txt"
+	else
+		# while the file is open, the vault reports its old size, so nothing is revoked and FSKit serves a later open from its cache
+		check "$kind: another open while it is held reads the old version" content_is "$MNT/held.txt" "version two, which is longer"
+	fi
+	mark "held-2-$kind"
+	check "$kind: and the server keeps the channel of the descriptor held" test "$(requests_between "held-1-$kind" "held-2-$kind" "CloseRequest[nodeId=$node,")" = 0
+	: > "$sig/go1"
+	await_file "$sig/reread"
+	check "$kind: the descriptor it holds keeps reading" test "$(sed -n 2p "$sig/holder.out")" = "second (28): version two, which is longer"
+	: > "$sig/go2"
+	await_file "$sig/closed"
+	# FSKit reclaims the revoked item right after the close
+	check "$kind: once it is closed, stat shows the new size" shows_size_within "$MNT/held.txt" 11 2
+	check "$kind: and cat the new content" content_is "$MNT/held.txt" "version one"
+	holder_write "$MNT/writer.txt" "$sig"
+	await_file "$sig/written" || return 0
+	# the writer's cached pages would go back over a change made in place
+	change_outside "$kind" writer.txt replace
+	: > "$sig/go3"
+	await_file "$sig/writer-closed"
+	# a vault reports the size of its open file until the writer's close reaches it
+	check "$kind: a writer open since before a change made outside leaves the new size when it closes" shows_size_within "$MNT/writer.txt" 11 3
+	check "$kind: and the new content" content_is "$MNT/writer.txt" "version one"
+	# the close can show the change before the stream reports it, up to its latency of 0.3 s after the change: wait for that report before the volume's own changes start
+	sleep 1
+	mark "own-1-$kind"
+	check "$kind: the volume writes, appends, changes a mode, renames and removes" own_changes "$MNT"
+	check "$kind: ls -l lists the files" ls -l "$MNT"
+	check "$kind: cat reads what the volume wrote" content_is "$MNT/own.txt" $'one\ntwo'
+	mark "own-2-$kind"
+	sleep 2
+	mark "own-3-$kind"
+	request sync "$SCENARIO"
+	kept="$(node_of own.txt Create)"
+	check "$kind: the program's log shows own.txt created" test -n "$kept"
+	check "$kind: its own changes cause no CHANGES response" test "$(requests_between "own-1-$kind" "own-3-$kind" 'ChangesRequest[')" = 0
+	check "$kind: and no forget of the file it wrote" test "$(requests_between "own-1-$kind" "own-3-$kind" "ForgetRequest[nodeId=$kept,")" = 0
+	check "$kind: a second open for writing succeeds" append_to three "$MNT/own.txt"
+	# FSKit passes on an open for writing of an item open for reading
+	check "$kind: an open for writing while a reader holds the file succeeds" holding_open "$MNT/own.txt" append_to four "$MNT/own.txt"
+	check "$kind: and the file holds every line written" content_is "$MNT/own.txt" $'one\ntwo\nthree\nfour'
+	unmount_volume "$SCENARIO-$kind" "$MNT"
+	mount_volume "$SCENARIO-$kind-nosource" "$kind" rw "$2" "$MNT" nosource || return 0
+	check "$kind: stat looks the files up" stat "$MNT/listed.txt" "$MNT/read.txt" "$MNT/write.txt" "$MNT/removed.txt"
+	request sync "$SCENARIO"
+	read="$(node_of read.txt Lookup)"
+	written="$(node_of write.txt Lookup)"
+	check "$kind: the program's log shows read.txt and write.txt looked up" test -n "$read" -a -n "$written"
+	change_outside "$kind" listed.txt
+	check "$kind: without a source of changes, ls -l lists a file changed outside with its new size" lists_size_of "$MNT" listed.txt 11
+	# the listing's revoke runs once it has replied
+	check "$kind: stat then shows it" shows_size_within "$MNT/listed.txt" 11 1
+	check "$kind: and cat the new content" content_is "$MNT/listed.txt" "version one"
+	change_outside "$kind" read.txt
+	change_outside "$kind" write.txt
+	mark "stale-1-$kind"
+	check_fails "$kind: an open for reading that finds the change fails" "Stale NFS file handle" cat "$MNT/read.txt"
+	mark "stale-2-$kind"
+	# FSKit never closes an open that failed, so the volume closes the channel its OPEN opened, which the server would keep otherwise
+	check "$kind: and closes the channel its OPEN opened" test "$(requests_between "stale-1-$kind" "stale-2-$kind" "CloseRequest[nodeId=$read,")" = 1
+	check "$kind: stat then shows the new size" shows_size_within "$MNT/read.txt" 11 1
+	check "$kind: and the next open the new content" content_is "$MNT/read.txt" "version one"
+	mark "stale-3-$kind"
+	check_fails "$kind: an open for writing that finds the change fails" "NFS file handle" append_to stale "$MNT/write.txt"
+	mark "stale-4-$kind"
+	check "$kind: and closes the channel its OPEN opened" test "$(requests_between "stale-3-$kind" "stale-4-$kind" "CloseRequest[nodeId=$written,")" = 1
+	check "$kind: stat then shows the new size" shows_size_within "$MNT/write.txt" 11 1
+	check "$kind: and the new content stays" content_is "$MNT/write.txt" "version one"
+	if [[ "$kind" == plain ]]; then
+		check "$kind: cat reads truncated.txt" content_is "$MNT/truncated.txt" "version two, which is longer"
+		holder_truncate "$MNT/truncated.txt" 11 "$sig"
+		await_file "$sig/opened" || return 0
+		change_outside "$kind" truncated.txt
+		: > "$sig/go"
+		await_file "$sig/truncated" || return 0
+		check "$kind: a process truncates a file it holds to the length a change outside left" test ! -s "$sig/truncate.out"
+		# the server leaves the length as it is, and the reply shows the change, whose revoke takes effect once the file is closed
+		sleep 0.5
+		check "$kind: cat then shows the new content" content_is "$MNT/truncated.txt" "version one"
+	fi
+	remove_outside "$kind" removed.txt
+	check_fails "$kind: an open of a file removed outside fails" "No such file or directory" cat "$MNT/removed.txt"
+	# the revoke runs once the open has failed
+	sleep 0.5
+	check_fails "$kind: stat then finds no file" "No such file or directory" stat "$MNT/removed.txt"
+	unmount_volume "$SCENARIO-$kind-nosource" "$MNT"
+}
+
+# change_outside <plain|vault> <name> [replace]: replaces the content of a file with "version one": in a plain directory in place, or through a rename with replace, and in a vault by putting back the ciphertext of that version, which prepare_vault_versions kept
+change_outside() {
+	local ciphertext
+	if [[ "$1" == plain && -n "${3:-}" ]]; then
+		print -n "version one" > "$SCENARIO_DIR/replacement" && mv "$SCENARIO_DIR/replacement" "$BACKING/$2"
+	elif [[ "$1" == plain ]]; then
+		print -n "version one" > "$BACKING/$2"
+	else
+		ciphertext="$(cat "$SCENARIO_DIR/$2.ciphertext")" || return 1
+		cp "$SCENARIO_DIR/$2.v1" "${ciphertext:h}/.tmp" && touch "${ciphertext:h}/.tmp" && mv "${ciphertext:h}/.tmp" "$ciphertext"
+	fi
+}
+
+remove_outside() {
+	if [[ "$1" == plain ]]; then
+		/bin/rm "$BACKING/$2"
+	else
+		/bin/rm "$(cat "$SCENARIO_DIR/$2.ciphertext")"
+	fi
+}
+
+# prepare_vault_versions <name> ...: creates a vault in the backing directory with a file for each name, holding "version two, which is longer", and keeps the ciphertext of "version one" of each in the scenario's directory. Records a failure itself.
+prepare_vault_versions() {
+	local name before after ciphertext
+	mount_volume "$SCENARIO-prepare-1" vault rw "$BACKING" "$MNT" || return 1
+	for name in "$@"; do
+		ciphertext=""
+		if before="$(/usr/bin/find "$BACKING/d" -name '*.c9r' -type f | sort)" && print -n "version one" > "$MNT/$name.txt" && after="$(/usr/bin/find "$BACKING/d" -name '*.c9r' -type f | sort)"; then
+			ciphertext="$(comm -13 <(print -r -- "$before") <(print -r -- "$after"))"
+		fi
+		if [[ -z "$ciphertext" || "$ciphertext" == *$'\n'* ]]; then
+			fail "the vault holds one ciphertext of $name.txt" "new ciphertexts: ${ciphertext:-none}"
+			unmount_volume "$SCENARIO-prepare-1" "$MNT"
+			return 1
+		fi
+		print -r -- "$ciphertext" > "$SCENARIO_DIR/$name.txt.ciphertext"
+	done
+	unmount_volume "$SCENARIO-prepare-1" "$MNT"
+	for name in "$@"; do
+		if ! cp -p "$(cat "$SCENARIO_DIR/$name.txt.ciphertext")" "$SCENARIO_DIR/$name.txt.v1"; then
+			fail "the ciphertext of $name.txt is kept"
+			return 1
+		fi
+	done
+	mount_volume "$SCENARIO-prepare-2" vault rw "$BACKING" "$MNT" || return 1
+	for name in "$@"; do
+		if ! print -n "version two, which is longer" > "$MNT/$name.txt"; then
+			fail "$name.txt is written over in the vault"
+			unmount_volume "$SCENARIO-prepare-2" "$MNT"
+			return 1
+		fi
+	done
+	unmount_volume "$SCENARIO-prepare-2" "$MNT"
+}
+
+# shows_size_within <file> <size> <seconds>: polls stat until it reports the size, at least once
+shows_size_within() {
+	local size
+	integer polls=$(( $3 * 10 ))
+	while true; do
+		size="$(stat -f %z "$1")" || return 1
+		[[ "$size" == "$2" ]] && return 0
+		(( polls-- > 0 )) || break
+		sleep 0.1
+	done
+	print -r -- "stat reports $size bytes"
+	return 1
+}
+
+content_is() {
+	local content
+	content="$(cat "$1")" || return 1
+	if [[ "$content" != "$2" ]]; then
+		print -r -- "cat printed: $content"
+		return 1
+	fi
+}
+
+# lists_size_of <directory> <name> <size>: ls -l lists the entry with that size
+lists_size_of() {
+	local listing size
+	listing="$(ls -l "$1")" || return 1
+	size="$(print -r -- "$listing" | awk -v name="$2" '$NF == name { print $5 }')"
+	[[ "$size" == "$3" ]]
+}
+
+# mark <name>: looks up a missing name, which marks a point in the program's log
+mark() {
+	/usr/bin/perl -e 'lstat($ARGV[0])' "$MNT/$1"
+}
+
+# changes_reported <node id> <log offset> [<size>]: BridgeSession traced, after the offset in the program's log, a CHANGES response with a record of the node, of that size if one is given. Node ids repeat across sessions, and every sweep names every held file.
+changes_reported() {
+	LC_ALL=C grep -q -E "ChangesResponse\[attributes=\[.*${3:+size=$3, }nodeId=$1," <(tail -c +$(( $2 + 1 )) "$PROGRAM_LOG")
+}
+
+# await_changes_reported <node id> <log offset> [<size>]
+await_changes_reported() {
+	local attempt
+	for attempt in {1..30}; do
+		changes_reported "$@" && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+await_file() {
+	local attempt
+	for attempt in {1..100}; do
+		[[ -e "$1" ]] && return 0
+		sleep 0.1
+	done
+	fail "${1:t} appears" "a background process did not get there"
+	return 1
+}
+
+# holder_read <file> <signal directory>: holds the file open in the background, reads it, reads it again through the same descriptor once go1 exists, and closes it once go2 exists. Writes what it read to holder.out.
+holder_read() {
+	/usr/bin/perl -e '
+		$| = 1;
+		my ($f, $d) = @ARGV;
+		sub touch { open(my $s, ">", "$d/$_[0]") or die; close $s }
+		sub await { select(undef, undef, undef, 0.1) until -e "$d/$_[0]" }
+		open(my $h, "<", $f) or die "open: $!";
+		my $n = sysread($h, my $b, 100); print "first ($n): $b\n";
+		touch("ready"); await("go1");
+		sysseek($h, 0, 0); $n = sysread($h, $b, 100); print "second (", defined $n ? $n : "error $!", "): $b\n";
+		touch("reread"); await("go2");
+		close($h) or print "close: $!\n"; touch("closed");
+	' "$1" "$2" > "$2/holder.out" 2>&1 &
+}
+
+# holder_write <file> <signal directory>: opens the file for writing in the background, overwrites its start, and closes it once go3 exists
+holder_write() {
+	/usr/bin/perl -e '
+		use Fcntl;
+		my ($f, $d) = @ARGV;
+		sub touch { open(my $s, ">", "$d/$_[0]") or die; close $s }
+		sysopen(my $h, $f, O_WRONLY) or die "open: $!";
+		syswrite($h, "WRITER") == 6 or die "write: $!";
+		touch("written"); select(undef, undef, undef, 0.1) until -e "$d/go3";
+		close($h) or die "close: $!"; touch("writer-closed");
+	' "$1" "$2" > "$2/writer.out" 2>&1 &
+}
+
+# holder_truncate <file> <size> <signal directory>: opens the file for writing in the background, creates "opened" in the signal directory, waits for "go" there, truncates the file through its descriptor to the size, closes it and creates "truncated". Prints its errors to truncate.out there.
+holder_truncate() {
+	/usr/bin/perl -e '
+		$| = 1;
+		my ($f, $size, $d) = @ARGV;
+		sub touch { open(my $s, ">", "$d/$_[0]") or die; close $s }
+		sub await { select(undef, undef, undef, 0.1) until -e "$d/$_[0]" }
+		open(my $h, "+<", $f) or die "open: $!";
+		touch("opened"); await("go");
+		truncate($h, $size) or print "truncate: $!\n";
+		close($h) or print "close: $!\n";
+		touch("truncated");
+	' "$1" "$2" "$3" > "$3/truncate.out" 2>&1 &
+}
+
+# own_changes <directory>: writes, appends, changes the mode to one the file cannot have been created with under any umask, renames and removes
+own_changes() {
+	echo_to one "$1/own.txt" && append_to two "$1/own.txt" && chmod 700 "$1/own.txt" && echo_to temporary "$1/temporary.txt" && mv "$1/temporary.txt" "$1/moved.txt" && rm "$1/moved.txt"
 }
 
 # --- run ---
@@ -1374,7 +1685,7 @@ mkfifo -m 600 "$PROGRAM_STDIN" || exit 2
 : > "$PROGRAM_LOG" || exit 2
 echo "==> Starting SmokeMountMain"
 # the program writes its log and its replies to standard error
-(cd "$REPO_ROOT" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djava.io.tmpdir=$JVM_TMP" ./mvnw -B -q test -Pmirror -P'!fskit-native' -Dfskit.test.fsType="$FS_TYPE_NAME" -Dmirror.mainClass=org.cryptomator.frontend.fskit.mount.SmokeMountMain < "$PROGRAM_STDIN" > "$PROGRAM_OUT" 2> "$PROGRAM_LOG") &
+(cd "$REPO_ROOT" && JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Djava.io.tmpdir=$JVM_TMP" ./mvnw -B -q test -Pmirror "$NATIVE_PROFILE" -Dfskit.test.fsType="$FS_TYPE_NAME" -Dmirror.mainClass=org.cryptomator.frontend.fskit.mount.SmokeMountMain < "$PROGRAM_STDIN" > "$PROGRAM_OUT" 2> "$PROGRAM_LOG") &
 PROGRAM_PID=$!
 exec 3> "$PROGRAM_STDIN" || exit 2
 if ! await_reply 120; then

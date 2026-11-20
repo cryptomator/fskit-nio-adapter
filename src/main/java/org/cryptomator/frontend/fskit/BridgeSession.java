@@ -63,17 +63,41 @@ public class BridgeSession implements Closeable {
 	private volatile @Nullable SocketChannel connection;
 
 	/**
-	 * @param operations   The file system to serve. This session closes it when it ends.
+	 * @param operations   The file system to serve. This session closes it when it ends, or at once when it fails to start.
 	 * @param closeTimeout How long {@link #close()} waits for an operation in flight to return
 	 */
 	public BridgeSession(FileSystemOperations operations, Duration closeTimeout) throws IOException {
 		this.operations = operations;
 		this.closeTimeout = closeTimeout;
-		new SecureRandom().nextBytes(token);
-		this.listener = ServerSocketChannel.open();
-		// the client connects to the IPv4 loopback address, whichever address family this JVM prefers
-		listener.bind(new InetSocketAddress(InetAddress.getByAddress(IPV4_LOOPBACK), 0));
-		Thread.ofPlatform().name("fskit-session-" + port()).daemon().start(this::run);
+		ServerSocketChannel opened = null;
+		try {
+			new SecureRandom().nextBytes(token);
+			opened = openListener();
+			this.listener = opened;
+			Thread.ofPlatform().name("fskit-session-" + port()).daemon().start(this::run);
+		} catch (Throwable e) {
+			if (opened != null) {
+				try {
+					opened.close();
+				} catch (IOException suppressed) {
+					e.addSuppressed(suppressed);
+				}
+			}
+			operations.close();
+			throw e;
+		}
+	}
+
+	private static ServerSocketChannel openListener() throws IOException {
+		ServerSocketChannel listener = ServerSocketChannel.open();
+		try {
+			// the client connects to the IPv4 loopback address, whichever address family this JVM prefers
+			listener.bind(new InetSocketAddress(InetAddress.getByAddress(IPV4_LOOPBACK), 0));
+			return listener;
+		} catch (IOException | RuntimeException e) {
+			listener.close();
+			throw e;
+		}
 	}
 
 	public int port() {
@@ -132,8 +156,8 @@ public class BridgeSession implements Closeable {
 	}
 
 	private void run() {
-		// the executor's close waits for the requests in flight, so the operations close after the last of them
-		try (operations; listener; ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor(); SocketChannel authenticated = accept()) {
+		// the executor's close waits for the requests in flight, so the operations close after the last of them. A CHANGES request may wait for good, so it is ended before the executor closes.
+		try (operations; listener; ExecutorService requests = Executors.newVirtualThreadPerTaskExecutor(); Closeable _ = operations::closeChanges; SocketChannel authenticated = accept()) {
 			serve(authenticated, requests);
 		} catch (EOFException | ClosedChannelException e) {
 			LOG.debug("Session ended.");

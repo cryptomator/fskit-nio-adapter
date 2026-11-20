@@ -5,7 +5,7 @@ import os
 ///
 /// Calls may overlap: each sends its request at once, and a thread of the client's own reads the responses and hands each to the call whose request id it carries. The server answers in any order.
 public final class BridgeClient: Sendable {
-	/// How many requests were sent and how many of them have completed, counted when a call sends its request and when it returns.
+	/// How many requests were sent and how many of them have completed, counted when a call sends its request and when it returns. A `CHANGES` request does not count: it may stay in flight for good, and it changes nothing.
 	public struct RequestCounts: Equatable, Sendable {
 		public var sent: UInt64 = 0
 		public var completed: UInt64 = 0
@@ -86,6 +86,11 @@ public final class BridgeClient: Sendable {
 		state.withLock { $0.counts }
 	}
 
+	/// Whether the connection is still there. Once it is lost, every call fails with `EIO`.
+	public var isConnected: Bool {
+		state.withLock { $0.connected }
+	}
+
 	/// Whether a sync can be answered without a request: every `WRITE`, `SETATTR` and `CREATE` sent was followed by a successful `SYNC` sent after it completed, and none is in flight.
 	public var canAnswerSyncItself: Bool {
 		state.withLock { $0.synced == $0.counts.dirtying && $0.counts.dirtyingCompleted == $0.counts.dirtying }
@@ -109,7 +114,7 @@ public final class BridgeClient: Sendable {
 		let dirtying = R.opcode == .write || R.opcode == .setattr || R.opcode == .create
 		var sent: Sent?
 		defer {
-			if sent != nil {
+			if sent != nil, R.opcode != .changes {
 				state.withLock { state in
 					state.counts.completed += 1
 					if dirtying {
@@ -153,7 +158,9 @@ public final class BridgeClient: Sendable {
 				let requestId = state.nextRequestId
 				state.nextRequestId += 1
 				state.waiting[requestId] = Waiter(opcode: R.opcode, continuation: continuation)
-				state.counts.sent += 1
+				if R.opcode != .changes {
+					state.counts.sent += 1
+				}
 				if dirtying {
 					state.counts.dirtying += 1
 				}

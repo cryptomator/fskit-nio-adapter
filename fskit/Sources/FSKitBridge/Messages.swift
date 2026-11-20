@@ -782,9 +782,19 @@ public struct OpenRequest: Request, Equatable {
 }
 
 public struct OpenResponse: Message, Equatable {
-	public init() {}
+	public var attributes: Attributes
 
-	public init(control: inout ByteReader, payload: Data) throws {}
+	public init(attributes: Attributes) {
+		self.attributes = attributes
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		self.attributes = try Attributes(control: &control)
+	}
+
+	public func encode(control: inout ByteWriter) {
+		attributes.encode(control: &control)
+	}
 }
 
 // MARK: - CLOSE
@@ -1061,5 +1071,37 @@ public struct SymlinkResponse: Message, Equatable {
 		control.write(name)
 		directoryAttributes.encode(control: &control)
 		freeSpace.encode(control: &control)
+	}
+}
+
+// MARK: - CHANGES
+
+public struct ChangesRequest: Request, Equatable {
+	public typealias Response = ChangesResponse
+	public static let opcode = Opcode.changes
+
+	public init() {}
+
+	public init(control: inout ByteReader, payload: Data) throws {}
+}
+
+public struct ChangesResponse: Message, Equatable {
+	public var attributes: [Attributes]
+
+	public init(attributes: [Attributes]) {
+		self.attributes = attributes
+	}
+
+	public init(control: inout ByteReader, payload: Data) throws {
+		let count = try Int(control.read(UInt16.self))
+		self.attributes = []
+		for _ in 0 ..< count {
+			try attributes.append(Attributes(control: &control))
+		}
+	}
+
+	public func encode(control: inout ByteWriter) {
+		control.write(UInt16(attributes.count))
+		attributes.forEach { $0.encode(control: &control) }
 	}
 }
