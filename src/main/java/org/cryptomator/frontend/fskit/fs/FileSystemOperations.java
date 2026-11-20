@@ -529,7 +529,7 @@ public class FileSystemOperations implements Closeable {
 					}
 				}
 			} catch (FileAlreadyExistsException e) {
-				// the backing file system refuses to replace the target although asked to, as cryptofs does for a file that is open
+				// A vault keeps a target that appeared after the lookup, since the move may not replace it. cryptofs before 2.12.0 also refuses to replace an open file.
 				throw new StatusException(Errno.EBUSY);
 			}
 			if (replaced != null) {

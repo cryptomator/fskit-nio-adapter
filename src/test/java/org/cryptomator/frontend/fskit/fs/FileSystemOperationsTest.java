@@ -1386,6 +1386,38 @@ public class FileSystemOperationsTest {
 		}
 
 		/**
+		 * @return Whether an entry in the vault has a ciphertext name that cryptofs shortened, keeping the full name in a file of its own
+		 */
+		private boolean holdsShortenedName() throws IOException {
+			try (Stream<Path> files = Files.walk(root.resolve("d"))) {
+				return files.anyMatch(file -> file.getFileName().toString().endsWith(".c9s"));
+			}
+		}
+
+		/**
+		 * Opens a file for writing, writes to it and renames it before the write reaches the disk. Then creates a file under the old name, and reads and writes the renamed file through a channel opened under its new name.
+		 */
+		private RenameResponse renameOpenFile(String sourceName, String targetName) throws IOException {
+			Files.writeString(vault.getPath("/" + sourceName), "old");
+			long source = lookup(ROOT, sourceName).nodeId();
+			ok(new OpenRequest(source, WRITE), OpenResponse.class);
+			write(source, 0, "new");
+
+			RenameResponse response = ok(new RenameRequest(source, ROOT, sourceName, ROOT, targetName), RenameResponse.class);
+			long recreated = create(ROOT, sourceName, NodeType.FILE).nodeId();
+			write(recreated, 0, "recreated");
+			ok(new CloseRequest(recreated, 0), CloseResponse.class);
+			// The read widens the channel, which was opened for writing alone. That opens the file under its new name while the channel opened under the old one still holds what was written.
+			Assertions.assertEquals("new", read(source, 0, 100));
+			write(source, 3, " and after");
+			ok(new CloseRequest(source, 0), CloseResponse.class);
+
+			Assertions.assertEquals("new and after", Files.readString(vault.getPath("/" + targetName)));
+			Assertions.assertEquals("recreated", Files.readString(vault.getPath("/" + sourceName)));
+			return response;
+		}
+
+		/**
 		 * Replaces a ciphertext with another through a rename, as a sync client does.
 		 */
 		private static void replaceCiphertext(Path ciphertext, Path replacement) throws IOException {
@@ -1456,18 +1488,53 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(11, afterClose.attributes().getFirst().size());
 		}
 
+		@ParameterizedTest(name = "shortened source: {0}, shortened target: {1}")
+		@DisplayName("a file open for writing is renamed to and from a shortened name, and keeps what it wrote apart from a file created under its old name")
+		@CsvSource({"false, true", "true, false", "true, true"})
+		public void testRenameOpenFileWithShortenedName(boolean shortenedSource, boolean shortenedTarget) throws IOException {
+			String sourceName = shortenedSource ? "s".repeat(200) : "source.txt";
+			String targetName = shortenedTarget ? "t".repeat(200) : "target.txt";
+
+			renameOpenFile(sourceName, targetName);
+
+			Assertions.assertEquals(List.of(".", "..", sourceName, targetName), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertTrue(holdsShortenedName());
+		}
+
+		@ParameterizedTest(name = "shortened source: {0}, shortened target: {1}")
+		@DisplayName("a file open for writing replaces a file that is open, and the replaced file keeps its content")
+		@CsvSource({"false, false", "false, true", "true, false", "true, true"})
+		public void testRenameOverOpenFile(boolean shortenedSource, boolean shortenedTarget) throws IOException {
+			String sourceName = shortenedSource ? "s".repeat(200) : "source.txt";
+			String targetName = shortenedTarget ? "t".repeat(200) : "target.txt";
+			Files.writeString(vault.getPath("/" + targetName), "replaced");
+			long target = lookup(ROOT, targetName).nodeId();
+			ok(new OpenRequest(target, READ), OpenResponse.class);
+
+			RenameResponse response = renameOpenFile(sourceName, targetName);
+
+			Assertions.assertEquals(target, response.replacedAttributes().nodeId());
+			Assertions.assertEquals("replaced", read(target, 0, 100));
+			ok(new CloseRequest(target, 0), CloseResponse.class);
+			Assertions.assertEquals("new and after", Files.readString(vault.getPath("/" + targetName)));
+			Assertions.assertEquals(List.of(".", "..", sourceName, targetName), names(readdir(ROOT, 0, 0, false)));
+			Assertions.assertEquals(shortenedSource || shortenedTarget, holdsShortenedName());
+		}
+
 		@Test
-		@DisplayName("replacing a file that is open yields EBUSY")
-		public void testRenameOverOpenFile() {
+		@DisplayName("a target that appears after the lookup yields EBUSY and is left as it is")
+		public void testRenameOntoTargetThatAppeared() throws IOException {
 			long source = createFile("source.txt", "new");
-			long target = createFile("target.txt", "replaced");
 			ok(new CloseRequest(source, 0), CloseResponse.class);
+			ops.beforeMoving = _ -> Files.writeString(vault.getPath("/target.txt"), "appeared");
 
 			assertStatus(Errno.EBUSY, new RenameRequest(source, ROOT, "source.txt", ROOT, "target.txt"));
 
-			ReadResponse response = ok(new ReadRequest(target, 0, 100), ReadResponse.class);
-			Assertions.assertEquals("replaced", StandardCharsets.UTF_8.decode(response.data()).toString());
-			Assertions.assertEquals(8, response.attributes().size());
+			Assertions.assertEquals(List.of(StandardCopyOption.ATOMIC_MOVE), ops.moveOptions);
+			Assertions.assertEquals("appeared", Files.readString(vault.getPath("/target.txt")));
+			Assertions.assertEquals("new", Files.readString(vault.getPath("/source.txt")));
+			Assertions.assertEquals(source, lookup(ROOT, "source.txt").nodeId());
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
 		}
 
 		@Test
@@ -1595,6 +1662,22 @@ public class FileSystemOperationsTest {
 
 			Assertions.assertEquals("one two three", Files.readString(vault.getPath("/dir/moved.txt")));
 			Assertions.assertEquals(List.of(".", "..", "dir"), names(readdir(ROOT, 0, 0, false)));
+		}
+
+		@Test
+		@DisplayName("moving a directory re-paths the open file inside it")
+		public void testMoveDirectoryWithOpenFile() throws IOException {
+			long source = create(ROOT, "source", NodeType.DIRECTORY).nodeId();
+			long target = create(ROOT, "target", NodeType.DIRECTORY).nodeId();
+			long file = create(source, "file.txt", NodeType.FILE).nodeId();
+			write(file, 0, "before");
+
+			ok(new RenameRequest(source, ROOT, "source", target, "moved"), RenameResponse.class);
+			write(file, 6, " and after");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals("before and after", Files.readString(vault.getPath("/target/moved/file.txt")));
+			Assertions.assertEquals(16, getattr(file).size());
 		}
 
 		@Test

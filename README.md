@@ -192,7 +192,6 @@ Observed on macOS 27.0.1 and 27.2 with JDK 26.
   - Replacing a directory of the mounted `Path` with a file or a link from outside, while it is mounted, is not supported.
 - The mounted `Path` must not hold two names that differ only in Unicode normalization.
 - The volume is case-sensitive: on a case-insensitive backing store, a name that differs from an existing one only in case is reported as absent and cannot be created.
-- Replacing a file that is open (`mv` onto it) fails with "Resource busy" on a vault, because cryptofs refuses to replace an open file. It works on a plain directory.
 - A time or permission change on a removed file that is still open is ignored.
 - A modification or access time cannot be set on a file or directory whose owner may not read it: `touch` fails with "Permission denied", because the JDK opens the entry for reading to set its times.
 - One request can change several attributes, as `setattrlist` does. When the backing store refuses one of them after another has been applied, the request still succeeds, and only the JVM's log reports the refusal.

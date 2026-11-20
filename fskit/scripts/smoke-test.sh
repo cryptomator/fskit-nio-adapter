@@ -553,6 +553,11 @@ rename_onto() {
 	/usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die "rename: $!\n"' "$1" "$2"
 }
 
+# rename_onto_held <source> <target>: renames the source onto the target while a descriptor holds the target open, as Preview's File > Save does while filecoord holds the document
+rename_onto_held() {
+	/usr/bin/perl -e 'open(my $held, "<", $ARGV[1]) or die "open: $!\n"; rename($ARGV[0], $ARGV[1]) or die "rename: $!\n"; close($held) or die "close: $!\n"' "$1" "$2"
+}
+
 # lists_backing_names <directory on the volume> <backing directory> [-l]: ls on the volume, with -l if given, names exactly the entries of the backing directory, and neither ls fails
 lists_backing_names() {
 	local backing mounted
@@ -888,6 +893,10 @@ check_basics() {
 	check "mv moves a file over an existing file" mv "$mnt/other.txt" "$mnt/file.txt"
 	check "the replaced file has the new content" test "$(cat "$confirm/file.txt")" = replacement
 	check "the moved file is gone" test ! -e "$confirm/other.txt"
+	check "echo creates a file to hold open" echo_to held "$mnt/held.txt"
+	check "echo creates a file to replace it with" echo_to saved "$mnt/saved.txt"
+	check "rename replaces a file that is held open" rename_onto_held "$mnt/saved.txt" "$mnt/held.txt"
+	check "the file replaced while held open has the new content" test "$(cat "$confirm/held.txt")" = saved
 	check "mv moves a directory that contains an open file" move_with_open_file "$mnt/dir" "$mnt/moved"
 	check "the open file took both writes" test "$(cat "$confirm/moved/open.txt")" = "before and after"
 	check "the directory is gone from its old place" test ! -e "$confirm/dir"
@@ -1246,6 +1255,9 @@ vault() {
 	head -c $(( 11 * 1024 * 1024 )) /dev/urandom > "$large"
 	mount_volume "$SCENARIO-1" vault rw "$BACKING" "$MNT" || return 0
 	check_basics "$MNT" "$MNT"
+	# check_basics removes the directory it moves, and only the reopened vault below reads what the open file took from disk rather than from the kernel's cache
+	check "a directory to keep is created" mkdir "$MNT/kept"
+	check "mv moves it while a file in it is open" move_with_open_file "$MNT/kept" "$MNT/kept-moved"
 	# the kernel may answer the reads of these files from its cache, since they are written through the mount. The reopened vault below reads the files written in parallel uncached.
 	check "the files to read in parallel are written" seed_parallel "$MNT/parallel"
 	check_parallel "$MNT" "$MNT"
@@ -1277,9 +1289,11 @@ vault() {
 	# reopens the vault from disk as a new volume
 	mount_volume "$SCENARIO-2" vault rw "$BACKING" "$MNT" || return 0
 	check "the reopened vault holds the file that replaced another" test "$(cat "$MNT/file.txt")" = replacement
+	check "it holds the file that replaced one held open" test "$(cat "$MNT/held.txt")" = saved
 	check "it holds the files written in parallel" parallel_writes_intact "$MNT/parallel" "$SCENARIO_DIR/first.bin" "$SCENARIO_DIR/second.bin"
 	check "it holds the large file" cmp -s "$large" "$MNT/large.bin"
-	check "it holds nothing that was removed" test "$(entries "$MNT")" = $'dir\nfile.txt\nlarge.bin\nparallel'
+	check "it holds what the file took before and after its directory moved" test "$(cat "$MNT/kept-moved/open.txt")" = "before and after"
+	check "it holds nothing that was removed" test "$(entries "$MNT")" = $'dir\nfile.txt\nheld.txt\nkept-moved\nlarge.bin\nparallel'
 	check "the directory of the removed file holds nothing but the link" test "$(entries "$MNT/dir")" = link
 	check "the link still has its target" test "$($READ_LINK "$MNT/dir/link")" = ../file.txt
 	unmount_volume "$SCENARIO-2" "$MNT"
