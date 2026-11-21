@@ -18,7 +18,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * Each entry has three:
  * <ul>
  *     <li>its path lock, which an operation on the entry or below it holds for reading, and one that moves, replaces, creates or removes the entry holds for writing,</li>
- *     <li>for a directory, its entries lock, which guards the names in it: lookups and listings hold it for reading, a change to the names in it for writing. Unlike the path lock, it is never taken as an ancestor lock, so a change to the names in a directory does not wait for requests below it,</li>
+ *     <li>its entries lock, which guards the names in it if it is a directory. Lookups and listings hold it for reading, and a change to the names in it for writing. An operation on the entry's attributes or data holds it for reading as well, whatever the entry's type, since the entry may have become a directory meanwhile. Unlike the path lock, it is never taken as an ancestor lock, so a change to the names in a directory does not wait for requests below it,</li>
  *     <li>its sampling lock, which is held around one read of the entry's attributes and their publication only.</li>
  * </ul>
  * Path and entries locks are taken only as one {@link #lock(Requirement...) lock set}, which adds the path locks of all ancestors for reading and acquires everything in one global order, so no two sets can deadlock as long as no thread holds two at once.
@@ -30,7 +30,7 @@ final class PathLocks {
 	/**
 	 * A lock of a lock set.
 	 *
-	 * @param entries   Whether this is the entries lock of the directory, not its path lock
+	 * @param entries   Whether this is the entry's entries lock, not its path lock
 	 * @param exclusive Whether it is held for writing
 	 */
 	record Requirement(Path path, boolean entries, boolean exclusive) {

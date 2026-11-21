@@ -100,7 +100,7 @@ import static org.cryptomator.frontend.fskit.fs.PathLocks.Requirement.writePath;
 /**
  * Serves the operations of one mounted volume against a root {@link Path}.
  * <p>
- * Requests run concurrently. Each operation takes the lock set of {@link PathLocks} that its entries need, then the data locks of its nodes, in ascending node id where it needs several. An operation reads its nodes' paths before it takes the set. Once it holds the set, it checks that they are unchanged, and otherwise starts again. An entry's attributes are read, stamped with a generation and published under its sampling lock, and every operation that changes them samples them again afterwards, so that a higher generation always means a later state. Which responses also read them under the node's data lock is part of the protocol (see its generation note).
+ * Requests run concurrently. Each operation takes the lock set of {@link PathLocks} that its entries need, then the data locks of its nodes, in ascending node id where it needs several. An operation reads its nodes' paths before it takes the set. Once it holds the set, it checks that they are unchanged, and otherwise starts again. An entry's attributes are read, stamped with a generation and published under its sampling lock, and every operation that changes them samples them again afterwards, so that a higher generation always means a later state. Which responses also read them under the node's data lock, and for a directory under the read lock of its entries, is part of the protocol (see its generation note).
  * <p>
  * Lock order, outermost first: the lock set, data locks, a sampling lock or the monitor of an unlinked node, the monitor of {@link DirectorySnapshots} or of {@link ChangeTracker}, the monitor of {@link NodeTable}.
  */
@@ -845,7 +845,7 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	/**
-	 * Runs an operation on one node under the read lock of its path, and under its data lock.
+	 * Runs an operation on one node under the locks of {@link #underPathLock}, and under its data lock.
 	 */
 	private <T> T onNode(long id, boolean exclusiveData, NodeOperation<T> operation) throws IOException {
 		return underPathLock(id, node -> {
@@ -856,13 +856,13 @@ public class FileSystemOperations implements Closeable {
 	}
 
 	/**
-	 * Runs an operation on one node under the read lock of its path, which a node that is unlinked does without.
+	 * Runs an operation on one node under the read locks of its path and its entries, which a node that is unlinked does without. The entries lock makes a record of a directory exclude the creates, removals and renames in it. Every node takes it, since a sample can find a directory where a file was.
 	 */
 	private <T> T underPathLock(long id, NodeOperation<T> operation) throws IOException {
 		while (true) {
 			Node node = nodes.get(id);
 			Path path = pathOf(node);
-			try (var _ = path != null ? lock(readPath(path)) : PathLocks.Held.NONE) {
+			try (var _ = path != null ? lock(readPath(path), readEntries(path)) : PathLocks.Held.NONE) {
 				if (at(node, path)) {
 					return operation.run(node);
 				}

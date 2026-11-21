@@ -67,10 +67,11 @@ final class NodeTable {
 	}
 
 	/**
-	 * @return The files and links that the kernel references and whose entries exist. Taking the snapshot adds no reference.
+	 * @return The nodes other than the root that the kernel references and whose entries exist. Taking the snapshot adds no reference.
 	 */
 	synchronized List<Node> heldSnapshot() {
-		return nodesById.values().stream().filter(node -> node.lookups > 0 && node.type != NodeType.DIRECTORY && !node.unlinked).toList();
+		// macOS refuses to drop what it cached of the root, so a record of it would change nothing
+		return nodesById.values().stream().filter(node -> node.lookups > 0 && node.id != Messages.ROOT_NODE_ID && !node.unlinked).toList();
 	}
 
 	/**

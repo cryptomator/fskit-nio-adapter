@@ -23,7 +23,23 @@ struct CacheValidityTests {
 	}
 
 	private static func claimFirst(_ validity: inout CacheValidity<Item>) -> Item? {
-		validity.claimDue().first
+		validity.claimDue().first?.item
+	}
+
+	/// A validity that tracks `item`, handed out with a directory of 64 bytes at generation 10.
+	private static func trackingDirectory(_ item: Item) -> CacheValidity<Item> {
+		var validity = CacheValidity<Item>()
+		validity.handedOut(item, directory(generation: 10))
+		return validity
+	}
+
+	private static func directory(size: UInt64 = 64, mode: UInt16 = 0o755, modified: Int64 = 100, generation: UInt64) -> Attributes {
+		record(size: size, mode: mode, modified: modified, type: .directory, generation: generation)
+	}
+
+	/// Claims every due action, and returns those for `item`.
+	private static func claimed(_ validity: inout CacheValidity<Item>, _ item: Item) -> [CacheValidity<Item>.Action] {
+		validity.claimDue().filter { $0.item === item }.map(\.action)
 	}
 
 	private static func admit(_ validity: inout CacheValidity<Item>, _ item: Item) -> CacheValidity<Item>.Admission {
@@ -99,9 +115,9 @@ struct CacheValidityTests {
 
 	@Test func aRecordOfAnUntrackedNodeIsIgnored() {
 		var validity = CacheValidity<Item>()
-		validity.handedOut(Item(), Self.record(type: .directory, generation: 10))
+		validity.handedOut(Item(), Self.record(type: .symlink, generation: 10))
 
-		validity.compare(Self.record(mode: 0o700, type: .directory, generation: 11), .locked)
+		validity.compare(Self.record(mode: 0o700, type: .symlink, generation: 11), .locked)
 		validity.compare(Self.record(size: 11, generation: 12), .locked)
 
 		#expect(!Self.due(&validity))
@@ -484,6 +500,225 @@ struct CacheValidityTests {
 		validity.compare(Self.record(size: 9, modified: 200, generation: 12), .locked)
 		validity.ownChangeEnded(Self.file, .setattr(applied: Messages.attributeSize, Self.record(size: 9, modified: 200, generation: 11)))
 
+		#expect(!Self.due(&validity))
+	}
+
+	// MARK: - Directories
+
+	@Test(arguments: [
+		directory(size: 96, generation: 11),
+		directory(modified: 200, generation: 11),
+		directory(mode: 0o700, generation: 11)
+	])
+	func aDirectoryThatDiffersMakesAnInvalidationDue(record: Attributes) {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		validity.compare(record, .locked)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func theSameRecordOfADirectoryAgainMakesNoInvalidationDue() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+		_ = validity.claimDue()
+
+		validity.compare(Self.directory(modified: 200, generation: 12), .locked)
+
+		#expect(!Self.due(&validity))
+	}
+
+	@Test func aLaterDifferenceOfADirectoryMakesAnotherInvalidationDueAlsoWhileTheFirstRuns() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+
+		validity.compare(Self.directory(modified: 300, generation: 12), .locked)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+		validity.invalidationEnded(item, nodeId: Self.file, success: true)
+		validity.invalidationEnded(item, nodeId: Self.file, success: true)
+		#expect(!Self.due(&validity))
+	}
+
+	@Test func aFailedInvalidationIsDueAgain() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+		_ = validity.claimDue()
+
+		validity.invalidationEnded(item, nodeId: Self.file, success: false)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func aMissingDirectoryIsDue() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		validity.missing(Self.file)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func aDirectoryRemovedOutsideAfterAnInvalidationIsDue() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+		_ = validity.claimDue()
+		validity.invalidationEnded(item, nodeId: Self.file, success: true)
+
+		validity.missing(Self.file)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func anOwnChangeOfTheEntriesMovesTheSizeAndTimeOfTheBaseline() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeSize | Messages.attributeModified)
+		validity.ownChangeEnded(Self.file, .entries(Self.directory(size: 96, modified: 200, generation: 11)))
+		#expect(!Self.due(&validity))
+		validity.compare(Self.directory(size: 96, modified: 200, generation: 12), .locked)
+
+		#expect(!Self.due(&validity))
+	}
+
+	@Test func aRecordReadBeforeAnOwnChangeOfTheEntriesThatShowsAnOutsideChangeIsJudgedAgainstTheBaselineOfItsGeneration() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeSize | Messages.attributeModified)
+
+		// a sweep read the directory after an entry was created outside, before the volume created one
+		validity.compare(Self.directory(size: 96, modified: 150, generation: 11), .locked)
+		validity.ownChangeEnded(Self.file, .entries(Self.directory(size: 128, modified: 200, generation: 12)))
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func aRecordSampledBeforeAnOwnChangeOfTheEntriesIsDropped() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeSize | Messages.attributeModified)
+
+		// a lookup that read the directory while the server created an entry in it
+		validity.compare(Self.directory(size: 96, modified: 150, generation: 11), .sampled)
+		validity.ownChangeEnded(Self.file, .entries(Self.directory(size: 96, modified: 200, generation: 12)))
+
+		#expect(!Self.due(&validity))
+	}
+
+	@Test func aModeChangedOutsideWhileAnOwnChangeOfTheEntriesIsInFlightIsDueAtOnce() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeSize | Messages.attributeModified)
+
+		validity.compare(Self.directory(size: 96, mode: 0o700, modified: 200, generation: 11), .locked)
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func anOpenOfADirectoryWithAnInvalidationDueIsGrantedAndTheInvalidationStaysDue() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+
+		#expect(Self.admit(&validity, item) == .grant)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+		#expect(Self.admit(&validity, item) == .grant)
+	}
+
+	@Test func anEntryKeepsTheKindItWasHandedOutAs() {
+		let directory = Item()
+		var validity = Self.trackingDirectory(directory)
+		validity.compare(Self.record(type: .file, generation: 11), .locked)
+		#expect(Self.claimed(&validity, directory) == [.invalidate])
+
+		let file = Item()
+		validity = Self.tracking(file)
+		validity.compare(Self.directory(generation: 11), .locked)
+		#expect(Self.claimed(&validity, file) == [.revoke])
+	}
+
+	@Test func aDirectoryRecordThatArrivesAfterANewerMatchingOneIsJudgedAndTheBaselineBecomesTheNewestObserved() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		validity.compare(Self.directory(generation: 12), .locked)
+		// a sync tool renamed in the directory and then restored its time: 11 shows the rename, 12 the restored time
+		validity.compare(Self.directory(modified: 200, generation: 11), .locked)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+
+		// macOS fetched the state of 12 after the invalidation, so a later state like 11 differs from what it holds
+		validity.compare(Self.directory(modified: 200, generation: 13), .locked)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func theReplyOfAnOwnChangeThatShowsAnOutsideChangeOfADirectoryBecomesItsBaseline() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		// an entry was created outside before the volume changed the directory's mode
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeMode)
+		validity.ownChangeEnded(Self.file, .setattr(applied: Messages.attributeMode, Self.directory(size: 96, mode: 0o700, modified: 200, generation: 11)))
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+
+		validity.compare(Self.directory(size: 96, mode: 0o700, modified: 200, generation: 12), .locked)
+		#expect(!Self.due(&validity))
+		// the entry was removed outside again and the directory's time restored
+		validity.compare(Self.directory(mode: 0o700, generation: 13), .locked)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func aLookupThatHandsOutADirectoryWithAnOlderRecordThatDiffersIsJudgedByThatRecord() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+		validity.compare(Self.directory(generation: 12), .locked)
+
+		// a sync tool renamed in the directory and then restored its time: the lookup read 11, FSKit is handed 12
+		validity.handedOut(item, Self.directory(modified: 200, generation: 11), newest: Self.directory(generation: 12))
+
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func anItemHandedOutFirstIsJudgedAgainstWhatFSKitIsHanded() {
+		let item = Item()
+		var validity = CacheValidity<Item>()
+
+		// a listing read the grown file after the lookup did, and FSKit is handed the listing's record
+		validity.handedOut(item, Self.record(size: 3, generation: 11), newest: Self.record(size: 11, generation: 12))
+		validity.compare(Self.record(size: 11, generation: 13), .locked)
+
+		#expect(!Self.due(&validity))
+	}
+
+	@Test func anItemHandedOutFirstKeepsTheKindFSKitIsHanded() {
+		let item = Item()
+		var validity = CacheValidity<Item>()
+
+		// the file was replaced by a directory after the lookup read it, and FSKit is handed the directory
+		validity.handedOut(item, Self.record(generation: 11), newest: Self.directory(generation: 12))
+		validity.compare(Self.directory(modified: 200, generation: 13), .locked)
+
+		#expect(Self.admit(&validity, item) == .grant)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+	}
+
+	@Test func anOwnChangeOfTheEntriesWhoseReplyFellBackToTheLastRecordInvalidatesOnce() {
+		let item = Item()
+		var validity = Self.trackingDirectory(item)
+
+		// the server could not read the directory after the create and replied with its last known record
+		validity.ownChangeBegan(Self.file, setting: Messages.attributeSize | Messages.attributeModified)
+		validity.ownChangeEnded(Self.file, .entries(Self.directory(generation: 11)))
+		validity.compare(Self.directory(size: 96, modified: 200, generation: 12), .locked)
+		#expect(Self.claimed(&validity, item) == [.invalidate])
+
+		validity.compare(Self.directory(size: 96, modified: 200, generation: 13), .locked)
 		#expect(!Self.due(&validity))
 	}
 }

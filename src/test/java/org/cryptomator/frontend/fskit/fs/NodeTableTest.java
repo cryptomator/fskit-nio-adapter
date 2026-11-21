@@ -158,11 +158,11 @@ public class NodeTableTest {
 	}
 
 	@Test
-	@DisplayName("the held snapshot holds the files and links a lookup holds, and no directory, nothing only listed, unlinked or forgotten")
+	@DisplayName("the held snapshot holds the files, links and directories a lookup holds, and not the root, nothing only listed, unlinked or forgotten")
 	public void testHeldSnapshot() throws IOException {
 		Node file = nodes.hold(ROOT.resolve("file"), NodeType.FILE, root);
 		Node link = nodes.hold(ROOT.resolve("link"), NodeType.SYMLINK, root);
-		nodes.hold(ROOT.resolve("dir"), NodeType.DIRECTORY, root);
+		Node dir = nodes.hold(ROOT.resolve("dir"), NodeType.DIRECTORY, root);
 		nodes.list(ROOT.resolve("listed"), NodeType.FILE, root);
 		nodes.unlink(nodes.hold(ROOT.resolve("unlinked"), NodeType.FILE, root));
 		nodes.forget(nodes.hold(ROOT.resolve("forgotten"), NodeType.FILE, root), 1);
@@ -170,8 +170,8 @@ public class NodeTableTest {
 		List<Node> snapshot = nodes.heldSnapshot();
 		nodes.hold(ROOT.resolve("later"), NodeType.FILE, root);
 
-		Assertions.assertEquals(Set.of(file, link), Set.copyOf(snapshot));
-		Assertions.assertEquals(2, snapshot.size());
+		Assertions.assertEquals(Set.of(file, link, dir), Set.copyOf(snapshot));
+		Assertions.assertEquals(3, snapshot.size());
 	}
 
 	@Test

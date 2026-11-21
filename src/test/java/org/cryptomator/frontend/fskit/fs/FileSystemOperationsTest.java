@@ -1467,6 +1467,22 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("a directory in which an entry was created outside is reported with the new time of its content directory")
+		public void testChangedDirectory() throws Exception {
+			SignaledSource source = serveWithSource();
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			Timestamp past = new Timestamp(1500000000, 0);
+			// sets the time of the directory's ciphertext content directory, which cryptofs reports for it
+			Files.setLastModifiedTime(vault.getPath("/d"), FileTime.from(Instant.ofEpochSecond(past.seconds())));
+			Assertions.assertEquals(past, getattr(directory).modified());
+
+			Files.writeString(vault.getPath("/d/created.txt"), "");
+
+			Attributes record = changes(source, true).attributes().stream().filter(candidate -> candidate.nodeId() == directory).findFirst().orElseThrow();
+			Assertions.assertNotEquals(past, record.modified());
+		}
+
+		@Test
 		@DisplayName("a file whose ciphertext was replaced while it was open, which the vault reports unchanged until it is closed, is reported again on its own once it is closed")
 		public void testChangedCiphertextOfOpenFile() throws Exception {
 			SignaledSource source = serveWithSource();
@@ -3746,28 +3762,32 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("waits for a signal, then reports every held file and link, changed or not, and no directory and nothing only listed")
-		public void testReportsHeldFiles() throws Exception {
+		@DisplayName("waits for a signal, then reports every held file, link and directory, changed or not, and nothing only listed and not the root")
+		public void testReportsHeldNodes() throws Exception {
 			backing("changed.txt", "one");
 			backing("unchanged.txt", "one");
 			backing("listed.txt", "one");
-			Files.createDirectory(root.resolve("dir"));
+			Timestamp past = new Timestamp(1500000000, 0);
+			Files.setLastModifiedTime(Files.createDirectory(root.resolve("dir")), FileTime.from(Instant.ofEpochSecond(past.seconds())));
 			long changed = lookup(ROOT, "changed.txt").nodeId();
 			long unchanged = lookup(ROOT, "unchanged.txt").nodeId();
 			long link = ok(new SymlinkRequest(ROOT, "link", "changed.txt"), SymlinkResponse.class).attributes().nodeId();
-			lookup(ROOT, "dir");
+			long dir = lookup(ROOT, "dir").nodeId();
 			readdir(ROOT, 0, 0, true);
 			Future<Response> changes = changes();
 			assertWaits(changes);
 
 			backing("changed.txt", "two, longer");
+			backing("dir/created.txt", "");
 			source.signal();
 
 			Map<Long, Attributes> records = records(changes);
-			Assertions.assertEquals(Set.of(changed, unchanged, link), records.keySet());
+			Assertions.assertEquals(Set.of(changed, unchanged, link, dir), records.keySet());
 			Assertions.assertEquals(11, records.get(changed).size());
 			Assertions.assertEquals(3, records.get(unchanged).size());
 			Assertions.assertEquals(state(getattr(changed)), state(records.get(changed)));
+			// the size of a small directory stays as it is on some file systems, as ext4
+			Assertions.assertNotEquals(past, records.get(dir).modified());
 			assertWaits(changes());
 		}
 
@@ -3934,6 +3954,26 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
+		@DisplayName("the sample of a directory waits for a create in it, and is newer than the directory's record in the create's reply")
+		public void testSampleOfDirectoryExcludesCreate() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			CountDownLatch creating = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			// inside the create's lock set, before it holds the new entry, so that the sweep finds only the directory held
+			ops.beforeOpeningChannel = onlyOnceAt(root.resolve("d/f"), HookedOperations.blocking(creating, release));
+			Future<Response> created = threads.submit(() -> ops.handle(new CreateRequest(directory, "f", NodeType.FILE, 0644)));
+			Assertions.assertTrue(creating.await(10, TimeUnit.SECONDS));
+			Future<Response> changes = changes();
+
+			source.signal();
+			assertWaits(changes);
+			release.countDown();
+
+			long createdDirectory = Assertions.assertInstanceOf(CreateResponse.class, created.get(10, TimeUnit.SECONDS)).directoryAttributes().generation();
+			Assertions.assertTrue(records(changes).get(directory).generation() > createdDirectory);
+		}
+
+		@Test
 		@DisplayName("closing ends a waiting request with EIO and answers later ones at once, and closing the operations stops the source")
 		public void testClose() throws Exception {
 			Future<Response> changes = changes();
@@ -4054,6 +4094,78 @@ public class FileSystemOperationsTest {
 			release.countDown();
 			long listed = done(listing, ReaddirResponse.class).entries().getFirst().attributes().generation();
 			Assertions.assertTrue(done(created, CreateResponse.class).directoryAttributes().generation() > listed);
+		}
+
+		@Test
+		@DisplayName("a getattr of a directory waits for a create in it, and replies with a later generation than the create's record of the directory")
+		public void testGetattrOfDirectoryExcludesCreate() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			CountDownLatch creating = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			// inside the create's lock set, before it holds the new entry
+			ops.beforeOpeningChannel = blockingOnce(root.resolve("d/f"), creating, release);
+
+			Future<Response> created = async(new CreateRequest(directory, "f", NodeType.FILE, 0644));
+			Assertions.assertTrue(creating.await(5, TimeUnit.SECONDS));
+			Future<Response> getattr = async(new GetattrRequest(directory));
+
+			assertWaits(getattr);
+			release.countDown();
+			Attributes createdDirectory = done(created, CreateResponse.class).directoryAttributes();
+			Attributes read = done(getattr, GetattrResponse.class).attributes();
+			Assertions.assertTrue(read.generation() > createdDirectory.generation());
+			Assertions.assertEquals(createdDirectory.modified(), read.modified());
+		}
+
+		@Test
+		@DisplayName("a getattr of a node held as a file that a sample found to be a directory waits for a create in it")
+		public void testGetattrOfFileThatBecameADirectoryExcludesCreate() throws Exception {
+			backing("x", "one");
+			long node = lookup(ROOT, "x").nodeId();
+			Files.delete(root.resolve("x"));
+			Files.createDirectory(root.resolve("x"));
+			CountDownLatch entered = new CountDownLatch(1);
+			CountDownLatch proceed = new CountDownLatch(1);
+			// before the getattr takes its lock set, while the node is held as a file
+			ops.beforeLocking = blockingOnce(root.resolve("x"), entered, proceed);
+			Future<Response> getattr = async(new GetattrRequest(node));
+			Assertions.assertTrue(entered.await(5, TimeUnit.SECONDS));
+			// a sample finds the directory
+			Assertions.assertEquals(NodeType.DIRECTORY, getattr(node).type());
+			CountDownLatch creating = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			ops.beforeOpeningChannel = blockingOnce(root.resolve("x/f"), creating, release);
+			Future<Response> created = async(new CreateRequest(node, "f", NodeType.FILE, 0644));
+			Assertions.assertTrue(creating.await(5, TimeUnit.SECONDS));
+
+			proceed.countDown();
+			assertWaits(getattr);
+			release.countDown();
+			Attributes createdDirectory = done(created, CreateResponse.class).directoryAttributes();
+			Assertions.assertTrue(done(getattr, GetattrResponse.class).attributes().generation() > createdDirectory.generation());
+		}
+
+		@Test
+		@DisplayName("a getattr that waits for the removal of its directory, or comes after it, replies with the directory's last record")
+		public void testGetattrOfDirectoryRemovedMeanwhile() throws Exception {
+			long directory = create(ROOT, "d", NodeType.DIRECTORY).nodeId();
+			CountDownLatch removing = new CountDownLatch(1);
+			CountDownLatch release = new CountDownLatch(1);
+			// the removal reads the directory's attributes under its lock set, before it deletes and unlinks it
+			ops.afterReadingAttributes = blockingOnce(root.resolve("d"), removing, release);
+			Future<Response> removed = async(new RemoveRequest(directory, ROOT, "d"));
+			Assertions.assertTrue(removing.await(5, TimeUnit.SECONDS));
+			CountDownLatch locking = new CountDownLatch(1);
+			ops.beforeLocking = onlyAt(root.resolve("d"), _ -> locking.countDown());
+
+			Future<Response> getattr = async(new GetattrRequest(directory));
+			// the getattr is about to take the lock set of the directory, which is still linked
+			Assertions.assertTrue(locking.await(5, TimeUnit.SECONDS));
+			release.countDown();
+
+			Attributes last = done(removed, RemoveResponse.class).attributes();
+			Assertions.assertEquals(state(last), state(done(getattr, GetattrResponse.class).attributes()));
+			Assertions.assertEquals(state(last), state(getattr(directory)));
 		}
 
 		@Test

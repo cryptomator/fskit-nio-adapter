@@ -5,13 +5,13 @@ import os
 
 /// Forwards the operations it supports to the server of the mount.
 ///
-/// Handlers run concurrently, each awaiting its own requests. One lock guards the volume's state: the items handed to FSKit with their lookups, the newest attributes and free space seen, what FSKit's cache of each file holds, and the volume's statistics. No request is sent and no cache state is set while it is held.
+/// Handlers run concurrently, each awaiting its own requests. One lock guards the volume's state: the items handed to FSKit with their lookups, the newest attributes and free space seen, what FSKit's cache of each file and directory holds, and the volume's statistics. No request is sent and no cache state is set while it is held.
 ///
 /// - Attributes and free space are populated under it, from the newest record by the server's generation, so that FSKit never takes an older record for the newest.
 /// - The handlers that hand out an item reply under it, and a reclaim tries the item under it, so that a reclaim never comes between handing out an item and FSKit counting it.
 /// - Every handler that sends a request holds a ticket of the attribute ledger from its start until it has populated, which keeps the records it may still populate.
-/// - Every record of a file goes to its `CacheValidity` under it. A file that changed outside the volume is revoked: FSKit drops what it cached and looks the item up again once nothing holds it open.
-/// - A revoke is claimed under the lock and runs outside it: from a task of its own that the handler which found it does not wait for, in the task that watches for changes, or within the open or upgrade that found it. An open or upgrade replies with its grant under the lock, in the section that finds no revoke of the item due, running or done, so that no revoke starts between that check and the grant.
+/// - Every record of a file or directory goes to its `CacheValidity` under it. A file that changed outside the volume is revoked: FSKit drops what it cached and looks the item up again once nothing holds it open. A directory that changed outside is invalidated: FSKit drops the names it cached in it and keeps the item. Releases before macOS 27.2.1 accept the call and drop nothing. The root is left out, since FSKit refuses to drop what it cached of it.
+/// - A revoke or an invalidation is claimed under the lock and runs outside it: from a task of its own that the handler which found it does not wait for, or in the task that watches for changes. A revoke may also run within the open or upgrade that found it. An open or upgrade replies with its grant under the lock, in the section that finds no revoke of the item due, running or done, so that no revoke starts between that check and the grant.
 final class BridgeVolume: FSVolume, @unchecked Sendable {
 	private struct Statistics {
 		var totalBytes: UInt64 = 0
@@ -68,14 +68,14 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		awaitingIdle.forEach { $0() }
 	}
 
-	/// Runs an operation under a ticket of the ledger and maps what it throws to the error FSKit expects. Then starts the revokes that are due.
+	/// Runs an operation under a ticket of the ledger and maps what it throws to the error FSKit expects. Then starts the revokes and invalidations that are due.
 	///
-	/// - Parameter item: The item the operation is for. If the server no longer finds it, its revoke is due.
+	/// - Parameter item: The item the operation is for. If the server no longer finds it, its revoke or invalidation is due.
 	private func serve<Result>(for item: FSItem? = nil, _ operation: () async throws -> Result) async throws -> Result {
 		let ticket = begin()
 		defer {
 			finish(ticket)
-			revokeDue()
+			dropDueCaches()
 		}
 		do {
 			return try await operation()
@@ -84,7 +84,7 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		}
 	}
 
-	/// Maps what an operation threw to the error FSKit expects. If the server no longer finds the item the operation was for, its revoke is due.
+	/// Maps what an operation threw to the error FSKit expects. If the server no longer finds the item the operation was for, its revoke or invalidation is due.
 	private func failure(_ error: any Error, for item: BridgeItem?) -> any Error {
 		if let item, (error as? StatusError)?.status == ENOENT {
 			state.withLockUnchecked { $0.validity.missing(item.nodeId) }
@@ -110,7 +110,7 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		Task {
 			defer {
 				self.finish(ticket)
-				self.revokeDue()
+				self.dropDueCaches()
 			}
 			do {
 				let build = try await operation(prepared)
@@ -164,16 +164,24 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		return string
 	}
 
-	// MARK: - Revokes
+	// MARK: - Revokes and invalidations
 
-	/// Runs the revokes that are due, from a task of their own, so that the handler that found them does not wait for them.
-	private func revokeDue() {
+	/// Runs the revokes and invalidations that are due, from a task of their own, so that the handler that found them does not wait for them.
+	private func dropDueCaches() {
 		let claimed = state.withLockUnchecked { $0.validity.claimDue() }
 		guard !claimed.isEmpty else {
 			return
 		}
 		Task.detached {
-			claimed.forEach(self.revoke)
+			claimed.forEach(self.dropCache)
+		}
+	}
+
+	/// Runs a claimed revoke or invalidation. Called without the state lock.
+	private func dropCache(_ claimed: CacheValidity<BridgeItem>.Claimed) {
+		switch claimed.action {
+		case .revoke: revoke(claimed.item)
+		case .invalidate: invalidate(claimed.item)
 		}
 	}
 
@@ -186,7 +194,16 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		state.withLockUnchecked { $0.validity.revokeEnded(item, nodeId: item.nodeId, success: error == nil) }
 	}
 
-	/// Asks the server for changes made outside the volume, and revokes the files they concern. Ends once the server has no source of them or the connection is lost, as at every unmount. Holds no ticket of the ledger, since it populates nothing.
+	/// Drops the names FSKit cached in a directory whose invalidation was claimed, so that the next path walk looks them up again. FSKit keeps the item. A failed invalidation is due again and runs with the next handler or the next changes. Called without the state lock.
+	private func invalidate(_ item: BridgeItem) {
+		let error = setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .invalidate)
+		if let error {
+			logger.debug("Failed to invalidate node \(item.nodeId, privacy: .public): \(String(describing: error), privacy: .public)")
+		}
+		state.withLockUnchecked { $0.validity.invalidationEnded(item, nodeId: item.nodeId, success: error == nil) }
+	}
+
+	/// Asks the server for changes made outside the volume, and revokes the files and invalidates the directories they concern. Ends once the server has no source of them or the connection is lost, as at every unmount. Holds no ticket of the ledger, since it populates nothing.
 	private func watchChanges() async {
 		while true {
 			do {
@@ -195,7 +212,7 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 					response.attributes.forEach { state.validity.compare($0, .locked) }
 					return state.validity.claimDue()
 				}
-				claimed.forEach(revoke)
+				claimed.forEach(dropCache)
 			} catch let failure as StatusError where failure.status != ENOTSUP && client.isConnected {
 				// an unexpected failure of the server, which the next attempt may not meet
 				try? await Task.sleep(for: .seconds(1))
@@ -220,10 +237,10 @@ final class BridgeVolume: FSVolume, @unchecked Sendable {
 		fsItemAttributes(state.ledger.newest(received))
 	}
 
-	/// Populates FSKit's attributes for a reply that hands out an item, and gives `CacheValidity` what FSKit is handed: the newest record of the item, since a newer one may have arrived meanwhile. Called under the state lock.
+	/// Populates FSKit's attributes for a reply that hands out an item from the newest record of the item, since a newer one may have arrived meanwhile. Gives `CacheValidity` both the received record and that newest one. Called under the state lock.
 	private func handedOut(_ item: BridgeItem, _ received: Attributes, _ state: inout State) -> FSItem.Attributes {
 		let attributes = state.ledger.newest(received)
-		state.validity.handedOut(item, attributes)
+		state.validity.handedOut(item, received, newest: attributes)
 		return fsItemAttributes(attributes)
 	}
 
@@ -360,6 +377,7 @@ extension BridgeVolume: FSVolume.Handler {
 			return try state.withLockUnchecked { state in
 				state.statistics.totalBytes = response.totalBytes
 				_ = newestUsableBytes(response.freeSpace, &state)
+				// handed out without a record, so that CacheValidity does not track it: FSKit refuses every cache state for the root (kIOReturnBadArgument)
 				return try required(FSActivateResult(rootItem: state.items.item(for: Messages.rootNodeId)))
 			}
 		}
@@ -458,7 +476,11 @@ extension BridgeVolume: FSVolume.Handler {
 			}
 			return request
 		} _: { request in
-			let response = try await self.client.request(request)
+			let response = try await self.ownEntriesChange(in: request.parentId) {
+				try await self.client.request(request)
+			} directory: {
+				$0.directoryAttributes
+			}
 			return { state in
 				let item = state.items.item(for: response.attributes.nodeId)
 				if request.type == .file {
@@ -468,7 +490,7 @@ extension BridgeVolume: FSVolume.Handler {
 					newItem: item,
 					newItemName: FSFileName(string: response.name),
 					newItemAttributes: self.handedOut(item, response.attributes, &state),
-					directoryAttributes: self.fsAttributes(response.directoryAttributes, &state),
+					directoryAttributes: self.populated(response.directoryAttributes, &state),
 					freeSpace: self.fsFreeSpace(response.freeSpace, &state)
 				)
 			}
@@ -482,13 +504,17 @@ extension BridgeVolume: FSVolume.Handler {
 			// the mode is not marked as consumed, since the server applies none to a link
 			return try SymlinkRequest(parentId: nodeId(directory), name: string(name), target: string(contents))
 		} _: { request in
-			let response = try await self.client.request(request)
+			let response = try await self.ownEntriesChange(in: request.parentId) {
+				try await self.client.request(request)
+			} directory: {
+				$0.directoryAttributes
+			}
 			return { state in
 				FSCreateSymlinkResult(
 					newItem: state.items.item(for: response.attributes.nodeId),
 					newItemName: FSFileName(string: response.name),
 					newItemAttributes: self.fsAttributes(response.attributes, &state),
-					directoryAttributes: self.fsAttributes(response.directoryAttributes, &state),
+					directoryAttributes: self.populated(response.directoryAttributes, &state),
 					freeSpace: self.fsFreeSpace(response.freeSpace, &state)
 				)
 			}
@@ -503,13 +529,25 @@ extension BridgeVolume: FSVolume.Handler {
 	func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext) async throws -> FSRenameItemResult {
 		try await serve {
 			try authorize(context)
-			let response = try await client.request(RenameRequest(nodeId: nodeId(item), sourceParentId: nodeId(sourceDirectory), sourceName: string(sourceName), destinationParentId: nodeId(destinationDirectory), destinationName: string(destinationName)))
+			let request = try RenameRequest(nodeId: nodeId(item), sourceParentId: nodeId(sourceDirectory), sourceName: string(sourceName), destinationParentId: nodeId(destinationDirectory), destinationName: string(destinationName))
+			let response = try await ownEntriesChange(in: request.destinationParentId) {
+				guard request.sourceParentId != request.destinationParentId else {
+					return try await client.request(request)
+				}
+				return try await ownEntriesChange(in: request.sourceParentId) {
+					try await client.request(request)
+				} directory: {
+					$0.sourceDirectoryAttributes
+				}
+			} directory: {
+				$0.destinationDirectoryAttributes
+			}
 			return try state.withLockUnchecked { state in
 				try required(FSRenameItemResult(
 					newName: FSFileName(string: response.name),
 					renamedItemAttributes: fsAttributes(response.attributes, &state, .locked),
-					sourceDirectoryAttributes: fsAttributes(response.sourceDirectoryAttributes, &state),
-					destinationDirectoryAttributes: fsAttributes(response.destinationDirectoryAttributes, &state),
+					sourceDirectoryAttributes: populated(response.sourceDirectoryAttributes, &state),
+					destinationDirectoryAttributes: populated(response.destinationDirectoryAttributes, &state),
 					overItemAttributes: overItem == nil ? nil : response.replacedAttributes.map { fsAttributes($0, &state, .locked) },
 					freeSpace: fsFreeSpace(response.freeSpace, &state)
 				))
@@ -520,11 +558,16 @@ extension BridgeVolume: FSVolume.Handler {
 	func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext) async throws -> FSRemoveItemResult {
 		try await serve {
 			try authorize(context)
-			let response = try await client.request(RemoveRequest(nodeId: nodeId(item), parentId: nodeId(directory), name: string(name)))
+			let request = try RemoveRequest(nodeId: nodeId(item), parentId: nodeId(directory), name: string(name))
+			let response = try await ownEntriesChange(in: request.parentId) {
+				try await client.request(request)
+			} directory: {
+				$0.directoryAttributes
+			}
 			return try state.withLockUnchecked { state in
 				try required(FSRemoveItemResult(
 					itemAttributes: fsAttributes(response.attributes, &state, .locked),
-					directoryAttributes: fsAttributes(response.directoryAttributes, &state),
+					directoryAttributes: populated(response.directoryAttributes, &state),
 					freeSpace: fsFreeSpace(response.freeSpace, &state)
 				))
 			}
@@ -572,7 +615,7 @@ extension BridgeVolume: FSVolume.Handler {
 		}
 	}
 
-	/// Sends a request that changes a file, and tells `CacheValidity` what it applied, so that the change is not taken for one made outside the volume.
+	/// Sends a request that changes an item or the names in a directory, and tells `CacheValidity` what it applied, so that the change is not taken for one made outside the volume.
 	///
 	/// - Parameter fields: The fields the request may set, as bits of `Messages`.
 	private func ownChange<Response>(of nodeId: UInt64, setting fields: UInt8, _ send: () async throws -> Response, applied: (Response) -> CacheValidity<BridgeItem>.OwnChange) async throws -> Response {
@@ -585,6 +628,13 @@ extension BridgeVolume: FSVolume.Handler {
 			state.withLockUnchecked { $0.validity.ownChangeEnded(nodeId, nil) }
 			throw error
 		}
+	}
+
+	/// Sends a request that creates, links, removes or renames an entry in a directory, as one of the volume's own changes to that directory's size and modification time.
+	///
+	/// - Parameter directory: The directory's record in the reply.
+	private func ownEntriesChange<Response>(in nodeId: UInt64, _ send: () async throws -> Response, directory: (Response) -> Attributes) async throws -> Response {
+		try await ownChange(of: nodeId, setting: Messages.attributeSize | Messages.attributeModified, send) { .entries(directory($0)) }
 	}
 
 	// swiftlint:disable:next function_parameter_count
@@ -654,7 +704,7 @@ extension BridgeVolume: FSVolume.DataCacheHandler {
 		Task {
 			defer {
 				self.finish(ticket)
-				self.revokeDue()
+				self.dropDueCaches()
 			}
 			let stale = fs_errorForPOSIXError(POSIXError.ESTALE.rawValue)
 			do {

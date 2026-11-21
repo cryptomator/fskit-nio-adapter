@@ -1,23 +1,27 @@
-/// Decides when FSKit's cache of a file is stale, because something else changed the file in the backing store, and who revokes it.
+/// Decides when FSKit's cache of a file or directory is stale, because something else changed it in the backing store, and who drops that cache.
 ///
-/// It keeps, for each file item handed out, a baseline of what FSKit's cache provably holds: the record of the reply that handed the item out, moved only by the fields that the volume's own changes set. Every other record of the file is compared with it. A difference in type, mode, size or modification time makes a revoke due. The access time is left out, since reading changes it.
+/// It keeps, for each file and directory item handed out, a baseline of what FSKit's cache provably holds. It starts as the record FSKit was handed with the item, the newest one at the time of the reply that handed it out, and moves by the fields that the volume's own changes set. Every other record of the item is compared with it. A difference in type, mode, size or modification time makes the item's action due: a revoke for a file, an invalidation of the names cached in it for a directory. The access time is left out, since reading changes it.
 ///
-/// The server stamps every record with a generation, and a higher one means a later state. A record it read under the node's data lock, which each of the volume's own changes holds while it applies and samples, shows exactly the changes with a generation up to its own. A record it sampled without that lock may show a change in progress, partly applied, so one that arrives while the volume's own changes are in flight is judged only if it is newer than all of them. `PROTOCOL.md` lists which responses are read under the data lock.
+/// The server stamps every record with a generation, and a higher one means a later state. A record it read under the node's data lock, which each of the volume's own changes holds while it applies and samples, shows exactly the changes with a generation up to its own. For a directory, such a record also excludes the creates, links, removals and renames in it. A record it sampled without that lock may show a change in progress, partly applied, so one that arrives while the volume's own changes are in flight is judged only if it is newer than all of them. `PROTOCOL.md` lists which responses are read under the data lock.
 ///
 /// A due revoke is claimed for the item it concerns, at most once at a time, and a successful one leaves the item revoked until it is reclaimed. An item keeps its entry for as long as FSKit keeps it: a lookup that hands it out again leaves its claim and its own changes as they are, since FSKit may hand it out with the pages it cached.
 ///
+/// FSKit does not reclaim a directory it was told to invalidate: it looks the directory up again and keeps the item. So a directory has no claim, its opens are always granted, and every later difference makes another invalidation due. Since macOS fetches the directory anew after an invalidation, a fully judged record that differs moves the baseline to the newest record judged in full so far. A record that matches leaves the baseline as it is, so that an older differing record that arrives after it is still judged.
+///
 /// A value without a lock of its own: the volume keeps it under its state lock.
 public struct CacheValidity<Item: AnyObject> {
-	/// A change the volume made to a file, with the record of its reply.
+	/// A change the volume made to a file or directory, with the record of its reply.
 	public enum OwnChange {
 		/// A `SETATTR`, with the bit set of the attributes it applied.
 		case setattr(applied: UInt8, Attributes)
 		/// A `WRITE` that ended at the given offset.
 		case write(end: UInt64, Attributes)
+		/// A create, link, removal or rename in a directory, with the directory's record.
+		case entries(Attributes)
 
 		var record: Attributes {
 			switch self {
-			case let .setattr(_, record), let .write(_, record): record
+			case let .setattr(_, record), let .write(_, record), let .entries(record): record
 			}
 		}
 	}
@@ -40,6 +44,20 @@ public struct CacheValidity<Item: AnyObject> {
 		case refuse
 	}
 
+	/// What a claim asks of the volume.
+	public enum Action: Equatable, Sendable {
+		/// Drop what FSKit cached of a file, which it then reclaims. `revokeEnded` has to be told about its end.
+		case revoke
+		/// Drop the names FSKit cached in a directory. `invalidationEnded` has to be told about its end.
+		case invalidate
+	}
+
+	/// An item whose cache the volume has to drop.
+	public struct Claimed {
+		public let item: Item
+		public let action: Action
+	}
+
 	private enum Claim {
 		case none
 		case revoking
@@ -48,7 +66,11 @@ public struct CacheValidity<Item: AnyObject> {
 
 	private struct Entry {
 		let item: Item
+		/// Whether the item was handed out as a directory, which decides how it is judged and what a claim does until FSKit reclaims it.
+		let isDirectory: Bool
 		var baseline: Attributes
+		/// The newest record judged in full, which a directory's baseline moves to once a record differs.
+		var latest: Attributes
 		var claim = Claim.none
 		/// The volume's own changes in flight. Changes that overlap form a batch, which is applied to the baseline once none is in flight.
 		var ownChanges = 0
@@ -60,20 +82,33 @@ public struct CacheValidity<Item: AnyObject> {
 		var waiting: [Attributes] = []
 		/// The records sampled while the batch is in flight, judged once it was applied if they are newer than all its changes.
 		var sampled: [Attributes] = []
+
+		init(item: Item, isDirectory: Bool, baseline: Attributes) {
+			self.item = item
+			self.isDirectory = isDirectory
+			self.baseline = baseline
+			self.latest = baseline
+		}
 	}
 
 	private var entries: [UInt64: Entry] = [:]
-	/// The nodes whose revoke is due and not claimed.
+	/// The nodes whose action is due and not claimed.
 	private var due: Set<UInt64> = []
 
 	public init() {}
 
-	/// Notes the record of a reply that hands out an item: a lookup or a create. A file is tracked from its first such reply on. One that hands out a tracked item again is compared as a sampled record, since a lookup reads without the data lock.
-	public mutating func handedOut(_ item: Item, _ record: Attributes) {
+	/// Notes the record of a reply that hands out an item: a lookup or a create. A file or directory is tracked from its first such reply on, with what FSKit is handed as its baseline. One that hands out a tracked item again is compared as a sampled record, since a lookup reads without the data lock.
+	///
+	/// - Parameters:
+	///   - record: The record of the reply.
+	///   - newest: What FSKit is handed: the newest record of the item, which may have arrived after the reply's. `nil` for the reply's own.
+	public mutating func handedOut(_ item: Item, _ record: Attributes, newest: Attributes? = nil) {
+		let newest = newest ?? record
 		if let entry = entries[record.nodeId], entry.item === item {
+			// a newer record that matches may hide one of the reply that differs
 			compare(record, .sampled)
-		} else if record.type == .file {
-			entries[record.nodeId] = Entry(item: item, baseline: record)
+		} else if newest.type == .file || newest.type == .directory {
+			entries[record.nodeId] = Entry(item: item, isDirectory: newest.type == .directory, baseline: newest)
 			due.remove(record.nodeId)
 		} else {
 			entries.removeValue(forKey: record.nodeId)
@@ -81,25 +116,28 @@ public struct CacheValidity<Item: AnyObject> {
 		}
 	}
 
-	/// Compares a record of a tracked file with its baseline. While the volume's own changes are in flight, a record read under the data lock is compared at once in the fields none of them sets, and kept to be compared in full once they were applied. A sampled one is kept until then.
+	/// Compares a record of a tracked item with its baseline. While the volume's own changes are in flight, a record read under the data lock is compared at once in the fields none of them sets, and kept to be compared in full once they were applied. A sampled one is kept until then.
 	public mutating func compare(_ record: Attributes, _ reading: Reading) {
-		guard let entry = entries[record.nodeId] else {
+		// taken out while it changes, so that appending to its records does not copy them
+		guard var entry = entries.removeValue(forKey: record.nodeId) else {
 			return
 		}
-		guard entry.ownChanges > 0 else {
-			judge(record, entry.claim, entry.baseline)
-			return
-		}
-		switch reading {
-		case .locked:
-			judge(record, entry.claim, entry.baseline, ignoring: entry.settable)
-			entries[record.nodeId]?.waiting.append(record)
-		case .sampled:
-			entries[record.nodeId]?.sampled.append(record)
+		defer { entries[record.nodeId] = entry }
+		if entry.ownChanges == 0 {
+			judge(record, &entry)
+		} else {
+			switch reading {
+			case .locked:
+				let settable = entry.settable
+				judge(record, &entry, ignoring: settable)
+				entry.waiting.append(record)
+			case .sampled:
+				entry.sampled.append(record)
+			}
 		}
 	}
 
-	/// Notes that a request for one of the volume's own changes to the file is about to be sent.
+	/// Notes that a request for one of the volume's own changes to the item is about to be sent.
 	///
 	/// - Parameter fields: The fields it may set, as bits of `Messages`.
 	public mutating func ownChangeBegan(_ nodeId: UInt64, setting fields: UInt8) {
@@ -112,20 +150,21 @@ public struct CacheValidity<Item: AnyObject> {
 	///
 	/// - Parameter change: What the change applied, or `nil` for a request that failed.
 	public mutating func ownChangeEnded(_ nodeId: UInt64, _ change: OwnChange?) {
-		guard entries[nodeId]?.ownChanges ?? 0 > 0 else {
+		guard var entry = entries.removeValue(forKey: nodeId) else {
 			return
 		}
-		entries[nodeId]?.ownChanges -= 1
-		guard var entry = entries[nodeId] else {
+		defer { entries[nodeId] = entry }
+		guard entry.ownChanges > 0 else {
 			return
 		}
+		entry.ownChanges -= 1
 		if let change {
 			entry.changes.append(change)
-			entries[nodeId] = entry
 		}
 		guard entry.ownChanges == 0 else {
 			if let change {
-				judge(change.record, entry.claim, entry.baseline, ignoring: entry.settable)
+				let settable = entry.settable
+				judge(change.record, &entry, ignoring: settable)
 			}
 			return
 		}
@@ -137,18 +176,19 @@ public struct CacheValidity<Item: AnyObject> {
 				entry.baseline = applied(changes[next], to: entry.baseline)
 				next += 1
 			}
-			judge(record, entry.claim, entry.baseline)
+			judge(record, &entry)
 		}
 		// a sample older than the baseline, which may show a change of the batch partly applied, is ignored
-		entry.sampled.forEach { judge($0, entry.claim, entry.baseline) }
+		for record in entry.sampled {
+			judge(record, &entry)
+		}
 		entry.settable = 0
 		entry.changes = []
 		entry.waiting = []
 		entry.sampled = []
-		entries[nodeId] = entry
 	}
 
-	/// Notes that the server no longer finds a tracked file.
+	/// Notes that the server no longer finds a tracked item.
 	public mutating func missing(_ nodeId: UInt64) {
 		guard let entry = entries[nodeId], entry.claim == .none else {
 			return
@@ -156,21 +196,25 @@ public struct CacheValidity<Item: AnyObject> {
 		due.insert(nodeId)
 	}
 
-	/// Claims every due revoke.
-	///
-	/// - Returns: The items to revoke, each of which `revokeEnded` has to be told about.
-	public mutating func claimDue() -> [Item] {
-		let claimed = due.compactMap { nodeId -> Item? in
+	/// Claims every due action.
+	public mutating func claimDue() -> [Claimed] {
+		let claimed = due.compactMap { nodeId -> Claimed? in
+			guard let entry = entries[nodeId] else {
+				return nil
+			}
+			guard !entry.isDirectory else {
+				return Claimed(item: entry.item, action: .invalidate)
+			}
 			entries[nodeId]?.claim = .revoking
-			return entries[nodeId]?.item
+			return Claimed(item: entry.item, action: .revoke)
 		}
 		due = []
 		return claimed
 	}
 
-	/// Decides an open or upgrade of an item. A due revoke of the item becomes the caller's.
+	/// Decides an open or upgrade of an item. A due revoke of a file becomes the caller's. A directory is always granted, and its due invalidation stays to be claimed.
 	public mutating func admit(_ item: Item, nodeId: UInt64) -> Admission {
-		guard let entry = entries[nodeId], entry.item === item else {
+		guard let entry = entries[nodeId], entry.item === item, !entry.isDirectory else {
 			return .grant
 		}
 		if due.remove(nodeId) != nil {
@@ -191,24 +235,41 @@ public struct CacheValidity<Item: AnyObject> {
 		}
 	}
 
+	/// Notes the end of an invalidation of a directory. A failed one is due again, and a successful one changes nothing.
+	public mutating func invalidationEnded(_ item: Item, nodeId: UInt64, success: Bool) {
+		guard !success, let entry = entries[nodeId], entry.item === item else {
+			return
+		}
+		due.insert(nodeId)
+	}
+
 	/// Forgets an item that FSKit reclaimed.
 	public mutating func reclaimed(_ nodeId: UInt64) {
 		entries.removeValue(forKey: nodeId)
 		due.remove(nodeId)
 	}
 
-	/// Makes a revoke due if the item is not claimed, and the record is not older than the baseline and differs from it in a field it is not told to ignore.
+	/// Makes the entry's action due if the record is not older than the baseline and differs from it in a field it is not told to ignore, unless a revoke of the file is claimed. When a record judged in full differs, a directory's baseline moves to the newest record judged in full.
 	///
 	/// - Parameter fields: Bits of `Messages` for the fields to leave out.
-	private mutating func judge(_ record: Attributes, _ claim: Claim, _ baseline: Attributes, ignoring fields: UInt8 = 0) {
-		guard claim == .none, record.generation >= baseline.generation else {
+	private mutating func judge(_ record: Attributes, _ entry: inout Entry, ignoring fields: UInt8 = 0) {
+		guard entry.claim == .none, record.generation >= entry.baseline.generation else {
 			return
 		}
+		if fields == 0, record.generation > entry.latest.generation {
+			entry.latest = record
+		}
+		let baseline = entry.baseline
 		func differs(_ field: UInt8, _ differ: Bool) -> Bool {
 			fields & field == 0 && differ
 		}
-		if record.type != baseline.type || differs(Messages.attributeMode, record.mode != baseline.mode) || differs(Messages.attributeSize, record.size != baseline.size) || differs(Messages.attributeModified, record.modified != baseline.modified) {
-			due.insert(record.nodeId)
+		guard record.type != baseline.type || differs(Messages.attributeMode, record.mode != baseline.mode) || differs(Messages.attributeSize, record.size != baseline.size) || differs(Messages.attributeModified, record.modified != baseline.modified) else {
+			return
+		}
+		due.insert(record.nodeId)
+		// macOS fetches the directory anew once it is invalidated
+		if entry.isDirectory, fields == 0 {
+			entry.baseline = entry.latest
 		}
 	}
 
@@ -233,8 +294,13 @@ public struct CacheValidity<Item: AnyObject> {
 				baseline.size = end
 			}
 			baseline.modified = record.modified
+		case .entries:
+			baseline.size = record.size
+			baseline.modified = record.modified
 		}
 		baseline.generation = record.generation
 		return baseline
 	}
 }
+
+extension CacheValidity.Claimed: Sendable where Item: Sendable {}

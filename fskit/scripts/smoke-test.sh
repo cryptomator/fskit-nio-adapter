@@ -43,6 +43,9 @@ EXTENSION_EXECUTABLE=Contents/MacOS/FSKitNioExtension
 SCENARIOS=(basics io listing modes renames names links unreadable-directory open-unlinked backend-failure parallel two-mounts occupied external-unmount busy-unmount read-only outside vault)
 # access needs a second account and joins the others only where SMOKE_OTHER_ACCOUNT names one
 OPT_IN_SCENARIOS=(access)
+# macOS drops the names it cached in a directory on request from 27.2.1 on
+autoload -Uz is-at-least
+is-at-least 27.2.1 "$(sw_vers -productVersion)" && DIRECTORY_PURGE=1 || DIRECTORY_PURGE=0
 
 usage() {
 	echo "usage: smoke-test.sh [--stop-on-failure] [scenario ...]" >&2
@@ -1341,17 +1344,64 @@ access() {
 	unmount_volume "$SCENARIO" "$MNT"
 }
 
-# Changes the backing store while the volume is mounted, against the rule for fixtures, as a sync client does. A plain directory is changed in place, except the file a writer holds, which is replaced through a rename. A vault is changed by replacing a file's ciphertext through a rename.
+# Changes the backing store while the volume is mounted, against the rule for fixtures, as a sync client does. A plain directory is changed in place, except the file a writer holds, which is replaced through a rename. In the directory fresh, a file is created and one removed. A vault is changed by replacing a file's ciphertext through a rename, and by adding or removing a ciphertext. A change to the names in a directory other than the root makes the volume drop the names macOS cached in it, which macOS does from 27.2.1 on. So the checks of what a name created or removed outside shows run only there. The checks that the volume's own creates, links, removals and renames keep the names cached run on every release, but only from 27.2.1 on could a wrong invalidation fail them.
 outside() {
-	local name names=(event listed read write removed held writer)
-	for name in $names truncated; do
+	local name names=(event listed read write removed held writer fresh/vanishes fresh/appears)
+	mkdir "$BACKING/fresh"
+	for name in ${names:#*/appears} truncated; do
 		print -n "version two, which is longer" > "$BACKING/$name.txt"
 	done
+	own_directories "$BACKING"
 	outside_rounds plain "$BACKING"
 	BACKING="$SCENARIO_DIR/vault"
 	mkdir "$BACKING"
 	prepare_vault_versions $names || return 0
+	# fresh/appears.txt is created outside by putting its kept ciphertext back
+	remove_outside vault fresh/appears.txt
+	mount_volume "$SCENARIO-prepare-3" vault rw "$BACKING" "$MNT" || return 0
+	check "the vault holds the directories for the volume's own changes" own_directories "$MNT"
+	unmount_volume "$SCENARIO-prepare-3" "$MNT"
 	outside_rounds vault "$BACKING"
+}
+
+# the directories in which the volume makes one change each, each holding a file named after it that macOS keeps cached
+OWN_DIRECTORIES=(own-create own-link own-remove own-rename own-from own-to)
+
+# own_directories <directory>: creates the directories of OWN_DIRECTORIES in it, with the files the changes act on
+own_directories() {
+	local directory
+	for directory in $OWN_DIRECTORIES; do
+		mkdir "$1/$directory" && : > "$1/$directory/primed-$directory" || return 1
+	done
+	: > "$1/own-remove/gone.txt" && : > "$1/own-rename/a.txt" && : > "$1/own-from/moved.txt"
+}
+
+# own_name_changes <mount point>: creates a file, a link, removes a file, renames a file within its directory and moves one to another, each in a directory of its own
+own_name_changes() {
+	echo_to created "$1/own-create/created.txt" && ln -s primed-own-link "$1/own-link/link" && rm "$1/own-remove/gone.txt" && mv "$1/own-rename/a.txt" "$1/own-rename/b.txt" && mv "$1/own-from/moved.txt" "$1/own-to/moved.txt"
+}
+
+# stat_primed <mount point>: stats the file named after each directory of OWN_DIRECTORIES
+stat_primed() {
+	local directory
+	for directory in $OWN_DIRECTORIES; do
+		stat "$1/$directory/primed-$directory" > /dev/null || return 1
+	done
+}
+
+# keeps_cached <directory> <first mark> <second mark>: the program's log shows no lookup of primed-<directory> in that directory between the marks
+keeps_cached() {
+	local node count
+	node="$(node_of "$1" Lookup)"
+	if [[ -z "$node" ]]; then
+		print -r -- "the log shows no lookup of $1"
+		return 1
+	fi
+	count="$(requests_between "$2" "$3" "LookupRequest[parentId=$node, name=primed-$1]")" || return 1
+	if [[ "$count" != 0 ]]; then
+		print -r -- "${count:-the log shows no marks}"
+		return 1
+	fi
 }
 
 # outside_rounds <plain|vault> <backing directory>
@@ -1369,6 +1419,27 @@ outside_rounds() {
 	check "$kind: stat shows a change made outside within 3 s" shows_size_within "$MNT/event.txt" 11 3
 	check "$kind: a CHANGES response named the file with its new size" changes_reported "$node" $offset 11
 	check "$kind: cat then shows the new content" content_is "$MNT/event.txt" "version one"
+	check_fails "$kind: stat looks up fresh/appears.txt while it is missing" "No such file or directory" stat "$MNT/fresh/appears.txt"
+	check "$kind: stat looks up fresh/vanishes.txt" stat "$MNT/fresh/vanishes.txt"
+	request sync "$SCENARIO"
+	node="$(node_of fresh Lookup)"
+	check "$kind: the program's log shows fresh looked up" test -n "$node"
+	offset=$(wc -c < "$PROGRAM_LOG")
+	change_outside "$kind" fresh/appears.txt
+	if (( DIRECTORY_PURGE )); then
+		check "$kind: stat finds a name created outside after it was looked up while missing, within 3 s" found_within "$MNT/fresh/appears.txt" 3
+		check "$kind: and cat reads it" content_is "$MNT/fresh/appears.txt" "version one"
+	fi
+	check "$kind: a CHANGES response named the directory" await_changes_reported "$node" $offset
+	# lets the invalidation for the creation finish, which would otherwise show the removal as well and prove nothing
+	sleep 1
+	check "$kind: stat looks up fresh/vanishes.txt again" stat "$MNT/fresh/vanishes.txt"
+	remove_outside "$kind" fresh/vanishes.txt
+	if (( DIRECTORY_PURGE )); then
+		check "$kind: stat of a file removed outside fails with No such file or directory within 3 s" gone_within "$MNT/fresh/vanishes.txt" 3
+	else
+		print -r -- "        macOS $(sw_vers -productVersion) is older than 27.2.1, the first release seen to drop the names cached in a directory, so what names created or removed outside show is not checked"
+	fi
 	holder_read "$MNT/held.txt" "$sig"
 	holder=$!
 	await_file "$sig/ready" || return 0
@@ -1414,6 +1485,18 @@ outside_rounds() {
 	check "$kind: and the new content" content_is "$MNT/writer.txt" "version one"
 	# the close can show the change before the stream reports it, up to its latency of 0.3 s after the change: wait for that report before the volume's own changes start
 	sleep 1
+	check "$kind: stat looks up a file in each directory the volume changes" stat_primed "$MNT"
+	mark "own-dirs-1-$kind"
+	check "$kind: the volume creates a file, a link, removes, renames and moves, each in a directory of its own" own_name_changes "$MNT"
+	# an invalidation that an own change caused by mistake runs only after its reply: give it time to show in the stats below
+	sleep 0.5
+	check "$kind: stat finds the file in each directory again" stat_primed "$MNT"
+	mark "own-dirs-2-$kind"
+	request sync "$SCENARIO"
+	local directory
+	for directory in $OWN_DIRECTORIES; do
+		check "$kind: macOS keeps the names cached in $directory" keeps_cached "$directory" "own-dirs-1-$kind" "own-dirs-2-$kind"
+	done
 	mark "own-1-$kind"
 	check "$kind: the volume writes, appends, changes a mode, renames and removes" own_changes "$MNT"
 	check "$kind: ls -l lists the files" ls -l "$MNT"
@@ -1480,7 +1563,7 @@ outside_rounds() {
 	unmount_volume "$SCENARIO-$kind-nosource" "$MNT"
 }
 
-# change_outside <plain|vault> <name> [replace]: replaces the content of a file with "version one": in a plain directory in place, or through a rename with replace, and in a vault by putting back the ciphertext of that version, which prepare_vault_versions kept
+# change_outside <plain|vault> <name> [replace]: replaces the content of a file with "version one", or creates the file with it. In a plain directory it writes in place, or through a rename with replace. In a vault it renames the ciphertext of that version, which prepare_vault_versions kept, into place.
 change_outside() {
 	local ciphertext
 	if [[ "$1" == plain && -n "${3:-}" ]]; then
@@ -1501,10 +1584,18 @@ remove_outside() {
 	fi
 }
 
-# prepare_vault_versions <name> ...: creates a vault in the backing directory with a file for each name, holding "version two, which is longer", and keeps the ciphertext of "version one" of each in the scenario's directory. Records a failure itself.
+# prepare_vault_versions <name> ...: creates a vault in the backing directory with a file for each name, holding "version two, which is longer", and keeps the ciphertext of "version one" of each in the scenario's directory. A name may lead through a directory. Records a failure itself.
 prepare_vault_versions() {
 	local name before after ciphertext
 	mount_volume "$SCENARIO-prepare-1" vault rw "$BACKING" "$MNT" || return 1
+	# ahead of the files, since a directory adds ciphertexts of its own
+	for name in "$@"; do
+		if [[ "$name" == */* ]] && ! mkdir -p "$MNT/${name:h}" "$SCENARIO_DIR/${name:h}"; then
+			fail "the vault holds the directory of $name.txt"
+			unmount_volume "$SCENARIO-prepare-1" "$MNT"
+			return 1
+		fi
+	done
 	for name in "$@"; do
 		ciphertext=""
 		if before="$(/usr/bin/find "$BACKING/d" -name '*.c9r' -type f | sort)" && print -n "version one" > "$MNT/$name.txt" && after="$(/usr/bin/find "$BACKING/d" -name '*.c9r' -type f | sort)"; then
@@ -1547,6 +1638,36 @@ shows_size_within() {
 	done
 	print -r -- "stat reports $size bytes"
 	return 1
+}
+
+# found_within <file> <seconds>: polls stat until it finds the file, at least once
+found_within() {
+	local output
+	integer polls=$(( $2 * 10 ))
+	until output="$(stat -f %z "$1" 2>&1)"; do
+		if (( polls-- <= 0 )); then
+			print -r -- "$output"
+			return 1
+		fi
+		sleep 0.1
+	done
+}
+
+# gone_within <file> <seconds>: polls stat until it reports that the file does not exist, at least once
+gone_within() {
+	local output
+	integer polls=$(( $2 * 10 ))
+	while output="$(stat -f %z "$1" 2>&1)"; do
+		if (( polls-- <= 0 )); then
+			print -r -- "stat reports $output bytes"
+			return 1
+		fi
+		sleep 0.1
+	done
+	if [[ "$output" != *"No such file or directory"* ]]; then
+		print -r -- "$output"
+		return 1
+	fi
 }
 
 content_is() {
