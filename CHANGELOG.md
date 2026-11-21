@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/cryptomator/fskit-nio-adapter/compare/0.5.1...HEAD)
 ### Fixed
 * A file that another process, such as a sync client, changes in the mounted `Path` shows its new size and content within about a second, where it kept its old ones as long as macOS remembered the file. Writing to such a file after the change no longer puts its old content back. An entry that such a process creates or removes in a folder shows up or disappears as well. See `KNOWN_LIMITATIONS.md` for what remains
+* A file that a sync client replaces while a process has it open for reading is no longer changed or damaged when another process writes to it or truncates it. Such a write fails with "Stale NFS file handle" until the file is closed. The process that has it open keeps reading the version it opened, where it could read parts of the new version, or get "Input/output error" in a vault. See `KNOWN_LIMITATIONS.md` for what remains
 
 
 ## [0.5.1](https://github.com/cryptomator/fskit-nio-adapter/releases/tag/0.5.1) - 2026-11-10

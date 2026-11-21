@@ -112,6 +112,7 @@ Notes:
 - `OPEN` replies with the item's attributes read after the open, which tell whether the item changed since the client last saw it. The items `.fseventsd` and `no_log` reply with their fixed records.
 - `OPEN` of a directory or a symbolic link succeeds without opening anything. A `READ` or `WRITE` of a symbolic link is answered with `ENOTSUP` (45).
 - `OPEN`, `READ` and `WRITE` of a file other than `no_log` need a successful `LOOKUP`, `CREATE` or `SYMLINK` response for it that the client has not forgotten yet. For a file known only from a listing they are answered with `ESTALE` (70), since the server drops the node of such a file whenever it needs the room for listings.
+- An `OPEN`, `READ` or `WRITE` that needs more modes than the file's channel has, and a `SETATTR` of the size while the file has a channel without write mode, open the file again by its path. If the server finds that the path no longer names the file the channel was opened on, as after a sync tool replaced it through a rename, it answers `ESTALE` (70) and keeps the channel.
 - `CLOSE`: `keptModes` are the modes that stay open. With none kept, the server closes the item's channel.
 - `READ`: `length` is at most the payload limit. Fewer bytes than requested mean the end of the file.
 - `READ` and `WRITE` larger than the payload limit are split by the client into several requests.

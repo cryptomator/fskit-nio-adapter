@@ -11,7 +11,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /**
  * One entry of the backing file system, as known to the kernel.
  * <p>
- * {@link NodeTable} changes {@link #path}, {@link #parentId}, {@link #type}, {@link #unlinked}, {@link #forgotten} and {@link #lookups} under its monitor. {@link #path}, {@link #parentId} and {@link #unlinked} change through a rename or a removal only under that operation's write lock on the node's path. Every operation on the node checks {@link #path} and {@link #unlinked} again once it holds its own lock set, and {@code REMOVE} and {@code RENAME} check {@link #parentId} as well. {@link #type} follows every published sample. {@link #channel} and {@link #modes} are guarded by {@link #data}, {@link #attributes} by the entry's sampling lock, or by the node's monitor once it is {@link #unlinked}.
+ * {@link NodeTable} changes {@link #path}, {@link #parentId}, {@link #type}, {@link #unlinked}, {@link #forgotten} and {@link #lookups} under its monitor. {@link #path}, {@link #parentId} and {@link #unlinked} change through a rename or a removal only under that operation's write lock on the node's path. Every operation on the node checks {@link #path} and {@link #unlinked} again once it holds its own lock set, and {@code REMOVE} and {@code RENAME} check {@link #parentId} as well. {@link #type} follows every published sample. {@link #channel}, {@link #modes} and {@link #fileKey} are guarded by {@link #data}, {@link #attributes} by the entry's sampling lock, or by the node's monitor once it is {@link #unlinked}.
  */
 final class Node {
 
@@ -44,6 +44,10 @@ final class Node {
 	 * The modes {@link #channel} was opened with.
 	 */
 	int modes;
+	/**
+	 * The {@link java.nio.file.attribute.BasicFileAttributes#fileKey() key} the file at {@link #path} had when {@link #channel} was first opened, or {@code null} if it is not known. Needed only while the file may be opened again by its path, for a wider channel or a temporary writer.
+	 */
+	@Nullable Object fileKey;
 
 	Node(long id, long parentId, Path path, NodeType type) {
 		this.id = id;

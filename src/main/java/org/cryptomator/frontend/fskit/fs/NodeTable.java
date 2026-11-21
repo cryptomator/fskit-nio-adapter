@@ -81,9 +81,10 @@ final class NodeTable {
 		return node.lookups > 0;
 	}
 
-	synchronized void setChannel(Node node, FileChannel channel, int modes) {
+	synchronized void setChannel(Node node, FileChannel channel, int modes, @Nullable Object fileKey) {
 		node.channel = channel;
 		node.modes = modes;
+		node.fileKey = fileKey;
 		nodesWithChannel.add(node);
 	}
 
@@ -101,6 +102,7 @@ final class NodeTable {
 			synchronized (this) {
 				node.channel = null;
 				node.modes = 0;
+				node.fileKey = null;
 				nodesWithChannel.remove(node);
 			}
 		}

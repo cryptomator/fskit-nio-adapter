@@ -88,7 +88,7 @@ public class NodeTableTest {
 	public void testForget(@TempDir Path tmpDir) throws IOException {
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 		FileChannel channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
-		nodes.setChannel(node, channel, Messages.MODE_WRITE);
+		nodes.setChannel(node, channel, Messages.MODE_WRITE, null);
 
 		nodes.forget(node, 1);
 
@@ -117,10 +117,10 @@ public class NodeTableTest {
 	@DisplayName("the nodes with a channel are handed out as a copy")
 	public void testWithChannelIsACopy() {
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
-		nodes.setChannel(node, Mockito.mock(FileChannel.class), Messages.MODE_READ);
+		nodes.setChannel(node, Mockito.mock(FileChannel.class), Messages.MODE_READ, null);
 		List<Node> withChannel = nodes.withChannel();
 
-		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), Mockito.mock(FileChannel.class), Messages.MODE_READ);
+		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), Mockito.mock(FileChannel.class), Messages.MODE_READ, null);
 
 		Assertions.assertEquals(List.of(node), withChannel);
 	}
@@ -138,7 +138,7 @@ public class NodeTableTest {
 			release.await();
 			return null;
 		}).when(blocking).close();
-		nodes.setChannel(node, blocking, Messages.MODE_WRITE);
+		nodes.setChannel(node, blocking, Messages.MODE_WRITE, null);
 		try (ExecutorService threads = Executors.newVirtualThreadPerTaskExecutor()) {
 			Future<?> closing = threads.submit(() -> {
 				nodes.closeChannel(node);
@@ -361,7 +361,7 @@ public class NodeTableTest {
 	public void testClear(@TempDir Path tmpDir) throws IOException {
 		Node node = nodes.hold(ROOT.resolve("a"), NodeType.FILE, root);
 		FileChannel channel = FileChannel.open(Files.createFile(tmpDir.resolve("a")), StandardOpenOption.WRITE);
-		nodes.setChannel(node, channel, Messages.MODE_WRITE);
+		nodes.setChannel(node, channel, Messages.MODE_WRITE, null);
 
 		nodes.clear();
 
@@ -376,9 +376,9 @@ public class NodeTableTest {
 		FileChannel failing = Mockito.mock(FileChannel.class);
 		FileChannel other = Mockito.mock(FileChannel.class);
 		Mockito.doThrow(new IOException("disk on fire")).when(failing).close();
-		nodes.setChannel(nodes.hold(ROOT.resolve("a"), NodeType.FILE, root), failing, Messages.MODE_WRITE);
-		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), other, Messages.MODE_WRITE);
-		nodes.setChannel(nodes.hold(ROOT.resolve("c"), NodeType.FILE, root), failing, Messages.MODE_WRITE);
+		nodes.setChannel(nodes.hold(ROOT.resolve("a"), NodeType.FILE, root), failing, Messages.MODE_WRITE, null);
+		nodes.setChannel(nodes.hold(ROOT.resolve("b"), NodeType.FILE, root), other, Messages.MODE_WRITE, null);
+		nodes.setChannel(nodes.hold(ROOT.resolve("c"), NodeType.FILE, root), failing, Messages.MODE_WRITE, null);
 
 		nodes.clear();
 

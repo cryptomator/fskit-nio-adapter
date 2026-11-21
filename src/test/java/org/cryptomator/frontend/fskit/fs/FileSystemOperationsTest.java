@@ -1,5 +1,6 @@
 package org.cryptomator.frontend.fskit.fs;
 
+import org.cryptomator.cryptofs.CryptoFileSystem;
 import org.cryptomator.cryptofs.CryptoFileSystemProperties;
 import org.cryptomator.cryptofs.CryptoFileSystemProvider;
 import org.cryptomator.cryptolib.api.Masterkey;
@@ -79,7 +80,6 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystem;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
@@ -250,6 +250,18 @@ public class FileSystemOperationsTest {
 		} catch (IOException e) {
 			throw new IllegalStateException(e);
 		}
+	}
+
+	/**
+	 * @return A hook that runs the given one the first time it runs for the given path, and does nothing otherwise
+	 */
+	private static HookedOperations.Hook onlyAt(Path path, HookedOperations.Hook hook) {
+		AtomicBoolean ran = new AtomicBoolean();
+		return candidate -> {
+			if (candidate.equals(path) && ran.compareAndSet(false, true)) {
+				hook.run(candidate);
+			}
+		};
 	}
 
 	private static Stream<Arguments> failures() {
@@ -1287,7 +1299,10 @@ public class FileSystemOperationsTest {
 	@DisplayName("on a vault")
 	public class OnVault {
 
-		private FileSystem vault;
+		// the length of the cleartext a vault encrypts as one chunk
+		private static final int CHUNK = 32 * 1024;
+
+		private CryptoFileSystem vault;
 
 		@BeforeEach
 		public void setup() throws IOException {
@@ -1380,9 +1395,11 @@ public class FileSystemOperationsTest {
 		 */
 		private Path writeThroughVault(String name, String content) throws IOException {
 			Files.writeString(vault.getPath("/" + name), content);
-			try (Stream<Path> files = Files.walk(root.resolve("d"))) {
-				return files.filter(file -> file.getFileName().toString().endsWith(".c9r") && !Set.of("dir.c9r", "dirid.c9r").contains(file.getFileName().toString())).findFirst().orElseThrow();
-			}
+			return ciphertext(name);
+		}
+
+		private Path ciphertext(String name) throws IOException {
+			return vault.getCiphertextPath(vault.getPath("/" + name));
 		}
 
 		/**
@@ -1502,6 +1519,73 @@ public class FileSystemOperationsTest {
 			ChangesResponse afterClose = changes(source, false);
 			Assertions.assertEquals(List.of(file), afterClose.attributes().stream().map(Attributes::nodeId).toList());
 			Assertions.assertEquals(11, afterClose.attributes().getFirst().size());
+		}
+
+		/**
+		 * Writes two versions of file.txt, four chunks each, that differ in the last chunk. Each is written as a file of its own, so that it has a header of its own. Leaves the second one in place.
+		 *
+		 * @return The ciphertext of the first version, kept outside the vault
+		 */
+		private Path writeVersions() throws IOException {
+			Path versionOne = Files.copy(writeThroughVault("file.txt", "a".repeat(4 * CHUNK)), root.resolve("version-one"));
+			Files.writeString(vault.getPath("/new.txt"), "a".repeat(3 * CHUNK) + "b".repeat(CHUNK));
+			Files.move(vault.getPath("/new.txt"), vault.getPath("/file.txt"), StandardCopyOption.REPLACE_EXISTING);
+			return versionOne;
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced while it is open for reading refuses a wider open with ESTALE, and keeps reading the version it was opened on")
+		public void testWidenAfterCiphertextReplaced() throws IOException {
+			Path versionOne = writeVersions();
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			read(file, 0, CHUNK);
+			replaceCiphertext(ciphertext("file.txt"), versionOne);
+
+			assertStatus(Errno.ESTALE, new OpenRequest(file, WRITE));
+
+			Assertions.assertEquals("b".repeat(CHUNK), read(file, 3 * CHUNK, CHUNK));
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced while it is open for writing refuses a read with ESTALE, and leaves the replacement's ciphertext as it is")
+		public void testReadAfterCiphertextReplaced() throws IOException {
+			Path versionOne = writeVersions();
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			write(file, 0, "written");
+			Path ciphertext = ciphertext("file.txt");
+			replaceCiphertext(ciphertext, versionOne);
+			FileTime replaced = Files.getLastModifiedTime(ciphertext);
+
+			assertStatus(Errno.ESTALE, new ReadRequest(file, 0, 4));
+
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
+			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
+			write(file, 7, " more");
+			// the close sets the time through the path, so only the bytes are compared after it
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced while it is open for reading refuses a truncation with ESTALE, leaves the replacement as it is and keeps reading the version it was opened on")
+		public void testTruncateAfterCiphertextReplaced() throws IOException {
+			Path versionOne = writeVersions();
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			read(file, 0, CHUNK);
+			Path ciphertext = ciphertext("file.txt");
+			replaceCiphertext(ciphertext, versionOne);
+			FileTime replaced = Files.getLastModifiedTime(ciphertext);
+
+			assertStatus(Errno.ESTALE, new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, CHUNK, 0, EPOCH, EPOCH));
+
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertEquals("b".repeat(CHUNK), read(file, 3 * CHUNK, CHUNK));
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
+			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
 		}
 
 		@ParameterizedTest(name = "shortened source: {0}, shortened target: {1}")
@@ -2039,6 +2123,166 @@ public class FileSystemOperationsTest {
 			Assertions.assertFalse(ops.openedChannels.get(0).isOpen());
 			Assertions.assertTrue(ops.openedChannels.get(1).isOpen());
 			Assertions.assertEquals("ab23", read(file, 0, 4));
+			Assertions.assertEquals(2, ops.openedChannels.size());
+		}
+
+		/**
+		 * Replaces the file through a rename, as a sync client does.
+		 */
+		private void replaceOutside() throws IOException {
+			Files.move(backing("replacement.txt", "ABCDEFGHIJ"), root.resolve("file.txt"), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		}
+
+		@Test
+		@DisplayName("a file replaced outside while it is open for reading refuses a wider open with ESTALE, and keeps reading the file it was opened on")
+		public void testWidenAfterReplacementOutside() throws IOException {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			Assertions.assertEquals("0123", read(file, 0, 4));
+			replaceOutside();
+
+			assertStatus(Errno.ESTALE, new OpenRequest(file, WRITE));
+			assertStatus(Errno.ESTALE, new WriteRequest(file, 0, StandardCharsets.UTF_8.encode("xy")));
+
+			Assertions.assertEquals("456789", read(file, 4, 6));
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertEquals("ABCDEFGHIJ", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a file replaced outside while it is open for writing refuses a read with ESTALE, and keeps writing to the file it was opened on")
+		public void testReadAfterReplacementOutside() throws IOException {
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			write(file, 0, "xy");
+			Path original = Files.createLink(root.resolve("original.txt"), root.resolve("file.txt"));
+			replaceOutside();
+			FileTime replaced = Files.getLastModifiedTime(root.resolve("file.txt"));
+
+			assertStatus(Errno.ESTALE, new ReadRequest(file, 0, 4));
+			write(file, 2, "zw");
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+
+			Assertions.assertEquals("xyzw456789", Files.readString(original));
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertEquals("ABCDEFGHIJ", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a file replaced outside while it is open for reading refuses a truncation with ESTALE and leaves the replacement as it is")
+		public void testTruncateAfterReplacementOutside() throws IOException {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			replaceOutside();
+
+			assertStatus(Errno.ESTALE, new SetattrRequest(file, Messages.ATTRIBUTE_SIZE, 4, 0, EPOCH, EPOCH));
+
+			Assertions.assertEquals(1, ops.openedChannels.size());
+			Assertions.assertEquals("ABCDEFGHIJ", Files.readString(root.resolve("file.txt")));
+			Assertions.assertEquals("0123456789", read(file, 0, 10));
+		}
+
+		@Test
+		@DisplayName("a file replaced outside while a wider open opens it refuses that open with ESTALE and closes what that open opened")
+		public void testWidenWhenReplacedDuringOpen() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ops.beforeOpeningChannel = onlyAt(root.resolve("file.txt"), _ -> replaceOutside());
+
+			assertStatus(Errno.ESTALE, new OpenRequest(file, WRITE));
+
+			Assertions.assertEquals(2, ops.openedChannels.size());
+			Assertions.assertFalse(ops.openedChannels.get(1).isOpen());
+			Assertions.assertEquals("0123456789", read(file, 0, 10));
+		}
+
+		@Test
+		@DisplayName("a file removed outside while a wider open opens it yields ENOENT and closes what that open opened")
+		public void testWidenWhenRemovedDuringOpen() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ops.channelWrapper = channel -> {
+				try {
+					Files.delete(root.resolve("file.txt"));
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+				return channel;
+			};
+
+			assertStatus(Errno.ENOENT, new OpenRequest(file, WRITE));
+
+			Assertions.assertFalse(ops.openedChannels.get(1).isOpen());
+			Assertions.assertTrue(ops.openedChannels.get(0).isOpen());
+		}
+
+		@Test
+		@DisplayName("a wider open whose file's attributes fail unexpectedly after it is opened yields EIO and closes what that open opened")
+		public void testWidenWhenReadingFailsAfterOpen() {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			UncheckedIOException failure = new UncheckedIOException(new IOException("backend gone"));
+			ops.channelWrapper = channel -> {
+				ops.beforeReadingAttributes = _ -> {
+					throw failure;
+				};
+				return channel;
+			};
+
+			assertStatus(Errno.EIO, new OpenRequest(file, WRITE));
+
+			Assertions.assertFalse(ops.openedChannels.get(1).isOpen());
+			Assertions.assertTrue(ops.openedChannels.get(0).isOpen());
+			Assertions.assertEquals(List.of(failure), ops.unexpectedFailures);
+		}
+
+		@Test
+		@DisplayName("a file replaced outside right after its first open refuses a wider open with ESTALE")
+		public void testWidenAfterReplacementRightAfterFirstOpen() throws IOException {
+			ops.channelWrapper = channel -> {
+				ops.channelWrapper = UnaryOperator.identity();
+				try {
+					replaceOutside();
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+				return channel;
+			};
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			assertStatus(Errno.ESTALE, new OpenRequest(file, WRITE));
+
+			Assertions.assertEquals("0123456789", read(file, 0, 10));
+			Assertions.assertEquals("ABCDEFGHIJ", Files.readString(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a file replaced outside after its channel was closed is opened anew")
+		public void testOpenAfterCloseAndReplacementOutside() throws IOException {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			replaceOutside();
+
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+
+			Assertions.assertEquals("ABCDEFGHIJ", read(file, 0, 10));
+		}
+
+		@Test
+		@DisplayName("a file renamed in the volume while it is open for reading is widened and written")
+		public void testWidenAfterRenameInVolume() throws IOException {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			ok(new RenameRequest(file, ROOT, "file.txt", ROOT, "renamed.txt"), RenameResponse.class);
+
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			write(file, 0, "xy");
+
+			Assertions.assertEquals("xy23456789", Files.readString(root.resolve("renamed.txt")));
+		}
+
+		@Test
+		@DisplayName("a file changed in place outside while it is open for reading is widened")
+		public void testWidenAfterChangeInPlace() throws IOException {
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			backing("file.txt", "changed in place");
+
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+
 			Assertions.assertEquals(2, ops.openedChannels.size());
 		}
 
@@ -3207,13 +3451,17 @@ public class FileSystemOperationsTest {
 			throw failure;
 		};
 
-		@Test
+		@ParameterizedTest(name = "unchecked: {0}")
 		@DisplayName("a write still succeeds, with the size it established and unknown usable space")
-		public void testWrite() throws IOException {
+		@ValueSource(booleans = {false, true})
+		public void testWrite(boolean unchecked) throws IOException {
 			backing("file.txt", "0123456789");
 			Attributes last = lookup(ROOT, "file.txt");
-			ops.beforeReadingAttributes = failing;
-			ops.beforeReadingUsableSpace = failing;
+			HookedOperations.Hook hook = unchecked ? _ -> {
+				throw new UncheckedIOException(failure);
+			} : failing;
+			ops.beforeReadingAttributes = hook;
+			ops.beforeReadingUsableSpace = hook;
 
 			WriteResponse response = write(last.nodeId(), 8, "abcdef");
 
@@ -3920,7 +4168,7 @@ public class FileSystemOperationsTest {
 			long file = lookup(ROOT, "file.txt").nodeId();
 			CountDownLatch entered = new CountDownLatch(1);
 			CountDownLatch release = new CountDownLatch(1);
-			ops.beforeLocking = onlyOnceAt(root.resolve("file.txt"), HookedOperations.blocking(entered, release));
+			ops.beforeLocking = onlyAt(root.resolve("file.txt"), HookedOperations.blocking(entered, release));
 			Future<Response> changes = changes();
 			source.signal();
 			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
@@ -3941,7 +4189,7 @@ public class FileSystemOperationsTest {
 			long other = lookup(ROOT, "other.txt").nodeId();
 			CountDownLatch entered = new CountDownLatch(1);
 			CountDownLatch release = new CountDownLatch(1);
-			ops.beforeLocking = onlyOnceAt(root.resolve("forgotten.txt"), HookedOperations.blocking(entered, release));
+			ops.beforeLocking = onlyAt(root.resolve("forgotten.txt"), HookedOperations.blocking(entered, release));
 			Future<Response> changes = changes();
 			source.signal();
 			Assertions.assertTrue(entered.await(10, TimeUnit.SECONDS));
@@ -3960,7 +4208,7 @@ public class FileSystemOperationsTest {
 			CountDownLatch creating = new CountDownLatch(1);
 			CountDownLatch release = new CountDownLatch(1);
 			// inside the create's lock set, before it holds the new entry, so that the sweep finds only the directory held
-			ops.beforeOpeningChannel = onlyOnceAt(root.resolve("d/f"), HookedOperations.blocking(creating, release));
+			ops.beforeOpeningChannel = onlyAt(root.resolve("d/f"), HookedOperations.blocking(creating, release));
 			Future<Response> created = threads.submit(() -> ops.handle(new CreateRequest(directory, "f", NodeType.FILE, 0644)));
 			Assertions.assertTrue(creating.await(10, TimeUnit.SECONDS));
 			Future<Response> changes = changes();
@@ -3986,15 +4234,6 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
 			ops.close();
 			Assertions.assertTrue(source.closed);
-		}
-
-		private static HookedOperations.Hook onlyOnceAt(Path path, HookedOperations.Hook hook) {
-			AtomicBoolean ran = new AtomicBoolean();
-			return candidate -> {
-				if (candidate.equals(path) && ran.compareAndSet(false, true)) {
-					hook.run(candidate);
-				}
-			};
 		}
 	}
 
@@ -4034,17 +4273,6 @@ public class FileSystemOperationsTest {
 			return onlyAt(path, HookedOperations.blocking(entered, release));
 		}
 
-		/**
-		 * @return A hook that runs the given one the first time it runs for the given path, and does nothing otherwise
-		 */
-		private static HookedOperations.Hook onlyAt(Path path, HookedOperations.Hook hook) {
-			AtomicBoolean ran = new AtomicBoolean();
-			return candidate -> {
-				if (candidate.equals(path) && ran.compareAndSet(false, true)) {
-					hook.run(candidate);
-				}
-			};
-		}
 		@Test
 		@DisplayName("an operation whose node a rename moved before it took its locks takes them anew for the new path")
 		public void testRevalidation() throws Exception {
@@ -4625,6 +4853,17 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of("file.txt"), backingNames());
 			Assertions.assertEquals("content", Files.readString(root.resolve("file.txt")));
 			Assertions.assertEquals(modified, Files.getLastModifiedTime(root.resolve("file.txt")));
+		}
+
+		@Test
+		@DisplayName("a file replaced outside after an open without modes refuses the read that opens it again with ESTALE")
+		public void testReadAfterOpenWithoutModesAndReplacement() throws IOException {
+			ok(new OpenRequest(file, 0), OpenResponse.class);
+			Files.move(backing("replacement.txt", "replaced"), root.resolve("file.txt"), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+			assertStatus(Errno.ESTALE, new ReadRequest(file, 0, 10));
+
+			Assertions.assertEquals(1, ops.openedChannels.size());
 		}
 
 		@Test

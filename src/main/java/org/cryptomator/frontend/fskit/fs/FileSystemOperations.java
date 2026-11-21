@@ -400,7 +400,7 @@ public class FileSystemOperations implements Closeable {
 		try (var _ = lockDataForWriting(node)) {
 			closeLeftoverChannel(node);
 			if (channel != null) {
-				nodes.setChannel(node, channel, Messages.MODE_READ | Messages.MODE_WRITE);
+				nodes.setChannel(node, channel, Messages.MODE_READ | Messages.MODE_WRITE, null);
 			}
 			Timestamp now = now();
 			Attributes attributes = refreshAfterChange(node, _ -> new Attributes(type, mode, size, node.id, node.parentId, now, now, now, 0));
@@ -1068,8 +1068,11 @@ public class FileSystemOperations implements Closeable {
 
 	/* channels */
 
+	/**
+	 * Ignores the node's type: a caller that holds the data lock for reading takes the write lock by this answer, and a lookup or a listing may change the type before {@link #ensureOpen} checks it.
+	 */
 	private static boolean needsOpening(Node node, int modes) {
-		return node.type == NodeType.FILE && (node.channel == null || (node.modes | modes) != node.modes);
+		return node.channel == null || (node.modes | modes) != node.modes;
 	}
 
 	/**
@@ -1093,14 +1096,72 @@ public class FileSystemOperations implements Closeable {
 				throw new StatusException(Errno.ESTALE);
 			}
 			// a channel cannot be upgraded in place, so open one with the widened modes and swap it in
-			FileChannel opened = openChannel(node.path, openOptions(widened));
+			// read before the open, so that a file replaced in between makes a later reopen fail rather than reach the replacement
+			Object fileKey = node.fileKey == null && needsFileKey(widened) ? fileKeyOrNull(node) : node.fileKey;
+			FileChannel opened = openByPath(node, widened);
 			FileChannel previous = node.channel;
-			nodes.setChannel(node, opened, widened);
+			nodes.setChannel(node, opened, widened, fileKey);
 			if (previous != null) {
 				previous.close();
 			}
 		}
 		return node.channel;
+	}
+
+	/**
+	 * @return Whether the file of a channel with these modes may be opened again by its path, for a wider channel or a temporary writer, which has to reach the file the channel is on
+	 */
+	private boolean needsFileKey(int modes) {
+		boolean widenable = modes != (Messages.MODE_READ | Messages.MODE_WRITE);
+		// a read-only mount refuses a widen to write mode before it opens anything
+		return widenable && !(readOnly && (modes & Messages.MODE_READ) != 0);
+	}
+
+	/**
+	 * Opens the node's file by its path. While the node has the key of its channel's file, the path must still name that file, before and after the open: a sync client may have replaced it through a rename, and an open by path would reach the replacement. A path that names another file only in between goes unnoticed, since the file an opened channel is on cannot be read from the channel.
+	 *
+	 * @throws StatusException With {@code ESTALE} if the path names another file than the node's channel was opened on
+	 */
+	private FileChannel openByPath(Node node, int modes) throws IOException {
+		Object expected = node.fileKey;
+		if (expected == null) {
+			return openChannel(node.path, openOptions(modes));
+		}
+		// before the open as well: on a vault, even closing a writable channel opened on the replacement writes into it
+		assertSameFile(node.path, expected);
+		FileChannel opened = openChannel(node.path, openOptions(modes));
+		try {
+			// a replacement during the open may have put the channel on it
+			assertSameFile(node.path, expected);
+		} catch (IOException | RuntimeException e) {
+			try {
+				opened.close();
+			} catch (IOException | RuntimeException suppressed) {
+				e.addSuppressed(suppressed);
+			}
+			throw e;
+		}
+		return opened;
+	}
+
+	private void assertSameFile(Path path, Object fileKey) throws IOException {
+		if (!fileKey.equals(readFileAttributes(path).fileKey())) {
+			throw new StatusException(Errno.ESTALE);
+		}
+	}
+
+	/**
+	 * @return The key of the node's file, or {@code null} if it cannot be read, which leaves later reopens unchecked rather than failing this open
+	 */
+	private @Nullable Object fileKeyOrNull(Node node) {
+		try {
+			return readFileAttributes(node.path).fileKey();
+		} catch (IOException e) {
+			return null;
+		} catch (RuntimeException e) {
+			FailureLog.warn(LOG, "Unable to read the file key of node " + node.id + ". Opening its file without one.", e);
+			return null;
+		}
 	}
 
 	private static Set<OpenOption> openOptions(int modes) {
@@ -1124,7 +1185,7 @@ public class FileSystemOperations implements Closeable {
 		} else if (node.unlinked) {
 			throw new StatusException(Errno.EINVAL);
 		} else {
-			try (FileChannel channel = openChannel(node.path, openOptions(Messages.MODE_WRITE))) {
+			try (FileChannel channel = openByPath(node, Messages.MODE_WRITE)) {
 				return resize(channel, size);
 			}
 		}
