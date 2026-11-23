@@ -522,6 +522,11 @@ append_to() {
 	echo "$1" >> "$2"
 }
 
+# open_only <read|append> <file>: opens the file and closes it without reading or writing. Fails with the open's error.
+open_only() {
+	/usr/bin/perl -e 'use Fcntl; my $flags = $ARGV[0] eq "append" ? O_WRONLY | O_APPEND : O_RDONLY; sysopen(my $file, $ARGV[1], $flags) or die "open: $!\n"; close($file) or die "close: $!\n"' "$1" "$2"
+}
+
 # Prints the space df reports as available at a mount point, in KiB, or nothing if df fails.
 available_kb() {
 	df -k "$1" 2> /dev/null | awk 'NR == 2 { print $4 }'
@@ -1448,19 +1453,13 @@ outside_rounds() {
 	check "$kind: the program's log shows held.txt looked up" test -n "$node"
 	offset=$(wc -c < "$PROGRAM_LOG")
 	change_outside "$kind" held.txt
-	# a vault reports the size of its open file, so the record may carry the old one
-	check "$kind: a CHANGES response names a file a process holds open" await_changes_reported "$node" $offset
+	check "$kind: a CHANGES response names a file a process holds open, with its new size" await_changes_reported "$node" $offset 11
 	# BridgeSession traces the response before it sends it, and FSKit answers an open from its cache until the extension has received the response and revoked the file
 	sleep 0.5
 	mark "held-1-$kind"
-	if [[ "$kind" == plain ]]; then
-		# FSKit passes on a later open of a revoked item, one for reading as an upgrade, which the volume refuses
-		check_fails "$kind: another open while it is held fails" "Stale NFS file handle" cat "$MNT/held.txt"
-		check_fails "$kind: an open for writing while it is held fails" "NFS file handle" append_to stale "$MNT/held.txt"
-	else
-		# while the file is open, the vault reports its old size, so nothing is revoked and FSKit serves a later open from its cache
-		check "$kind: another open while it is held reads the old version" content_is "$MNT/held.txt" "version two, which is longer"
-	fi
+	# FSKit passes on a later open of a revoked item, one for reading as an upgrade, which the volume refuses
+	check_fails "$kind: another open while it is held fails" "open: Stale NFS file handle" open_only read "$MNT/held.txt"
+	check_fails "$kind: an open for writing while it is held fails" "open: Stale NFS file handle" open_only append "$MNT/held.txt"
 	mark "held-2-$kind"
 	check "$kind: and the server keeps the channel of the descriptor held" test "$(requests_between "held-1-$kind" "held-2-$kind" "CloseRequest[nodeId=$node,")" = 0
 	: > "$sig/go1"
@@ -1475,15 +1474,22 @@ outside_rounds() {
 	holder_write "$MNT/writer.txt" "$sig"
 	holder=$!
 	await_file "$sig/written" || return 0
+	request sync "$SCENARIO"
+	node="$(node_of writer.txt Lookup)"
+	check "$kind: the program's log shows writer.txt looked up" test -n "$node"
+	offset=$(wc -c < "$PROGRAM_LOG")
 	# the writer's cached pages would go back over a change made in place
 	change_outside "$kind" writer.txt replace
+	check "$kind: a CHANGES response names a file a process holds open for writing, with its new size" await_changes_reported "$node" $offset 11
+	sleep 0.5
+	check_fails "$kind: another open while a writer holds it fails" "open: Stale NFS file handle" open_only read "$MNT/writer.txt"
+	check_fails "$kind: an open for writing while a writer holds it fails" "open: Stale NFS file handle" open_only append "$MNT/writer.txt"
 	: > "$sig/go3"
 	await_file "$sig/writer-closed"
 	stop_background $holder
-	# a vault reports the size of its open file until the writer's close reaches it
 	check "$kind: a writer open since before a change made outside leaves the new size when it closes" shows_size_within "$MNT/writer.txt" 11 3
 	check "$kind: and the new content" content_is "$MNT/writer.txt" "version one"
-	# the close can show the change before the stream reports it, up to its latency of 0.3 s after the change: wait for that report before the volume's own changes start
+	# keeps what the stream still reports of the change apart from the volume's own changes
 	sleep 1
 	check "$kind: stat looks up a file in each directory the volume changes" stat_primed "$MNT"
 	mark "own-dirs-1-$kind"
@@ -1528,14 +1534,14 @@ outside_rounds() {
 	change_outside "$kind" read.txt
 	change_outside "$kind" write.txt
 	mark "stale-1-$kind"
-	check_fails "$kind: an open for reading that finds the change fails" "Stale NFS file handle" cat "$MNT/read.txt"
+	check_fails "$kind: an open for reading that finds the change fails" "open: Stale NFS file handle" open_only read "$MNT/read.txt"
 	mark "stale-2-$kind"
 	# FSKit never closes an open that failed, so the volume closes the channel its OPEN opened, which the server would keep otherwise
 	check "$kind: and closes the channel its OPEN opened" test "$(requests_between "stale-1-$kind" "stale-2-$kind" "CloseRequest[nodeId=$read,")" = 1
 	check "$kind: stat then shows the new size" shows_size_within "$MNT/read.txt" 11 1
 	check "$kind: and the next open the new content" content_is "$MNT/read.txt" "version one"
 	mark "stale-3-$kind"
-	check_fails "$kind: an open for writing that finds the change fails" "NFS file handle" append_to stale "$MNT/write.txt"
+	check_fails "$kind: an open for writing that finds the change fails" "open: Stale NFS file handle" open_only append "$MNT/write.txt"
 	mark "stale-4-$kind"
 	check "$kind: and closes the channel its OPEN opened" test "$(requests_between "stale-3-$kind" "stale-4-$kind" "CloseRequest[nodeId=$written,")" = 1
 	check "$kind: stat then shows the new size" shows_size_within "$MNT/write.txt" 11 1

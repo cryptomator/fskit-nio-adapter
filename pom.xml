@@ -28,7 +28,7 @@
         <!-- test dependencies -->
         <junit.jupiter.version>6.1.3</junit.jupiter.version>
         <mockito.version>5.24.0</mockito.version>
-        <cryptofs.version>2.12.0</cryptofs.version>
+        <cryptofs.version>2.12.1</cryptofs.version>
 
         <!-- build dependencies -->
         <mvn-compiler.version>3.16.0</mvn-compiler.version>

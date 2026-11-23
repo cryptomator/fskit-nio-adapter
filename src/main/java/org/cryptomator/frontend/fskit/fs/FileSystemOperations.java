@@ -1127,7 +1127,7 @@ public class FileSystemOperations implements Closeable {
 		if (expected == null) {
 			return openChannel(node.path, openOptions(modes));
 		}
-		// before the open as well: on a vault, even closing a writable channel opened on the replacement writes into it
+		// before the open as well: on a vault with cryptofs before 2.12.1, closing a writable channel opened on the replacement sets its modification time and can write the open file's pending data into it. From 2.12.1 on, that close still sets the replacement's access time, and its modification time to the one the channel read when it opened.
 		assertSameFile(node.path, expected);
 		FileChannel opened = openChannel(node.path, openOptions(modes));
 		try {

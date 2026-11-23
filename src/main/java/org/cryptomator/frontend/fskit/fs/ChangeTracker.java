@@ -10,7 +10,7 @@ import java.util.Set;
 /**
  * Decides which nodes a {@code CHANGES} request samples.
  * <p>
- * A signal of {@link OutsideChanges} requests a sweep over every file, link and directory other than the root that the client holds, since a signal does not say what changed. A signal during a sweep requests another one after it. A node sampled while its channel was open is sampled again on its own once that channel is closed, since a vault reports the size and time of its open file until then.
+ * A signal of {@link OutsideChanges} requests a sweep over every file, link and directory other than the root that the client holds, since a signal does not say what changed. A signal during a sweep requests another one after it. A node sampled while its channel was open is sampled again on its own once that channel is closed, since a vault can report the size and time of its open file until then. It does so after a change in place, and with cryptofs before 2.12.1 also after the file's ciphertext was replaced.
  * <p>
  * Its monitor is held only for short sections and never during a backend call. It is taken after a data lock and before the monitor of {@link NodeTable}.
  */

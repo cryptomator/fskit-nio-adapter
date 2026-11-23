@@ -1471,9 +1471,8 @@ public class FileSystemOperationsTest {
 		@DisplayName("a ciphertext replaced outside is reported with the size of its content")
 		public void testChangedCiphertext() throws Exception {
 			SignaledSource source = serveWithSource();
-			Path ciphertext = writeThroughVault("file.txt", "version one");
-			Path versionOne = Files.copy(ciphertext, root.resolve("version-one"));
-			Files.writeString(vault.getPath("/file.txt"), "version two, which is longer");
+			Path versionOne = writeVersionsSharingHeader("version one", "version two, which is longer");
+			Path ciphertext = ciphertext("file.txt");
 			long file = lookup(ROOT, "file.txt").nodeId();
 
 			replaceCiphertext(ciphertext, versionOne);
@@ -1500,18 +1499,17 @@ public class FileSystemOperationsTest {
 		}
 
 		@Test
-		@DisplayName("a file whose ciphertext was replaced while it was open, which the vault reports unchanged until it is closed, is reported again on its own once it is closed")
+		@DisplayName("a file whose ciphertext was changed in place while it was open, which the vault reports unchanged until it is closed, is reported again on its own once it is closed")
 		public void testChangedCiphertextOfOpenFile() throws Exception {
 			SignaledSource source = serveWithSource();
-			Path ciphertext = writeThroughVault("file.txt", "version one");
-			Path versionOne = Files.copy(ciphertext, root.resolve("version-one"));
-			Files.writeString(vault.getPath("/file.txt"), "version two, which is longer");
+			Path versionOne = writeVersionsSharingHeader("version one", "version two, which is longer");
+			Path ciphertext = ciphertext("file.txt");
 			Files.writeString(vault.getPath("/other.txt"), "");
 			long file = lookup(ROOT, "file.txt").nodeId();
 			lookup(ROOT, "other.txt");
 			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
 
-			replaceCiphertext(ciphertext, versionOne);
+			Files.write(ciphertext, Files.readAllBytes(versionOne));
 			Attributes whileOpen = changes(source, true).attributes().stream().filter(record -> record.nodeId() == file).findFirst().orElseThrow();
 			Assertions.assertEquals(28, whileOpen.size());
 			ok(new CloseRequest(file, 0), CloseResponse.class);
@@ -1519,6 +1517,23 @@ public class FileSystemOperationsTest {
 			ChangesResponse afterClose = changes(source, false);
 			Assertions.assertEquals(List.of(file), afterClose.attributes().stream().map(Attributes::nodeId).toList());
 			Assertions.assertEquals(11, afterClose.attributes().getFirst().size());
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced through a rename while it is open is reported with the replacement's size and time")
+		public void testReplacedCiphertextOfOpenFile() throws Exception {
+			SignaledSource source = serveWithSource();
+			Path versionOne = writeVersionsSharingHeader("version one", "version two, which is longer");
+			Path ciphertext = ciphertext("file.txt");
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ | WRITE), OpenResponse.class);
+
+			replaceCiphertext(ciphertext, versionOne);
+			Files.setLastModifiedTime(ciphertext, FileTime.from(Instant.ofEpochSecond(1500000000)));
+
+			Attributes whileOpen = changes(source, true).attributes().stream().filter(record -> record.nodeId() == file).findFirst().orElseThrow();
+			Assertions.assertEquals(11, whileOpen.size());
+			Assertions.assertEquals(new Timestamp(1500000000, 0), whileOpen.modified());
 		}
 
 		/**
@@ -1530,6 +1545,17 @@ public class FileSystemOperationsTest {
 			Path versionOne = Files.copy(writeThroughVault("file.txt", "a".repeat(4 * CHUNK)), root.resolve("version-one"));
 			Files.writeString(vault.getPath("/new.txt"), "a".repeat(3 * CHUNK) + "b".repeat(CHUNK));
 			Files.move(vault.getPath("/new.txt"), vault.getPath("/file.txt"), StandardCopyOption.REPLACE_EXISTING);
+			return versionOne;
+		}
+
+		/**
+		 * Writes two versions of file.txt, the second over the first, so that they share a header. Leaves the second one in place.
+		 *
+		 * @return The ciphertext of the first version, kept outside the vault
+		 */
+		private Path writeVersionsSharingHeader(String first, String second) throws IOException {
+			Path versionOne = Files.copy(writeThroughVault("file.txt", first), root.resolve("version-one"));
+			Files.writeString(vault.getPath("/file.txt"), second);
 			return versionOne;
 		}
 
@@ -1548,8 +1574,53 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
 		}
 
+		/**
+		 * Replaces the ciphertext while the request opens the file again, and expects the request to fail with ESTALE and the replacement's bytes and time to stay as they were, also after the holder's close.
+		 *
+		 * @param versionOne The ciphertext to replace it with, of the same header, since a header that differs would detach the open file by itself and could hide a regression of cryptofs's key check
+		 */
+		private void assertRefusedWhileCiphertextIsReplaced(long file, Path versionOne, Request widening) throws IOException {
+			Path ciphertext = ciphertext("file.txt");
+			FileTime replaced = FileTime.from(Instant.ofEpochSecond(1500000000));
+			ops.beforeOpeningChannel = onlyAt(vault.getPath("/file.txt"), _ -> {
+				replaceCiphertext(ciphertext, versionOne);
+				Files.setLastModifiedTime(ciphertext, replaced);
+			});
+
+			assertStatus(Errno.ESTALE, widening);
+
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
+			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
+			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
+			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
+			Assertions.assertEquals(List.of(), ops.unexpectedFailures);
+		}
+
 		@Test
-		@DisplayName("a file whose ciphertext was replaced while it is open for writing refuses a read with ESTALE, and leaves the replacement's ciphertext as it is")
+		@DisplayName("a file open for reading whose ciphertext is replaced while a wider open opens it refuses that open with ESTALE, and leaves the replacement's bytes and time as they are, also after its close")
+		public void testWidenWhileCiphertextIsReplaced() throws IOException {
+			Path versionOne = writeVersionsSharingHeader("a".repeat(4 * CHUNK), "a".repeat(3 * CHUNK) + "b".repeat(CHUNK));
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, READ), OpenResponse.class);
+			read(file, 0, CHUNK);
+
+			assertRefusedWhileCiphertextIsReplaced(file, versionOne, new OpenRequest(file, WRITE));
+		}
+
+		@Test
+		@DisplayName("a file with unwritten data whose ciphertext is replaced while a read widens its channel refuses the read with ESTALE, and leaves the replacement's bytes and time as they are, also after its close")
+		public void testReadWhileCiphertextIsReplaced() throws IOException {
+			Path versionOne = writeVersionsSharingHeader("a".repeat(4 * CHUNK), "a".repeat(3 * CHUNK) + "b".repeat(CHUNK));
+			long file = lookup(ROOT, "file.txt").nodeId();
+			ok(new OpenRequest(file, WRITE), OpenResponse.class);
+			write(file, 0, "written");
+
+			assertRefusedWhileCiphertextIsReplaced(file, versionOne, new ReadRequest(file, 0, 4));
+		}
+
+		@Test
+		@DisplayName("a file whose ciphertext was replaced while it is open for writing refuses a read with ESTALE, and leaves the replacement's ciphertext and time as they are, also after its close")
 		public void testReadAfterCiphertextReplaced() throws IOException {
 			Path versionOne = writeVersions();
 			long file = lookup(ROOT, "file.txt").nodeId();
@@ -1557,6 +1628,7 @@ public class FileSystemOperationsTest {
 			write(file, 0, "written");
 			Path ciphertext = ciphertext("file.txt");
 			replaceCiphertext(ciphertext, versionOne);
+			Files.setLastModifiedTime(ciphertext, FileTime.from(Instant.ofEpochSecond(1500000000)));
 			FileTime replaced = Files.getLastModifiedTime(ciphertext);
 
 			assertStatus(Errno.ESTALE, new ReadRequest(file, 0, 4));
@@ -1564,8 +1636,8 @@ public class FileSystemOperationsTest {
 			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
 			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
 			write(file, 7, " more");
-			// the close sets the time through the path, so only the bytes are compared after it
 			ok(new CloseRequest(file, 0), CloseResponse.class);
+			Assertions.assertEquals(replaced, Files.getLastModifiedTime(ciphertext));
 			Assertions.assertArrayEquals(Files.readAllBytes(versionOne), Files.readAllBytes(ciphertext));
 		}
 
